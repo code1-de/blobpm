@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod repo;
+
 #[derive(Parser)]
 #[command(name = "blob", about = "A simple package manager for Windows")]
 struct Cli {
@@ -41,7 +43,13 @@ fn main() {
 
     match &cli.command {
         Commands::Serve { repo, port } => {
+            let index = repo::RepoIndex::scan(repo).expect("Failed to scan repo");
+            let summary = index.index_summary();
             println!("Serving repo {} on port {port}", repo.display());
+            println!("Packages found: {}", summary.len());
+            for (name, version) in &summary {
+                println!("  {name} {version}");
+            }
         }
         Commands::Install { name } => {
             println!("Installing {name}");
