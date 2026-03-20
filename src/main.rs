@@ -1,11 +1,16 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod client;
 mod repo;
 mod server;
 
 #[derive(Parser)]
-#[command(name = "blob", about = "A simple package manager for Windows")]
+#[command(
+    name = "blob",
+    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io", env!("CARGO_PKG_VERSION")),
+    version,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -20,7 +25,7 @@ enum Commands {
         repo: PathBuf,
 
         /// Port to listen on
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "8803")]
         port: u16,
     },
     /// Install a package
