@@ -1,0 +1,2 @@
+max_width = 120
+use_small_heuristics = "Max"  # Prefer keeping items on one line up to max_width
