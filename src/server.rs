@@ -42,7 +42,10 @@ pub async fn run(repo_path: PathBuf, port: u16) -> std::io::Result<()> {
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(state.index.index_summary()).unwrap_or_default())
+    let value = serde_json::to_value(state.index.index_summary()).unwrap_or_default();
+    let size = serde_json::to_string(&value).map_or(0, |s| s.len());
+    println!("GET /index ({size} bytes)");
+    Json(value)
 }
 
 async fn get_file(
@@ -56,7 +59,10 @@ async fn get_file(
 
     let path = state.index.package_file_path(&name, &version, &filename);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => Ok(bytes),
+        Ok(bytes) => {
+            println!("GET /packages/{name}/{version}/{filename} ({} bytes)", bytes.len());
+            Ok(bytes)
+        }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }

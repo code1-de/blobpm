@@ -57,7 +57,9 @@ fn main() {
                 .expect("Server error");
         }
         Commands::Install { name } => {
-            println!("Installing {name}");
+            let config = client::Config::load().expect("Failed to load config. Run 'blob config' first.");
+            let mut db = client::Database::load().expect("Failed to load database");
+            client::install(name, &config, &mut db).expect("Install failed");
         }
         Commands::Remove { name } => {
             println!("Removing {name}");
