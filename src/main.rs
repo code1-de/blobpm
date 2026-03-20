@@ -39,6 +39,11 @@ enum Commands {
         /// Package name
         name: String,
     },
+    /// Mark a package as manually installed
+    Manual {
+        /// Package name
+        name: String,
+    },
     /// Update all installed packages
     Update,
     /// List installed packages
@@ -64,11 +69,39 @@ fn main() {
         Commands::Remove { name } => {
             println!("Removing {name}");
         }
+        Commands::Manual { name } => {
+            let mut db = client::Database::load().expect("Failed to load database");
+            match db.packages.get_mut(name.as_str()) {
+                Some(pkg) => {
+                    if pkg.reason == client::InstallReason::Manual {
+                        println!("{name} is already marked as manual");
+                    } else {
+                        pkg.reason = client::InstallReason::Manual;
+                        db.save().expect("Failed to save database");
+                        println!("{name} marked as manually installed");
+                    }
+                }
+                None => {
+                    eprintln!("{name} is not installed");
+                }
+            }
+        }
         Commands::Update => {
             println!("Updating all packages");
         }
         Commands::List => {
-            println!("Listing installed packages");
+            let db = client::Database::load().expect("Failed to load database");
+            if db.packages.is_empty() {
+                println!("No packages installed.");
+            } else {
+                for (name, pkg) in &db.packages {
+                    let reason = match pkg.reason {
+                        client::InstallReason::Manual => "manual",
+                        client::InstallReason::Auto => "auto",
+                    };
+                    println!("{name} {} [{reason}]", pkg.version);
+                }
+            }
         }
         Commands::Config => {
             run_config();

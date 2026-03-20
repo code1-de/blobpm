@@ -11,9 +11,17 @@ pub struct Config {
     pub base_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallReason {
+    Manual,
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledPackage {
     pub version: String,
+    pub reason: InstallReason,
     pub files: BTreeMap<String, PathBuf>,
     pub dependencies: Vec<String>,
     pub manifest: Manifest,
@@ -254,6 +262,21 @@ fn resolve_recursive(
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()> {
+    // If already installed at latest version, just ensure it's marked manual
+    if let Some(existing) = db.packages.get(name) {
+        let index = fetch_index(&config.server_url)?;
+        if index.get(name).is_some_and(|v| *v == existing.version) {
+            if existing.reason == InstallReason::Auto {
+                db.packages.get_mut(name).unwrap().reason = InstallReason::Manual;
+                db.save()?;
+                println!("{name} marked as manually installed");
+            } else {
+                println!("{name} {} is already installed", existing.version);
+            }
+            return Ok(());
+        }
+    }
+
     let index = fetch_index(&config.server_url)?;
     let to_install = resolve_dependencies(name, &config.server_url, &index, db)?;
 
@@ -279,10 +302,17 @@ pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()>
             installed_files.insert(file.clone(), dest);
         }
 
+        let reason = if pkg_name == name {
+            InstallReason::Manual
+        } else {
+            InstallReason::Auto
+        };
+
         db.packages.insert(
             pkg_name.clone(),
             InstalledPackage {
                 version: version.clone(),
+                reason,
                 files: installed_files,
                 dependencies: manifest.dependencies.clone(),
                 manifest: manifest.clone(),
@@ -389,7 +419,32 @@ mod tests {
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
         assert_eq!(db.packages.len(), 2);
         assert_eq!(db.packages["toolA"].version, "1.0");
+        assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
         assert_eq!(db.packages["toolB"].version, "2.0");
+        assert_eq!(db.packages["toolB"].reason, InstallReason::Manual);
+    }
+
+    #[test]
+    fn install_flips_auto_to_manual() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolB, which auto-installs toolA
+        install("toolB", &config, &mut db).unwrap();
+        assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
+
+        // Explicitly install toolA — should flip to manual
+        install("toolA", &config, &mut db).unwrap();
+        assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
     }
 
     #[test]
@@ -460,6 +515,7 @@ mod tests {
             "testpkg".to_string(),
             InstalledPackage {
                 version: "1.0".to_string(),
+                reason: InstallReason::Manual,
                 files: BTreeMap::from([
                     ("test.exe".to_string(), PathBuf::from("C:/bin/util/test.exe")),
                 ]),
