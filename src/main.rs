@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::Write;
 use std::path::PathBuf;
 
 mod client;
@@ -42,6 +43,8 @@ enum Commands {
     Update,
     /// List installed packages
     List,
+    /// Configure blob settings
+    Config,
 }
 
 fn main() {
@@ -65,7 +68,47 @@ fn main() {
         Commands::List => {
             println!("Listing installed packages");
         }
+        Commands::Config => {
+            run_config();
+        }
     }
+}
+
+fn prompt(label: &str, default: &str) -> String {
+    print!("{label} [{default}]: ");
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+    if input.is_empty() {
+        default.to_string()
+    } else {
+        input.to_string()
+    }
+}
+
+fn run_config() {
+    let config = client::Config::load().unwrap_or_else(|_| client::Config {
+        server_url: "http://localhost:8803".to_string(),
+        base_dir: PathBuf::from("C:/"),
+    });
+
+    println!("blob configuration");
+    println!("Press Enter to keep current value.\n");
+
+    let server_url = prompt("Server URL", &config.server_url);
+    let base_dir = prompt("Base install directory", &config.base_dir.display().to_string());
+
+    let base_dir = PathBuf::from(base_dir);
+    let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
+
+    let new_config = client::Config {
+        server_url,
+        base_dir,
+    };
+
+    new_config.save().expect("Failed to save config");
+    println!("\nConfig saved.");
 }
 
 #[cfg(test)]
