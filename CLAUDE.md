@@ -27,6 +27,15 @@ cargo run -- install <pkg>
 - Production-grade error handling: no `unwrap()` or `expect()` in non-test code
 - All errors must be propagated gracefully with `?` or proper error messages
 
+## Security
+
+- **Never trust external input.** All data from HTTP requests, manifests, config files, and user input must be validated before use.
+- **Path safety:** Any path assembled from external strings must be validated — reject `..`, absolute paths, drive letters (`:`), UNC paths. Always verify the resolved path stays inside the expected root directory.
+- **Defense in depth:** Validate inputs early (allowlist checks), then verify the result (canonicalize + starts_with). Never rely on a single check.
+- **Disk operations after validation:** Never create files/directories before verifying the target path is permitted.
+- **No arbitrary file reads from user-supplied paths** on the server side — always confine to the repo directory.
+- **Write security tests** for every boundary that accepts external input (path traversal, absolute paths, special characters).
+
 ## Conventions
 
 - Keep it simple — this is a personal tool

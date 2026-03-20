@@ -48,6 +48,17 @@ async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     Json(value)
 }
 
+/// Check that a URL path segment contains no traversal or special characters.
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains(':')
+        && !s.contains('\0')
+        && !s.starts_with('.')
+}
+
 async fn get_file(
     State(state): State<Arc<AppState>>,
     Path((name, version, filename)): Path<(String, String, String)>,
@@ -59,8 +70,25 @@ async fn get_file(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    if !is_safe_segment(&name) || !is_safe_segment(&version) || !is_safe_segment(&filename) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let path = state.index.package_file_path(&name, &version, &filename);
-    match tokio::fs::read(&path).await {
+
+    // Verify resolved path is inside the repo
+    let Ok(canonical) = tokio::fs::canonicalize(&path).await else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Ok(repo_base) = tokio::fs::canonicalize(
+        state.index.package_file_path(&name, &version, ""),
+    ).await else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !canonical.starts_with(&repo_base) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
             println!("GET /packages/{name}/{version}/{filename} ({} bytes)", bytes.len());
             Ok(bytes)
@@ -210,5 +238,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_path_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let app = build_test_app(tmp.path());
+
+        let resp = app
+            .oneshot(
+                Request::get("/packages/testpkg/1.0/..%2F..%2F..%2Fetc%2Fpasswd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 }

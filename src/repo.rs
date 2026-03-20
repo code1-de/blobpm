@@ -74,7 +74,9 @@ impl RepoIndex {
 
             versions.sort_by(|a, b| version_cmp(a, b));
 
-            let latest = versions.last().unwrap().clone();
+            let Some(latest) = versions.last().cloned() else {
+                continue;
+            };
             packages.insert(
                 pkg_name.clone(),
                 PackageInfo {

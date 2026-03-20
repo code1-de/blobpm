@@ -261,6 +261,48 @@ fn resolve_recursive(
     Ok(())
 }
 
+/// Windows reserved device names that must not be used as filenames.
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate that a file path and destination directory from a manifest are safe.
+fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Result<()> {
+    for (label, value) in [("file", file), ("dest_dir", dest_dir)] {
+        if value.contains("..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Path traversal in {label} for {pkg_name}: {value}"),
+            ));
+        }
+        // Reject absolute paths: drive letters (C:), UNC (\\), leading slashes
+        if value.starts_with('/') || value.starts_with('\\') || value.contains(':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Absolute path in {label} for {pkg_name}: {value}"),
+            ));
+        }
+        // Reject null bytes (cause path truncation on Windows)
+        if value.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Null byte in {label} for {pkg_name}"),
+            ));
+        }
+    }
+    // Check filename against Windows reserved device names
+    let file_stem = file.split('.').next().unwrap_or(file);
+    if WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(file_stem)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Reserved device name in file for {pkg_name}: {file}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Install a package and its dependencies.
 ///
 /// # Errors
@@ -297,7 +339,21 @@ pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()>
         let mut installed_files = BTreeMap::new();
 
         for (file, dest_dir) in &manifest.files {
+            // Validate paths are safe before doing anything on disk
+            validate_manifest_path(file, dest_dir, pkg_name)?;
+
             let dest = config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
+
+            // Second check: verify the assembled path stays under base_dir
+            // (catches edge cases like Windows drive letters or UNC paths)
+            let canonical_base = dunce::canonicalize(&config.base_dir)?;
+            if !dest.starts_with(&canonical_base) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Install target escapes base dir for {pkg_name}: {}", dest.display()),
+                ));
+            }
+
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -451,6 +507,63 @@ mod tests {
         // Explicitly install toolA — should flip to manual
         install("toolA", &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
+    }
+
+    #[test]
+    fn reject_absolute_path_in_manifest() {
+        let result = validate_manifest_path("evil.exe", "C:\\Windows\\System32", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("evil.exe", "/etc", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("C:\\evil.exe", "util", "badpkg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_traversal_in_manifest() {
+        let result = validate_manifest_path("..\\..\\evil.exe", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("evil.exe", "..\\..\\Windows", "badpkg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_null_bytes_in_manifest() {
+        let result = validate_manifest_path("evil\0.exe", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("evil.exe", "util\0hidden", "badpkg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_windows_device_names() {
+        let result = validate_manifest_path("CON", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("con.txt", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("NUL.exe", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("COM1", "util", "badpkg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accept_valid_manifest_paths() {
+        let result = validate_manifest_path("tool.exe", "util", "goodpkg");
+        assert!(result.is_ok());
+
+        let result = validate_manifest_path("helper.py", "scripts", "goodpkg");
+        assert!(result.is_ok());
+
+        let result = validate_manifest_path("console.exe", "util", "goodpkg");
+        assert!(result.is_ok());
     }
 
     #[test]
