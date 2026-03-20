@@ -24,6 +24,8 @@ cargo run -- install <pkg>
 - Lint clean: `cargo clippy --all-targets -- -W clippy::all -W clippy::pedantic`
 - All clippy warnings must be fixed
 - Default build is debug (`cargo build`), not release
+- Production-grade error handling: no `unwrap()` or `expect()` in non-test code
+- All errors must be propagated gracefully with `?` or proper error messages
 
 ## Conventions
 

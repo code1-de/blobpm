@@ -52,8 +52,10 @@ async fn get_file(
     State(state): State<Arc<AppState>>,
     Path((name, version, filename)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let pkg = state.index.packages.get(&name);
-    if pkg.is_none() || !pkg.unwrap().versions.contains(&version) {
+    let Some(pkg) = state.index.packages.get(&name) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !pkg.versions.contains(&version) {
         return Err(StatusCode::NOT_FOUND);
     }
 

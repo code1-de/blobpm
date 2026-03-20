@@ -32,18 +32,18 @@ pub struct Database {
     pub packages: BTreeMap<String, InstalledPackage>,
 }
 
-fn blob_dir() -> PathBuf {
+fn blob_dir() -> io::Result<PathBuf> {
     dirs::home_dir()
-        .expect("Could not determine home directory")
-        .join(".blob")
+        .map(|p| p.join(".blob"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
 }
 
-fn config_path() -> PathBuf {
-    blob_dir().join("config.json")
+fn config_path() -> io::Result<PathBuf> {
+    blob_dir().map(|p| p.join("config.json"))
 }
 
-fn db_path() -> PathBuf {
-    blob_dir().join("db.json")
+fn db_path() -> io::Result<PathBuf> {
+    blob_dir().map(|p| p.join("db.json"))
 }
 
 impl Config {
@@ -52,7 +52,7 @@ impl Config {
     /// # Errors
     /// Returns an error if the file cannot be read or parsed.
     pub fn load() -> io::Result<Self> {
-        let path = config_path();
+        let path = config_path()?;
         if path.is_file() {
             let content = fs::read_to_string(&path)?;
             serde_json::from_str(&content)
@@ -72,8 +72,10 @@ impl Config {
     /// # Errors
     /// Returns an error if the file cannot be written.
     pub fn save(&self) -> io::Result<()> {
-        let path = config_path();
-        fs::create_dir_all(path.parent().unwrap())?;
+        let path = config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(&path, content)
@@ -96,7 +98,7 @@ impl Database {
     /// # Errors
     /// Returns an error if the file cannot be read or parsed.
     pub fn load() -> io::Result<Self> {
-        let path = db_path();
+        let path = db_path()?;
         if path.is_file() {
             let content = fs::read_to_string(&path)?;
             serde_json::from_str(&content)
@@ -115,8 +117,10 @@ impl Database {
     /// # Errors
     /// Returns an error if the file cannot be written.
     pub fn save(&self) -> io::Result<()> {
-        let path = db_path();
-        fs::create_dir_all(path.parent().unwrap())?;
+        let path = db_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(&path, content)
@@ -198,7 +202,7 @@ pub fn download_file(server_url: &str, name: &str, version: &str, file: &str) ->
     }
     resp.bytes()
         .map(|b| b.to_vec())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 /// Resolve dependencies recursively. Returns packages in install order (dependencies first).
@@ -267,7 +271,9 @@ pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()>
         let index = fetch_index(&config.server_url)?;
         if index.get(name).is_some_and(|v| *v == existing.version) {
             if existing.reason == InstallReason::Auto {
-                db.packages.get_mut(name).unwrap().reason = InstallReason::Manual;
+                if let Some(pkg) = db.packages.get_mut(name) {
+                    pkg.reason = InstallReason::Manual;
+                }
                 db.save()?;
                 println!("{name} marked as manually installed");
             } else {

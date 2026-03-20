@@ -107,9 +107,14 @@ impl RepoIndex {
         let manifest: Manifest = serde_json::from_str(&content)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        let path = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+
         Ok(PackageVersion {
             version: version.to_string(),
-            path: manifest_path.parent().unwrap().to_path_buf(),
+            path,
             manifest,
         })
     }

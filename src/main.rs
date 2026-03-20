@@ -55,34 +55,40 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
-    match &cli.command {
+    if let Err(e) = run_command(&cli.command) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Commands::Serve { repo, port } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(server::run(repo.clone(), *port))
-                .expect("Server error");
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(server::run(repo.clone(), *port))?;
         }
         Commands::Install { name } => {
-            let config = client::Config::load().expect("Failed to load config. Run 'blob config' first.");
-            let mut db = client::Database::load().expect("Failed to load database");
-            client::install(name, &config, &mut db).expect("Install failed");
+            let config = client::Config::load()?;
+            let mut db = client::Database::load()?;
+            client::install(name, &config, &mut db)?;
         }
         Commands::Remove { name } => {
             println!("Removing {name}");
         }
         Commands::Manual { name } => {
-            let mut db = client::Database::load().expect("Failed to load database");
+            let mut db = client::Database::load()?;
             match db.packages.get_mut(name.as_str()) {
                 Some(pkg) => {
                     if pkg.reason == client::InstallReason::Manual {
                         println!("{name} is already marked as manual");
                     } else {
                         pkg.reason = client::InstallReason::Manual;
-                        db.save().expect("Failed to save database");
+                        db.save()?;
                         println!("{name} marked as manually installed");
                     }
                 }
                 None => {
-                    eprintln!("{name} is not installed");
+                    return Err(format!("{name} is not installed").into());
                 }
             }
         }
@@ -90,7 +96,7 @@ fn main() {
             println!("Updating all packages");
         }
         Commands::List => {
-            let db = client::Database::load().expect("Failed to load database");
+            let db = client::Database::load()?;
             if db.packages.is_empty() {
                 println!("No packages installed.");
             } else {
@@ -104,25 +110,26 @@ fn main() {
             }
         }
         Commands::Config => {
-            run_config();
+            run_config()?;
         }
     }
+    Ok(())
 }
 
-fn prompt(label: &str, default: &str) -> String {
+fn prompt(label: &str, default: &str) -> std::io::Result<String> {
     print!("{label} [{default}]: ");
-    std::io::stdout().flush().unwrap();
+    std::io::stdout().flush()?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+    std::io::stdin().read_line(&mut input)?;
     let input = input.trim();
     if input.is_empty() {
-        default.to_string()
+        Ok(default.to_string())
     } else {
-        input.to_string()
+        Ok(input.to_string())
     }
 }
 
-fn run_config() {
+fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
         server_url: "http://localhost:8803".to_string(),
         base_dir: PathBuf::from("C:/"),
@@ -131,8 +138,8 @@ fn run_config() {
     println!("blob configuration");
     println!("Press Enter to keep current value.\n");
 
-    let server_url = prompt("Server URL", &config.server_url);
-    let base_dir = prompt("Base install directory", &config.base_dir.display().to_string());
+    let server_url = prompt("Server URL", &config.server_url)?;
+    let base_dir = prompt("Base install directory", &config.base_dir.display().to_string())?;
 
     let base_dir = PathBuf::from(base_dir);
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
@@ -142,8 +149,9 @@ fn run_config() {
         base_dir,
     };
 
-    new_config.save().expect("Failed to save config");
+    new_config.save()?;
     println!("\nConfig saved.");
+    Ok(())
 }
 
 #[cfg(test)]
