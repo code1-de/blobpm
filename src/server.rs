@@ -16,6 +16,7 @@ pub struct AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/index", get(get_index))
+        .route("/packages/{name}", get(get_versions))
         .route("/packages/{name}/{version}/{filename}", get(get_file))
         .with_state(state)
 }
@@ -46,6 +47,21 @@ async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     let size = serde_json::to_string(&value).map_or(0, |s| s.len());
     println!("GET /index ({size} bytes)");
     Json(value)
+}
+
+async fn get_versions(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(pkg) = state.index.packages.get(&name) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let value = serde_json::json!({
+        "name": name,
+        "latest": pkg.latest,
+        "versions": pkg.versions,
+    });
+    Ok(Json(value))
 }
 
 /// Check that a URL path segment contains no traversal or special characters.

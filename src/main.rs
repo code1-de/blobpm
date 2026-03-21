@@ -59,6 +59,10 @@ enum Commands {
     Search {
         /// Regex pattern to match package names
         pattern: String,
+
+        /// Show all available versions
+        #[arg(long = "available", short = 'a')]
+        versions: bool,
     },
     /// Mark a package as manually installed
     Manual {
@@ -67,10 +71,16 @@ enum Commands {
     },
     /// Remove all orphaned auto-installed packages
     Purge,
-    /// Update all installed packages
-    Update,
+    /// Update installed packages
+    Update {
+        /// Package name (optional, updates all if omitted)
+        name: Option<String>,
+    },
     /// List installed packages
-    List,
+    List {
+        /// Package name (optional, show details for this package)
+        name: Option<String>,
+    },
     /// Configure blob settings
     Config,
 }
@@ -96,9 +106,9 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let (pkg_name, version) = parse_package_spec(name);
             client::install(&pkg_name, version.as_deref(), *force, &config, &mut db)?;
         }
-        Commands::Search { pattern } => {
+        Commands::Search { pattern, versions } => {
             let config = client::Config::load()?;
-            client::search(pattern, &config)?;
+            client::search(pattern, *versions, &config)?;
         }
         Commands::Remove { name, force, transitive, keep } => {
             let mut db = client::Database::load()?;
@@ -125,20 +135,44 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let mut db = client::Database::load()?;
             client::purge(&mut db)?;
         }
-        Commands::Update => {
-            println!("Updating all packages");
+        Commands::Update { name } => {
+            let config = client::Config::load()?;
+            let mut db = client::Database::load()?;
+            client::update(name.as_deref(), &config, &mut db)?;
         }
-        Commands::List => {
+        Commands::List { name } => {
             let db = client::Database::load()?;
-            if db.packages.is_empty() {
-                println!("No packages installed.");
-            } else {
-                for (name, pkg) in &db.packages {
-                    let reason = match pkg.reason {
-                        client::InstallReason::Manual => "manual",
-                        client::InstallReason::Auto => "auto",
-                    };
-                    println!("{name} {} [{reason}]", pkg.version);
+            match name {
+                Some(n) => {
+                    if let Some(pkg) = db.packages.get(n.as_str()) {
+                        let reason = match pkg.reason {
+                            client::InstallReason::Manual => "manual",
+                            client::InstallReason::Auto => "auto",
+                        };
+                        println!("{n} {} [{reason}]", pkg.version);
+                        if !pkg.dependencies.is_empty() {
+                            println!("  Dependencies: {}", pkg.dependencies.join(", "));
+                        }
+                        for (file, path) in &pkg.files {
+                            println!("  {file} -> {}", path.display());
+                        }
+                    } else {
+                        println!("{n} is not installed");
+                    }
+                }
+                None => {
+                    if db.packages.is_empty() {
+                        println!("No packages installed.");
+                    } else {
+                        for (n, pkg) in &db.packages {
+                            let suffix = if pkg.reason == client::InstallReason::Auto {
+                                " (auto)"
+                            } else {
+                                ""
+                            };
+                            println!("{n} {}{suffix}", pkg.version);
+                        }
+                    }
                 }
             }
         }

@@ -158,6 +158,29 @@ pub fn fetch_index(server_url: &str) -> io::Result<BTreeMap<String, String>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Fetch available versions for a package from the server.
+///
+/// # Errors
+/// Returns an error if the HTTP request fails or the response is not valid JSON.
+pub fn fetch_versions(server_url: &str, name: &str) -> io::Result<Vec<String>> {
+    let url = format!("{server_url}/packages/{name}");
+    let resp = reqwest::blocking::get(&url)
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+    if !resp.status().is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Package {name} not found"),
+        ));
+    }
+    let value: serde_json::Value = resp.json()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let versions = value["versions"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Ok(versions)
+}
+
 /// Fetch a manifest from the server.
 ///
 /// # Errors
@@ -335,53 +358,14 @@ pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, 
     }
 
     for (pkg_name, version, manifest) in &to_install {
-        println!("Installing {pkg_name} {version}...");
-
-        let mut installed_files = BTreeMap::new();
-
-        for (file, dest_dir) in &manifest.files {
-            // Validate paths are safe before doing anything on disk
-            validate_manifest_path(file, dest_dir, pkg_name)?;
-
-            let dest = config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
-
-            // Second check: verify the assembled path stays under base_dir
-            // (catches edge cases like Windows drive letters or UNC paths)
-            let canonical_base = dunce::canonicalize(&config.base_dir)?;
-            if !dest.starts_with(&canonical_base) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Install target escapes base dir for {pkg_name}: {}", dest.display()),
-                ));
-            }
-
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let bytes = download_file(&config.server_url, pkg_name, version, file)?;
-            fs::write(&dest, &bytes)?;
-            println!("  {} -> {}", file, dest.display());
-            installed_files.insert(file.clone(), dest);
-        }
-
         let reason = if pkg_name == name {
             InstallReason::Manual
         } else {
             InstallReason::Auto
         };
 
-        db.packages.insert(
-            pkg_name.clone(),
-            InstalledPackage {
-                version: version.clone(),
-                reason,
-                files: installed_files,
-                dependencies: manifest.dependencies.clone(),
-                manifest: manifest.clone(),
-            },
-        );
-
+        println!("Installing {pkg_name} {version}...");
+        install_files(pkg_name, version, manifest, reason, config, db)?;
         println!("  Installed {pkg_name} {version}");
     }
 
@@ -392,20 +376,155 @@ pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, 
     Ok(())
 }
 
+/// Update installed packages to their latest versions.
+/// If `name` is given, update only that package. Otherwise update all.
+///
+/// # Errors
+/// Returns an error if fetching, downloading, or writing files fails.
+pub fn update(name: Option<&str>, config: &Config, db: &mut Database) -> io::Result<()> {
+    let index = fetch_index(&config.server_url)?;
+
+    let packages: Vec<(String, String)> = match name {
+        Some(n) => {
+            if !db.packages.contains_key(n) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{n} is not installed"),
+                ));
+            }
+            let latest = index.get(n).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index"))
+            })?;
+            if *latest == db.packages[n].version {
+                println!("{n} is already at latest version ({latest}).");
+                return Ok(());
+            }
+            vec![(n.to_string(), latest.clone())]
+        }
+        None => {
+            let mut list = Vec::new();
+            for (n, pkg) in &db.packages {
+                if let Some(latest) = index.get(n) {
+                    if *latest != pkg.version {
+                        list.push((n.clone(), latest.clone()));
+                    }
+                }
+            }
+            if list.is_empty() {
+                println!("Everything is up to date.");
+                return Ok(());
+            }
+            list
+        }
+    };
+
+    for (pkg_name, new_version) in &packages {
+        let old_version = db.packages[pkg_name].version.clone();
+        println!("Updating {pkg_name} {old_version} -> {new_version}...");
+
+        // Resolve and install new deps
+        let new_deps = resolve_dependencies(pkg_name, new_version, &config.server_url, &index, db)?;
+        for (dep_name, dep_version, dep_manifest) in &new_deps {
+            if dep_name == pkg_name {
+                continue; // we handle the main package below
+            }
+            if db.packages.contains_key(dep_name) {
+                continue;
+            }
+            println!("  Installing new dependency {dep_name} {dep_version}...");
+            install_files(dep_name, dep_version, dep_manifest, InstallReason::Auto, config, db)?;
+        }
+
+        // Get the manifest for the new version
+        let manifest = fetch_manifest(&config.server_url, pkg_name, new_version)?;
+
+        // Remove old files that are no longer in the new manifest
+        if let Some(old_pkg) = db.packages.get(pkg_name) {
+            for (old_file, old_path) in &old_pkg.files {
+                if !manifest.files.contains_key(old_file) && old_path.is_file() {
+                    fs::remove_file(old_path)?;
+                    println!("  Removed old file {old_file}");
+                }
+            }
+        }
+
+        let reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
+        install_files(pkg_name, new_version, &manifest, reason, config, db)?;
+    }
+
+    purge_orphans(db)?;
+    db.save()?;
+
+    println!("Updated {} package(s).", packages.len());
+    Ok(())
+}
+
+/// Download and write files for a single package, update db entry.
+fn install_files(
+    name: &str,
+    version: &str,
+    manifest: &Manifest,
+    reason: InstallReason,
+    config: &Config,
+    db: &mut Database,
+) -> io::Result<()> {
+    let mut installed_files = BTreeMap::new();
+
+    for (file, dest_dir) in &manifest.files {
+        validate_manifest_path(file, dest_dir, name)?;
+
+        let dest = config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
+
+        let canonical_base = dunce::canonicalize(&config.base_dir)?;
+        if !dest.starts_with(&canonical_base) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Install target escapes base dir for {name}: {}", dest.display()),
+            ));
+        }
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let bytes = download_file(&config.server_url, name, version, file)?;
+        fs::write(&dest, &bytes)?;
+        println!("  {} -> {}", file, dest.display());
+        installed_files.insert(file.clone(), dest);
+    }
+
+    db.packages.insert(
+        name.to_string(),
+        InstalledPackage {
+            version: version.to_string(),
+            reason,
+            files: installed_files,
+            dependencies: manifest.dependencies.clone(),
+            manifest: manifest.clone(),
+        },
+    );
+    Ok(())
+}
+
 /// Search for packages on the server matching a regex pattern.
 ///
 /// # Errors
 /// Returns an error if the index cannot be fetched or the regex is invalid.
-pub fn search(pattern: &str, config: &Config) -> io::Result<()> {
+pub fn search(pattern: &str, show_versions: bool, config: &Config) -> io::Result<()> {
     let re = regex::Regex::new(pattern)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex: {e}")))?;
 
     let index = fetch_index(&config.server_url)?;
     let mut found = false;
 
-    for (name, version) in &index {
+    for (name, latest) in &index {
         if re.is_match(name) {
-            println!("{name} {version}");
+            if show_versions {
+                let versions = fetch_versions(&config.server_url, name)?;
+                println!("{name} (latest: {latest}) — versions: {}", versions.join(", "));
+            } else {
+                println!("{name} {latest}");
+            }
             found = true;
         }
     }
@@ -514,6 +633,9 @@ fn remove_package_files(name: &str, db: &mut Database) -> io::Result<()> {
 /// or if file removal fails.
 pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mut Database) -> io::Result<()> {
     if !db.packages.contains_key(name) {
+        if transitive {
+            return Ok(()); // already removed by cascade
+        }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("{name} is not installed"),
@@ -873,6 +995,152 @@ mod tests {
 
         let result = validate_manifest_path("console.exe", "util", "goodpkg");
         assert!(result.is_ok());
+    }
+
+    /// Create a diamond-shaped dep tree: C and D both depend on B, B depends on A.
+    /// Also toolE v1.0 and v2.0 (v2 adds dep on A).
+    fn create_diamond_repo(base: &Path) {
+        for (name, ver, deps, file) in [
+            ("depA", "1.0", "[]", "depA.exe"),
+            ("depB", "1.0", r#"["depA"]"#, "depB.exe"),
+            ("depC", "1.0", r#"["depB"]"#, "depC.exe"),
+            ("depD", "1.0", r#"["depB"]"#, "depD.exe"),
+            ("toolE", "1.0", "[]", "toolE.exe"),
+            ("toolE", "2.0", r#"["depA"]"#, "toolE.exe"),
+        ] {
+            let dir = base.join("packages").join(name).join(ver);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("blob.json"),
+                format!(r#"{{"name":"{name}","description":"","files":{{"{file}":"util/"}},"dependencies":{deps}}}"#),
+            ).unwrap();
+            fs::write(dir.join(file), format!("{name}-{ver}-binary").as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn diamond_deps_installed_once() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_diamond_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install C and D — both depend on B which depends on A
+        install("depC", None, false, &config, &mut db).unwrap();
+        install("depD", None, false, &config, &mut db).unwrap();
+        assert_eq!(db.packages.len(), 4); // A, B, C, D
+        assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
+        assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
+    }
+
+    #[test]
+    fn diamond_remove_one_branch_keeps_shared_dep() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_diamond_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("depC", None, false, &config, &mut db).unwrap();
+        install("depD", None, false, &config, &mut db).unwrap();
+
+        // Remove C — B and A should stay because D still needs B
+        remove("depC", false, false, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("depC"));
+        assert!(db.packages.contains_key("depB"));
+        assert!(db.packages.contains_key("depA"));
+    }
+
+    #[test]
+    fn diamond_remove_both_branches_cleans_all() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_diamond_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("depC", None, false, &config, &mut db).unwrap();
+        install("depD", None, false, &config, &mut db).unwrap();
+
+        // Remove C, then D — everything should be cleaned up
+        remove("depC", false, false, false, &mut db).unwrap();
+        remove("depD", false, false, false, &mut db).unwrap();
+        assert!(db.packages.is_empty());
+    }
+
+    #[test]
+    fn transitive_remove_with_diamond() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_diamond_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("depC", None, false, &config, &mut db).unwrap();
+        install("depD", None, false, &config, &mut db).unwrap();
+
+        // Transitive remove A — should cascade up through B to C and D
+        remove("depA", false, true, false, &mut db).unwrap();
+        assert!(db.packages.is_empty());
+    }
+
+    #[test]
+    fn update_installs_new_deps() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_diamond_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolE v1.0 (no deps)
+        install("toolE", Some("1.0"), false, &config, &mut db).unwrap();
+        assert_eq!(db.packages.len(), 1);
+
+        // Update — toolE goes to v2.0 which depends on depA
+        update(None, &config, &mut db).unwrap();
+        assert_eq!(db.packages["toolE"].version, "2.0");
+        assert!(db.packages.contains_key("depA"));
+    }
+
+    #[test]
+    fn remove_nonexistent_package_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.json");
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        let result = remove("nonexistent", false, false, false, &mut db);
+        assert!(result.is_err());
     }
 
     #[test]
