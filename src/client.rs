@@ -201,6 +201,7 @@ pub fn download_file(server_url: &str, name: &str, version: &str, file: &str) ->
 /// Returns an error if a dependency cycle is detected or a dependency is not in the index.
 pub fn resolve_dependencies(
     name: &str,
+    target_version: &str,
     server_url: &str,
     index: &BTreeMap<String, String>,
     db: &Database,
@@ -208,12 +209,13 @@ pub fn resolve_dependencies(
     let mut result = Vec::new();
     let mut visited = HashSet::new();
     let mut in_stack = HashSet::new();
-    resolve_recursive(name, server_url, index, db, &mut result, &mut visited, &mut in_stack)?;
+    resolve_recursive(name, Some(target_version), server_url, index, db, &mut result, &mut visited, &mut in_stack)?;
     Ok(result)
 }
 
 fn resolve_recursive(
     name: &str,
+    version_override: Option<&str>,
     server_url: &str,
     index: &BTreeMap<String, String>,
     db: &Database,
@@ -233,21 +235,24 @@ fn resolve_recursive(
 
     in_stack.insert(name.to_string());
 
-    let version = index.get(name).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index"))
-    })?;
+    let version = match version_override {
+        Some(v) => v.to_string(),
+        None => index.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index"))
+        })?.clone(),
+    };
 
-    let manifest = fetch_manifest(server_url, name, version)?;
+    let manifest = fetch_manifest(server_url, name, &version)?;
 
     for dep in &manifest.dependencies {
         if !db.packages.contains_key(dep) {
-            resolve_recursive(dep, server_url, index, db, result, visited, in_stack)?;
+            resolve_recursive(dep, None, server_url, index, db, result, visited, in_stack)?;
         }
     }
 
     in_stack.remove(name);
     visited.insert(name.to_string());
-    result.push((name.to_string(), version.clone(), manifest));
+    result.push((name.to_string(), version, manifest));
     Ok(())
 }
 
@@ -297,26 +302,32 @@ fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Res
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn install(name: &str, force: bool, config: &Config, db: &mut Database) -> io::Result<()> {
-    // If already installed at latest version, just ensure it's marked manual (unless --force)
+pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, db: &mut Database) -> io::Result<()> {
+    let index = fetch_index(&config.server_url)?;
+
+    // Determine which version to install
+    let target_version = match version {
+        Some(v) => v.to_string(),
+        None => index.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index"))
+        })?.clone(),
+    };
+
+    // If already installed, just ensure it's marked manual (unless --force)
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
-            let index = fetch_index(&config.server_url)?;
-            if index.get(name).is_some_and(|v| *v == existing.version) {
-                if existing.reason == InstallReason::Auto {
-                    if let Some(pkg) = db.packages.get_mut(name) {
-                        pkg.reason = InstallReason::Manual;
-                    }
-                    db.save()?;
-                    println!("{name} marked as manually installed");
-                } else {
-                    println!("{name} {} is already installed", existing.version);
-                }
-                return Ok(());
+        if existing.reason == InstallReason::Auto {
+            if let Some(pkg) = db.packages.get_mut(name) {
+                pkg.reason = InstallReason::Manual;
+            }
+            db.save()?;
+            println!("{name} marked as manually installed");
+        } else {
+            println!("{name} is already installed ({}). Use --force to reinstall.", existing.version);
         }
+        return Ok(());
     }
 
-    let index = fetch_index(&config.server_url)?;
-    let to_install = resolve_dependencies(name, &config.server_url, &index, db)?;
+    let to_install = resolve_dependencies(name, &target_version, &config.server_url, &index, db)?;
 
     if to_install.is_empty() {
         println!("{name} is already installed");
@@ -373,6 +384,9 @@ pub fn install(name: &str, force: bool, config: &Config, db: &mut Database) -> i
 
         println!("  Installed {pkg_name} {version}");
     }
+
+    // Clean up orphaned auto-deps (e.g. after --force changed the dep tree)
+    purge_orphans(db)?;
 
     db.save()?;
     Ok(())
@@ -609,7 +623,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", false, &config, &mut db).unwrap();
+        install("toolA", None, false, &config, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert_eq!(db.packages["toolA"].version, "1.0");
@@ -629,7 +643,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
@@ -655,11 +669,11 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolB, which auto-installs toolA
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         // Explicitly install toolA — should flip to manual
-        install("toolA", false, &config, &mut db).unwrap();
+        install("toolA", None, false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
     }
 
@@ -677,7 +691,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", false, &config, &mut db).unwrap();
+        install("toolA", None, false, &config, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
 
         remove("toolA", false, false, false, &mut db).unwrap();
@@ -699,7 +713,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
 
         // toolA is a dep of toolB — remove should fail
         let result = remove("toolA", false, false, false, &mut db);
@@ -722,7 +736,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
 
         // Force remove toolA even though toolB depends on it
         remove("toolA", true, false, false, &mut db).unwrap();
@@ -745,7 +759,7 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         // toolB depends on toolA (auto-installed)
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         // Remove toolB: toolA should be auto-cleaned (orphaned auto dep)
@@ -771,8 +785,8 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolB (auto-installs toolA), then manually install toolA
-        install("toolB", false, &config, &mut db).unwrap();
-        install("toolA", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolA", None, false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
 
         // Remove toolB: toolA should stay (it's manual)
@@ -796,7 +810,7 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         // toolB depends on toolA
-        install("toolB", false, &config, &mut db).unwrap();
+        install("toolB", None, false, &config, &mut db).unwrap();
 
         // Remove toolA with --transitive: should also remove toolB
         remove("toolA", false, true, false, &mut db).unwrap();
@@ -883,7 +897,7 @@ mod tests {
 
         let index = fetch_index(&format!("http://127.0.0.1:{port}")).unwrap();
         let db = Database { packages: BTreeMap::new(), path: None };
-        let result = resolve_dependencies("cycleA", &format!("http://127.0.0.1:{port}"), &index, &db);
+        let result = resolve_dependencies("cycleA", "1.0", &format!("http://127.0.0.1:{port}"), &index, &db);
         assert!(result.is_err());
     }
 

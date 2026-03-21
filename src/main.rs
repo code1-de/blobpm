@@ -93,7 +93,8 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Install { name, force } => {
             let config = client::Config::load()?;
             let mut db = client::Database::load()?;
-            client::install(name, *force, &config, &mut db)?;
+            let (pkg_name, version) = parse_package_spec(name);
+            client::install(&pkg_name, version.as_deref(), *force, &config, &mut db)?;
         }
         Commands::Search { pattern } => {
             let config = client::Config::load()?;
@@ -146,6 +147,15 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Parse `name@version` into (name, Some(version)) or (name, None).
+fn parse_package_spec(spec: &str) -> (String, Option<String>) {
+    if let Some((name, version)) = spec.split_once('@') {
+        (name.to_string(), Some(version.to_string()))
+    } else {
+        (spec.to_string(), None)
+    }
 }
 
 fn prompt(label: &str, default: &str) -> std::io::Result<String> {

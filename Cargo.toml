@@ -23,6 +23,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-opt-level = "z"
+opt-level = "s"
 overflow-checks = false
 debug = false
