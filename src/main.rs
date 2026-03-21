@@ -33,17 +33,40 @@ enum Commands {
     Install {
         /// Package name
         name: String,
+
+        /// Reinstall even if already installed
+        #[arg(long)]
+        force: bool,
     },
     /// Remove an installed package
     Remove {
         /// Package name
         name: String,
+
+        /// Remove even if other packages depend on it
+        #[arg(long)]
+        force: bool,
+
+        /// Also remove dependencies that are no longer needed
+        #[arg(long)]
+        transitive: bool,
+
+        /// Don't auto-remove orphaned dependencies
+        #[arg(long)]
+        keep: bool,
+    },
+    /// Search for packages on the server (regex)
+    Search {
+        /// Regex pattern to match package names
+        pattern: String,
     },
     /// Mark a package as manually installed
     Manual {
         /// Package name
         name: String,
     },
+    /// Remove all orphaned auto-installed packages
+    Purge,
     /// Update all installed packages
     Update,
     /// List installed packages
@@ -67,13 +90,18 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(repo.clone(), *port))?;
         }
-        Commands::Install { name } => {
+        Commands::Install { name, force } => {
             let config = client::Config::load()?;
             let mut db = client::Database::load()?;
-            client::install(name, &config, &mut db)?;
+            client::install(name, *force, &config, &mut db)?;
         }
-        Commands::Remove { name } => {
-            println!("Removing {name}");
+        Commands::Search { pattern } => {
+            let config = client::Config::load()?;
+            client::search(pattern, &config)?;
+        }
+        Commands::Remove { name, force, transitive, keep } => {
+            let mut db = client::Database::load()?;
+            client::remove(name, *force, *transitive, *keep, &mut db)?;
         }
         Commands::Manual { name } => {
             let mut db = client::Database::load()?;
@@ -91,6 +119,10 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!("{name} is not installed").into());
                 }
             }
+        }
+        Commands::Purge => {
+            let mut db = client::Database::load()?;
+            client::purge(&mut db)?;
         }
         Commands::Update => {
             println!("Updating all packages");

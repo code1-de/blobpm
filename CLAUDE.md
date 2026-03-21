@@ -41,3 +41,4 @@ cargo run -- install <pkg>
 - Keep it simple — this is a personal tool
 - No async where not needed (server is async, client can be blocking)
 - Manifest file is called `blob.json`
+- DRY: Don't repeat yourself — extract shared logic into functions, never duplicate code

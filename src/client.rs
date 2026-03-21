@@ -30,6 +30,8 @@ pub struct InstalledPackage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Database {
     pub packages: BTreeMap<String, InstalledPackage>,
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 fn blob_dir() -> io::Result<PathBuf> {
@@ -99,31 +101,16 @@ impl Database {
     /// Returns an error if the file cannot be read or parsed.
     pub fn load() -> io::Result<Self> {
         let path = db_path()?;
-        if path.is_file() {
-            let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        } else {
-            let db = Self {
-                packages: BTreeMap::new(),
-            };
-            db.save()?;
-            Ok(db)
-        }
+        Self::load_from(&path)
     }
 
-    /// Save database to `~/.blob/db.json`.
+    /// Save database to its loaded path.
     ///
     /// # Errors
     /// Returns an error if the file cannot be written.
     pub fn save(&self) -> io::Result<()> {
-        let path = db_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&path, content)
+        let path = self.path.clone().map_or_else(db_path, Ok)?;
+        self.save_to(&path)
     }
 
     /// Load database from a specific path.
@@ -131,15 +118,18 @@ impl Database {
     /// # Errors
     /// Returns an error if the file cannot be read or parsed.
     pub fn load_from(path: &Path) -> io::Result<Self> {
-        if path.is_file() {
+        let mut db = if path.is_file() {
             let content = fs::read_to_string(path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_str::<Self>(&content)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         } else {
-            Ok(Self {
+            Self {
                 packages: BTreeMap::new(),
-            })
-        }
+                path: None,
+            }
+        };
+        db.path = Some(path.to_path_buf());
+        Ok(db)
     }
 
     /// Save database to a specific path.
@@ -307,21 +297,21 @@ fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Res
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()> {
-    // If already installed at latest version, just ensure it's marked manual
-    if let Some(existing) = db.packages.get(name) {
-        let index = fetch_index(&config.server_url)?;
-        if index.get(name).is_some_and(|v| *v == existing.version) {
-            if existing.reason == InstallReason::Auto {
-                if let Some(pkg) = db.packages.get_mut(name) {
-                    pkg.reason = InstallReason::Manual;
+pub fn install(name: &str, force: bool, config: &Config, db: &mut Database) -> io::Result<()> {
+    // If already installed at latest version, just ensure it's marked manual (unless --force)
+    if let Some(existing) = db.packages.get(name).filter(|_| !force) {
+            let index = fetch_index(&config.server_url)?;
+            if index.get(name).is_some_and(|v| *v == existing.version) {
+                if existing.reason == InstallReason::Auto {
+                    if let Some(pkg) = db.packages.get_mut(name) {
+                        pkg.reason = InstallReason::Manual;
+                    }
+                    db.save()?;
+                    println!("{name} marked as manually installed");
+                } else {
+                    println!("{name} {} is already installed", existing.version);
                 }
-                db.save()?;
-                println!("{name} marked as manually installed");
-            } else {
-                println!("{name} {} is already installed", existing.version);
-            }
-            return Ok(());
+                return Ok(());
         }
     }
 
@@ -382,6 +372,170 @@ pub fn install(name: &str, config: &Config, db: &mut Database) -> io::Result<()>
         );
 
         println!("  Installed {pkg_name} {version}");
+    }
+
+    db.save()?;
+    Ok(())
+}
+
+/// Search for packages on the server matching a regex pattern.
+///
+/// # Errors
+/// Returns an error if the index cannot be fetched or the regex is invalid.
+pub fn search(pattern: &str, config: &Config) -> io::Result<()> {
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex: {e}")))?;
+
+    let index = fetch_index(&config.server_url)?;
+    let mut found = false;
+
+    for (name, version) in &index {
+        if re.is_match(name) {
+            println!("{name} {version}");
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("No packages matching '{pattern}'");
+    }
+
+    Ok(())
+}
+
+/// Find all installed packages that depend on `name`.
+fn reverse_deps(name: &str, db: &Database) -> Vec<String> {
+    db.packages
+        .iter()
+        .filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string()))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// Find auto-installed dependencies of `name` that no other package needs.
+fn orphaned_deps(name: &str, db: &Database) -> Vec<String> {
+    let Some(pkg) = db.packages.get(name) else {
+        return vec![];
+    };
+
+    let mut orphans = Vec::new();
+    for dep in &pkg.dependencies {
+        let Some(dep_pkg) = db.packages.get(dep) else {
+            continue;
+        };
+        if dep_pkg.reason != InstallReason::Auto {
+            continue;
+        }
+        // Check if any other installed package (besides `name`) depends on this
+        let still_needed = db.packages.iter().any(|(n, p)| {
+            n != name && p.dependencies.contains(dep)
+        });
+        if !still_needed {
+            orphans.push(dep.clone());
+        }
+    }
+    orphans
+}
+
+/// Remove all orphaned auto-installed packages.
+fn purge_orphans(db: &mut Database) -> io::Result<()> {
+    loop {
+        let orphans: Vec<String> = db
+            .packages
+            .iter()
+            .filter(|(_, pkg)| pkg.reason == InstallReason::Auto)
+            .filter(|(dep_name, _)| {
+                !db.packages
+                    .iter()
+                    .any(|(_, p)| p.dependencies.contains(dep_name))
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        if orphans.is_empty() {
+            break;
+        }
+
+        for orphan in &orphans {
+            println!("Removing orphaned dependency {orphan}...");
+            remove_package_files(orphan, db)?;
+        }
+    }
+    Ok(())
+}
+
+/// Purge all orphaned auto-installed packages and save.
+///
+/// # Errors
+/// Returns an error if file removal or database save fails.
+pub fn purge(db: &mut Database) -> io::Result<()> {
+    purge_orphans(db)?;
+    db.save()
+}
+
+/// Remove files for a single package and delete its db entry.
+fn remove_package_files(name: &str, db: &mut Database) -> io::Result<()> {
+    let Some(pkg) = db.packages.get(name) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{name} is not installed"),
+        ));
+    };
+
+    for (file, path) in &pkg.files {
+        if path.is_file() {
+            fs::remove_file(path)?;
+            println!("  Removed {file} ({})", path.display());
+        }
+    }
+
+    db.packages.remove(name);
+    Ok(())
+}
+
+/// Remove a package, auto-clean orphaned deps, optionally cascade to dependents.
+///
+/// # Errors
+/// Returns an error if the package is not installed, is depended on (without --force/--transitive),
+/// or if file removal fails.
+pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mut Database) -> io::Result<()> {
+    if !db.packages.contains_key(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{name} is not installed"),
+        ));
+    }
+
+    // Check reverse dependencies
+    let rdeps = reverse_deps(name, db);
+    if !rdeps.is_empty() && !force && !transitive {
+        eprintln!("Cannot remove {name}: depended on by:");
+        for dep in &rdeps {
+            eprintln!("  {dep}");
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Use --force to override, or --transitive to also remove dependents.".to_string(),
+        ));
+    }
+
+    // --transitive: remove dependents first (upward cascade)
+    if transitive {
+        for rdep in &rdeps {
+            remove(rdep, false, true, true, db)?;
+        }
+    }
+
+    // Already removed by transitive cascade
+    if !db.packages.contains_key(name) {
+        return Ok(());
+    }
+
+    println!("Removing {name}...");
+    remove_package_files(name, db)?;
+
+    if !no_purge {
+        purge_orphans(db)?;
     }
 
     db.save()?;
@@ -455,7 +609,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", &config, &mut db).unwrap();
+        install("toolA", false, &config, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert_eq!(db.packages["toolA"].version, "1.0");
@@ -475,7 +629,7 @@ mod tests {
         };
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", &config, &mut db).unwrap();
+        install("toolB", false, &config, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
@@ -501,12 +655,153 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolB, which auto-installs toolA
-        install("toolB", &config, &mut db).unwrap();
+        install("toolB", false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         // Explicitly install toolA — should flip to manual
-        install("toolA", &config, &mut db).unwrap();
+        install("toolA", false, &config, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
+    }
+
+    #[test]
+    fn remove_simple_package() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("toolA", false, &config, &mut db).unwrap();
+        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+
+        remove("toolA", false, false, false, &mut db).unwrap();
+        assert!(!install_tmp.path().join("util").join("toolA.exe").exists());
+        assert!(!db.packages.contains_key("toolA"));
+    }
+
+    #[test]
+    fn remove_blocked_by_dependent() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("toolB", false, &config, &mut db).unwrap();
+
+        // toolA is a dep of toolB — remove should fail
+        let result = remove("toolA", false, false, false, &mut db);
+        assert!(result.is_err());
+        // toolA should still be installed
+        assert!(db.packages.contains_key("toolA"));
+    }
+
+    #[test]
+    fn remove_force_ignores_dependents() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("toolB", false, &config, &mut db).unwrap();
+
+        // Force remove toolA even though toolB depends on it
+        remove("toolA", true, false, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolA"));
+        assert!(db.packages.contains_key("toolB"));
+    }
+
+    #[test]
+    fn remove_auto_cleans_orphans() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // toolB depends on toolA (auto-installed)
+        install("toolB", false, &config, &mut db).unwrap();
+        assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
+
+        // Remove toolB: toolA should be auto-cleaned (orphaned auto dep)
+        remove("toolB", false, false, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolB"));
+        assert!(!db.packages.contains_key("toolA"));
+        assert!(!install_tmp.path().join("util").join("toolA.exe").exists());
+        assert!(!install_tmp.path().join("util").join("toolB.exe").exists());
+    }
+
+    #[test]
+    fn remove_keeps_manual_deps() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolB (auto-installs toolA), then manually install toolA
+        install("toolB", false, &config, &mut db).unwrap();
+        install("toolA", false, &config, &mut db).unwrap();
+        assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
+
+        // Remove toolB: toolA should stay (it's manual)
+        remove("toolB", false, false, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolB"));
+        assert!(db.packages.contains_key("toolA"));
+    }
+
+    #[test]
+    fn remove_transitive_cascades_upward() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port) = start_test_server(repo_tmp.path());
+
+        let config = Config {
+            server_url: format!("http://127.0.0.1:{port}"),
+            base_dir: install_tmp.path().to_path_buf(),
+        };
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // toolB depends on toolA
+        install("toolB", false, &config, &mut db).unwrap();
+
+        // Remove toolA with --transitive: should also remove toolB
+        remove("toolA", false, true, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolA"));
+        assert!(!db.packages.contains_key("toolB"));
     }
 
     #[test]
@@ -587,7 +882,7 @@ mod tests {
         let (_rt, port) = start_test_server(tmp.path());
 
         let index = fetch_index(&format!("http://127.0.0.1:{port}")).unwrap();
-        let db = Database { packages: BTreeMap::new() };
+        let db = Database { packages: BTreeMap::new(), path: None };
         let result = resolve_dependencies("cycleA", &format!("http://127.0.0.1:{port}"), &index, &db);
         assert!(result.is_err());
     }
@@ -629,6 +924,7 @@ mod tests {
 
         let mut db = Database {
             packages: BTreeMap::new(),
+            path: None,
         };
         db.packages.insert(
             "testpkg".to_string(),
@@ -663,6 +959,7 @@ mod tests {
     fn database_roundtrip_json() {
         let db = Database {
             packages: BTreeMap::new(),
+            path: None,
         };
         let json = serde_json::to_string(&db).unwrap();
         let loaded: Database = serde_json::from_str(&json).unwrap();
