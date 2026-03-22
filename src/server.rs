@@ -41,7 +41,12 @@ async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next:
         .and_then(|v| v.strip_prefix("Basic "))
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .is_some_and(|creds| creds.split_once(':').is_some_and(|(u, p)| u == expected_user && p == expected_pass));
+        .is_some_and(|creds| {
+            creds.split_once(':').is_some_and(|(u, p)| {
+                constant_time_eq::constant_time_eq(u.as_bytes(), expected_user.as_bytes())
+                    && constant_time_eq::constant_time_eq(p.as_bytes(), expected_pass.as_bytes())
+            })
+        });
 
     if authorized { next.run(req).await } else { (StatusCode::UNAUTHORIZED, "Unauthorized").into_response() }
 }
@@ -72,10 +77,12 @@ pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let Ok(index) = state.index.read() else {
-        return Json(serde_json::Value::Object(serde_json::Map::default()));
+    let value = {
+        let Ok(index) = state.index.read() else {
+            return Json(serde_json::Value::Object(serde_json::Map::default()));
+        };
+        serde_json::to_value(index.index_summary()).unwrap_or_default()
     };
-    let value = serde_json::to_value(index.index_summary()).unwrap_or_default();
     let size = serde_json::to_string(&value).map_or(0, |s| s.len());
     println!("GET /index ({size} bytes)");
     Json(value)

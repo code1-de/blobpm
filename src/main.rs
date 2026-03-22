@@ -11,7 +11,7 @@ mod tls;
 #[derive(Parser)]
 #[command(
     name = "blob",
-    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io", env!("CARGO_PKG_VERSION")),
+    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io\nMax file size per extracted file: 1 GB", env!("CARGO_PKG_VERSION")),
     version,
 )]
 struct Cli {
@@ -31,13 +31,13 @@ enum Commands {
         #[arg(long, default_value = "8803")]
         port: u16,
 
-        /// Username for Basic Auth (required)
-        #[arg(long)]
-        username: Option<String>,
+        /// Username for Basic Auth (or set `BLOB_USERNAME` env var)
+        #[arg(long, env = "BLOB_USERNAME")]
+        username: String,
 
-        /// Password for Basic Auth (required)
-        #[arg(long)]
-        password: Option<String>,
+        /// Password for Basic Auth (or set `BLOB_PASSWORD` env var)
+        #[arg(long, env = "BLOB_PASSWORD")]
+        password: String,
     },
     /// Install a package
     Install {
@@ -139,10 +139,8 @@ fn main() {
 fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Serve { repo, port, username, password } => {
-            let u = username.as_ref().ok_or("--username is required")?;
-            let p = password.as_ref().ok_or("--password is required")?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(repo.clone(), *port, (u.clone(), p.clone())))?;
+            rt.block_on(server::run(repo.clone(), *port, (username.clone(), password.clone())))?;
         }
         Commands::Install { name, force } => {
             let config = client::Config::load()?;

@@ -146,8 +146,7 @@ impl HttpClient {
         Ok(Self { client, config: config.clone() })
     }
 
-    fn get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
-        let mut req = self.client.get(url);
+    fn send(&self, mut req: reqwest::blocking::RequestBuilder) -> io::Result<reqwest::blocking::Response> {
         if !self.config.username.is_empty() {
             req = req.basic_auth(&self.config.username, Some(&self.config.password));
         }
@@ -161,19 +160,12 @@ impl HttpClient {
         Ok(resp)
     }
 
+    fn get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
+        self.send(self.client.get(url))
+    }
+
     fn post(&self, url: &str, body: Vec<u8>) -> io::Result<reqwest::blocking::Response> {
-        let mut req = self.client.post(url).body(body);
-        if !self.config.username.is_empty() {
-            req = req.basic_auth(&self.config.username, Some(&self.config.password));
-        }
-        let resp = req.send().map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Authentication failed. Check username/password in 'blob config'.",
-            ));
-        }
-        Ok(resp)
+        self.send(self.client.post(url).body(body))
     }
 }
 
@@ -248,6 +240,9 @@ fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<Path
 ///
 /// # Errors
 /// Returns an error if extraction or path validation fails.
+/// Maximum decompressed file size (1 GB) — zip bomb protection.
+const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
+
 fn extract_zip(
     zip_path: &Path,
     manifest: &Manifest,
@@ -280,8 +275,22 @@ fn extract_zip(
             .by_name(file)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("File {file} not in zip for {name}: {e}")))?;
 
+        if entry.size() > MAX_EXTRACT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("File {file} in {name} exceeds max size ({} bytes)", entry.size()),
+            ));
+        }
+
         let mut out = fs::File::create(&dest)?;
-        io::copy(&mut entry, &mut out)?;
+        let written = io::copy(&mut entry, &mut out)?;
+        if written > MAX_EXTRACT_SIZE {
+            fs::remove_file(&dest)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("File {file} in {name} exceeded max size during extraction"),
+            ));
+        }
 
         println!("  {} -> {}", file, dest.display());
         installed_files.insert(file.clone(), dest);
