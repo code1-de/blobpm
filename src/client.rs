@@ -195,7 +195,7 @@ pub fn fetch_versions(http: &HttpClient, name: &str) -> io::Result<Vec<String>> 
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
 pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Result<Manifest> {
-    let url = format!("{}/packages/{name}/{version}/blob.json", http.config.server_url);
+    let url = format!("{}/packages/{name}/{version}/manifest.json", http.config.server_url);
     let resp = http.get(&url)?;
     if !resp.status().is_success() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found")));
@@ -203,17 +203,76 @@ pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Resul
     resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Download a file from the server.
+/// Download a package zip to the cache. Returns the path to the cached zip.
 ///
 /// # Errors
-/// Returns an error if the HTTP request fails.
-pub fn download_file(http: &HttpClient, name: &str, version: &str, file: &str) -> io::Result<Vec<u8>> {
-    let url = format!("{}/packages/{name}/{version}/{file}", http.config.server_url);
+/// Returns an error if the HTTP request fails or the file cannot be written.
+fn cache_zip_path_in(name: &str, version: &str, base_dir: &Path) -> PathBuf {
+    base_dir.join(".cache").join(name).join(version).join("files.zip")
+}
+
+fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<PathBuf> {
+    let zip_path = cache_zip_path_in(name, version, &http.config.base_dir);
+    if zip_path.is_file() {
+        return Ok(zip_path);
+    }
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let url = format!("{}/packages/{name}/{version}/files.zip", http.config.server_url);
     let resp = http.get(&url)?;
     if !resp.status().is_success() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("File {file} not found in {name} {version}")));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found on server")));
     }
-    resp.bytes().map(|b| b.to_vec()).map_err(io::Error::other)
+    let bytes = resp.bytes().map_err(io::Error::other)?;
+    fs::write(&zip_path, &bytes)?;
+    Ok(zip_path)
+}
+
+/// Extract files from a zip to target directories based on the manifest.
+///
+/// # Errors
+/// Returns an error if extraction or path validation fails.
+fn extract_zip(
+    zip_path: &Path,
+    manifest: &Manifest,
+    base_dir: &Path,
+    name: &str,
+) -> io::Result<BTreeMap<String, PathBuf>> {
+    let canonical_base = dunce::canonicalize(base_dir)?;
+    let zip_file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(zip_file)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid zip for {name}: {e}")))?;
+
+    let mut installed_files = BTreeMap::new();
+
+    for (file, dest_dir) in &manifest.files {
+        validate_manifest_path(file, dest_dir, name)?;
+
+        let dest = base_dir.join(dest_dir.replace('/', "\\")).join(file);
+        if !dest.starts_with(&canonical_base) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Install target escapes base dir for {name}: {}", dest.display()),
+            ));
+        }
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut entry = archive
+            .by_name(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("File {file} not in zip for {name}: {e}")))?;
+
+        let mut out = fs::File::create(&dest)?;
+        io::copy(&mut entry, &mut out)?;
+
+        println!("  {} -> {}", file, dest.display());
+        installed_files.insert(file.clone(), dest);
+    }
+
+    Ok(installed_files)
 }
 
 /// Resolve dependencies recursively. Returns packages in install order (dependencies first).
@@ -351,11 +410,31 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         return Ok(());
     }
 
+    // Phase 1: download all zips
+    println!("Downloading {} package(s)...", to_install.len());
+    let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
     for (pkg_name, version, manifest) in &to_install {
-        let reason = if pkg_name == name { InstallReason::Manual } else { InstallReason::Auto };
+        let zip_path = download_zip(http, pkg_name, version)?;
+        println!("  Downloaded {pkg_name} {version}");
+        downloads.push((pkg_name, version, manifest, zip_path));
+    }
+
+    // Phase 2: extract all
+    for (pkg_name, version, manifest, zip_path) in &downloads {
+        let reason = if *pkg_name == name { InstallReason::Manual } else { InstallReason::Auto };
 
         println!("Installing {pkg_name} {version}...");
-        install_files(pkg_name, version, manifest, reason, http, db)?;
+        let installed_files = extract_zip(zip_path, manifest, &http.config.base_dir, pkg_name)?;
+
+        db.packages.insert(
+            pkg_name.to_string(),
+            InstalledPackage {
+                version: version.to_string(),
+                reason,
+                files: installed_files,
+                dependencies: manifest.dependencies.clone(),
+            },
+        );
         println!("  Installed {pkg_name} {version}");
     }
 
@@ -401,14 +480,23 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         list
     };
 
+    // Phase 1: resolve and download all zips
+    #[allow(clippy::type_complexity)]
+    let mut all_downloads: Vec<(String, String, Vec<(String, String, Manifest)>)> = Vec::new();
     for (pkg_name, new_version) in &packages {
+        let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
+        // Download zips for all new packages in this resolution
+        for (dep_name, dep_version, _) in &resolved {
+            download_zip(http, dep_name, dep_version)?;
+        }
+        all_downloads.push((pkg_name.clone(), new_version.clone(), resolved));
+    }
+
+    // Phase 2: extract and install
+    for (pkg_name, new_version, resolved) in &all_downloads {
         let old_version = db.packages[pkg_name].version.clone();
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
-        // Resolve and install new deps
-        let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
-
-        // Find the manifest for the main package from the resolved list
         let manifest = resolved
             .iter()
             .find(|(n, _, _)| n == pkg_name)
@@ -416,12 +504,22 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{pkg_name} not in resolved deps")))?;
 
         // Install new deps
-        for (dep_name, dep_version, dep_manifest) in &resolved {
+        for (dep_name, dep_version, dep_manifest) in resolved {
             if dep_name == pkg_name || db.packages.contains_key(dep_name) {
                 continue;
             }
             println!("  Installing new dependency {dep_name} {dep_version}...");
-            install_files(dep_name, dep_version, dep_manifest, InstallReason::Auto, http, db)?;
+            let zip_path = cache_zip_path_in(dep_name, dep_version, &http.config.base_dir);
+            let installed_files = extract_zip(&zip_path, dep_manifest, &http.config.base_dir, dep_name)?;
+            db.packages.insert(
+                dep_name.clone(),
+                InstalledPackage {
+                    version: dep_version.clone(),
+                    reason: InstallReason::Auto,
+                    files: installed_files,
+                    dependencies: dep_manifest.dependencies.clone(),
+                },
+            );
         }
 
         // Remove old files that are no longer in the new manifest
@@ -435,59 +533,23 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         }
 
         let reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
-        install_files(pkg_name, new_version, &manifest, reason, http, db)?;
+        let zip_path = cache_zip_path_in(pkg_name, new_version, &http.config.base_dir);
+        let installed_files = extract_zip(&zip_path, &manifest, &http.config.base_dir, pkg_name)?;
+        db.packages.insert(
+            pkg_name.clone(),
+            InstalledPackage {
+                version: new_version.clone(),
+                reason,
+                files: installed_files,
+                dependencies: manifest.dependencies.clone(),
+            },
+        );
     }
 
     purge_orphans(db)?;
     db.save()?;
 
     println!("Updated {} package(s).", packages.len());
-    Ok(())
-}
-
-/// Download and write files for a single package, update db entry.
-fn install_files(
-    name: &str,
-    version: &str,
-    manifest: &Manifest,
-    reason: InstallReason,
-    http: &HttpClient,
-    db: &mut Database,
-) -> io::Result<()> {
-    let canonical_base = dunce::canonicalize(&http.config.base_dir)?;
-    let mut installed_files = BTreeMap::new();
-
-    for (file, dest_dir) in &manifest.files {
-        validate_manifest_path(file, dest_dir, name)?;
-
-        let dest = http.config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
-
-        if !dest.starts_with(&canonical_base) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Install target escapes base dir for {name}: {}", dest.display()),
-            ));
-        }
-
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let bytes = download_file(http, name, version, file)?;
-        fs::write(&dest, &bytes)?;
-        println!("  {} -> {}", file, dest.display());
-        installed_files.insert(file.clone(), dest);
-    }
-
-    db.packages.insert(
-        name.to_string(),
-        InstalledPackage {
-            version: version.to_string(),
-            reason,
-            files: installed_files,
-            dependencies: manifest.dependencies.clone(),
-        },
-    );
     Ok(())
 }
 
@@ -628,24 +690,26 @@ pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mu
 mod tests {
     use super::*;
 
+    use crate::testutil::helpers::create_zip;
+
     fn create_test_repo(base: &Path) {
         let pkg_dir = base.join("packages").join("toolA").join("1.0");
         fs::create_dir_all(&pkg_dir).unwrap();
         fs::write(
-            pkg_dir.join("blob.json"),
+            pkg_dir.join("manifest.json"),
             r#"{"name":"toolA","description":"Tool A","files":{"toolA.exe":"util/"},"dependencies":[]}"#,
         )
         .unwrap();
-        fs::write(pkg_dir.join("toolA.exe"), b"toolA-binary").unwrap();
+        create_zip(&pkg_dir, &[("toolA.exe", b"toolA-binary")]);
 
         let pkg_dir2 = base.join("packages").join("toolB").join("2.0");
         fs::create_dir_all(&pkg_dir2).unwrap();
         fs::write(
-            pkg_dir2.join("blob.json"),
+            pkg_dir2.join("manifest.json"),
             r#"{"name":"toolB","description":"Tool B","files":{"toolB.exe":"util/"},"dependencies":["toolA"]}"#,
         )
         .unwrap();
-        fs::write(pkg_dir2.join("toolB.exe"), b"toolB-binary").unwrap();
+        create_zip(&pkg_dir2, &[("toolB.exe", b"toolB-binary")]);
     }
 
     use crate::testutil::helpers::{TEST_PASS, TEST_USER, start_tls_server};
@@ -935,11 +999,11 @@ mod tests {
             let dir = base.join("packages").join(name).join(ver);
             fs::create_dir_all(&dir).unwrap();
             fs::write(
-                dir.join("blob.json"),
+                dir.join("manifest.json"),
                 format!(r#"{{"name":"{name}","description":"","files":{{"{file}":"util/"}},"dependencies":{deps}}}"#),
             )
             .unwrap();
-            fs::write(dir.join(file), format!("{name}-{ver}-binary").as_bytes()).unwrap();
+            create_zip(&dir, &[(file, format!("{name}-{ver}-binary").as_bytes())]);
         }
     }
 
@@ -1065,7 +1129,7 @@ mod tests {
         let pkg_a = tmp.path().join("packages").join("cycleA").join("1.0");
         fs::create_dir_all(&pkg_a).unwrap();
         fs::write(
-            pkg_a.join("blob.json"),
+            pkg_a.join("manifest.json"),
             r#"{"name":"cycleA","description":"A","files":{},"dependencies":["cycleB"]}"#,
         )
         .unwrap();
@@ -1073,7 +1137,7 @@ mod tests {
         let pkg_b = tmp.path().join("packages").join("cycleB").join("1.0");
         fs::create_dir_all(&pkg_b).unwrap();
         fs::write(
-            pkg_b.join("blob.json"),
+            pkg_b.join("manifest.json"),
             r#"{"name":"cycleB","description":"B","files":{},"dependencies":["cycleA"]}"#,
         )
         .unwrap();
@@ -1148,5 +1212,103 @@ mod tests {
         let json = serde_json::to_string(&db).unwrap();
         let loaded: Database = serde_json::from_str(&json).unwrap();
         assert!(loaded.packages.is_empty());
+    }
+
+    #[test]
+    fn cache_reuse_skips_download() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolA — downloads zip to cache
+        install("toolA", None, false, &http, &mut db).unwrap();
+        let cache_path = cache_zip_path_in("toolA", "1.0", install_tmp.path());
+        assert!(cache_path.is_file());
+
+        // Remove toolA but keep cache
+        remove("toolA", false, false, false, &mut db).unwrap();
+        assert!(cache_path.is_file()); // cache should still exist
+
+        // Reinstall — should reuse cache (no download needed)
+        install("toolA", None, false, &http, &mut db).unwrap();
+        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+    }
+
+    #[test]
+    fn download_all_before_install() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolB (depends on toolA) — both zips should be cached
+        install("toolB", None, false, &http, &mut db).unwrap();
+        assert!(cache_zip_path_in("toolA", "1.0", install_tmp.path()).is_file());
+        assert!(cache_zip_path_in("toolB", "2.0", install_tmp.path()).is_file());
+        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+        assert!(install_tmp.path().join("util").join("toolB.exe").exists());
+    }
+
+    #[test]
+    fn failed_download_leaves_nothing_installed() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+
+        // Create repo with toolC that depends on "missing" (which doesn't exist)
+        let pkg_dir = repo_tmp.path().join("packages").join("missing_dep").join("1.0");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("manifest.json"),
+            r#"{"name":"missing_dep","description":"","files":{"x.exe":"util/"},"dependencies":["nonexistent"]}"#,
+        )
+        .unwrap();
+        create_zip(&pkg_dir, &[("x.exe", b"binary")]);
+
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install should fail because "nonexistent" dep isn't in the index
+        let result = install("missing_dep", None, false, &http, &mut db);
+        assert!(result.is_err());
+        // Nothing should be installed
+        assert!(db.packages.is_empty());
+        assert!(!install_tmp.path().join("util").join("x.exe").exists());
+    }
+
+    #[test]
+    fn extract_zip_missing_file_in_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a zip with only "a.exe" but manifest expects "b.exe"
+        create_zip(tmp.path(), &[("a.exe", b"binary-a")]);
+
+        let manifest = crate::repo::Manifest {
+            name: "bad".to_string(),
+            description: "bad".to_string(),
+            files: BTreeMap::from([("b.exe".to_string(), "util/".to_string())]),
+            dependencies: vec![],
+        };
+
+        let base = tmp.path().join("install");
+        fs::create_dir_all(&base).unwrap();
+
+        let result = extract_zip(&tmp.path().join("files.zip"), &manifest, &base, "bad");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("b.exe"));
     }
 }

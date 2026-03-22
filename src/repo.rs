@@ -51,7 +51,7 @@ impl RepoIndex {
                     continue;
                 }
                 let ver = ver_entry.file_name().to_string_lossy().to_string();
-                let manifest_path = ver_entry.path().join("blob.json");
+                let manifest_path = ver_entry.path().join("manifest.json");
                 if manifest_path.is_file() {
                     versions.push(ver);
                 }
@@ -154,7 +154,7 @@ mod tests {
         let pkg_dir = base.join("packages").join("testpkg").join("1.0");
         fs::create_dir_all(&pkg_dir).unwrap();
         fs::write(
-            pkg_dir.join("blob.json"),
+            pkg_dir.join("manifest.json"),
             r#"{"name":"testpkg","description":"A test package","files":{"test.exe":"util/"},"dependencies":[]}"#,
         )
         .unwrap();
@@ -162,7 +162,7 @@ mod tests {
         let pkg_dir2 = base.join("packages").join("testpkg").join("2.0");
         fs::create_dir_all(&pkg_dir2).unwrap();
         fs::write(
-            pkg_dir2.join("blob.json"),
+            pkg_dir2.join("manifest.json"),
             r#"{"name":"testpkg","description":"A test package v2","files":{"test.exe":"util/"},"dependencies":[]}"#,
         )
         .unwrap();
@@ -170,7 +170,7 @@ mod tests {
         let other_dir = base.join("packages").join("other").join("0.1");
         fs::create_dir_all(&other_dir).unwrap();
         fs::write(
-            other_dir.join("blob.json"),
+            other_dir.join("manifest.json"),
             r#"{"name":"other","description":"Another package","files":{"other.exe":"bin/"},"dependencies":["testpkg"]}"#,
         )
         .unwrap();

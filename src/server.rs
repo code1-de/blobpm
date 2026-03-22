@@ -136,18 +136,18 @@ async fn get_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::helpers::{TEST_PASS, TEST_USER, start_tls_server, tls_client_no_auth};
+    use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server, tls_client_no_auth};
     use std::fs;
 
     fn create_test_repo(base: &std::path::Path) {
         let pkg_dir = base.join("packages").join("testpkg").join("1.0");
         fs::create_dir_all(&pkg_dir).unwrap();
         fs::write(
-            pkg_dir.join("blob.json"),
+            pkg_dir.join("manifest.json"),
             r#"{"name":"testpkg","description":"A test","files":{"test.exe":"util/"},"dependencies":[]}"#,
         )
         .unwrap();
-        fs::write(pkg_dir.join("test.exe"), b"fake-exe-content").unwrap();
+        create_zip(&pkg_dir, &[("test.exe", b"fake-exe-content")]);
     }
 
     fn auth_get(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
@@ -174,22 +174,23 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(tmp.path());
         let client = tls_client_no_auth(&fp);
 
-        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/blob.json"));
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/manifest.json"));
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().unwrap();
         assert_eq!(json["name"], "testpkg");
     }
 
     #[test]
-    fn test_get_file() {
+    fn test_get_zip() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
         let client = tls_client_no_auth(&fp);
 
-        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/test.exe"));
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/files.zip"));
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.bytes().unwrap().as_ref(), b"fake-exe-content");
+        let bytes = resp.bytes().unwrap();
+        assert!(!bytes.is_empty());
     }
 
     #[test]
@@ -199,7 +200,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(tmp.path());
         let client = tls_client_no_auth(&fp);
 
-        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/nonexistent/1.0/blob.json"));
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/nonexistent/1.0/manifest.json"));
         assert_eq!(resp.status(), 404);
     }
 
@@ -210,7 +211,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(tmp.path());
         let client = tls_client_no_auth(&fp);
 
-        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/9.9/blob.json"));
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/9.9/manifest.json"));
         assert_eq!(resp.status(), 404);
     }
 

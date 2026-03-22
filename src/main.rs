@@ -46,7 +46,7 @@ enum Commands {
         name: String,
 
         /// Reinstall even if already installed
-        #[arg(long)]
+        #[arg(long, short)]
         force: bool,
     },
     /// Remove an installed package

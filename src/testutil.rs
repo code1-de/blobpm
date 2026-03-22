@@ -4,8 +4,12 @@
 pub mod helpers {
     use crate::repo::RepoIndex;
     use crate::server::{self, AppState};
+    use std::fs;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(19000);
 
     pub const TEST_USER: &str = "test";
     pub const TEST_PASS: &str = "test";
@@ -36,11 +40,8 @@ pub mod helpers {
         let fingerprint = crate::tls::cert_fingerprint(cert_der.as_ref());
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let port = rt.block_on(async {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-
+        let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        rt.block_on(async {
             let tls_config =
                 axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
                     .await
@@ -51,8 +52,13 @@ pub mod helpers {
                 axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.unwrap();
             });
 
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            port
+            // Wait for the server to be ready
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+            }
         });
 
         (rt, port, fingerprint)
@@ -69,5 +75,18 @@ pub mod helpers {
             .with_no_client_auth();
 
         reqwest::blocking::Client::builder().use_preconfigured_tls(tls_config).build().unwrap()
+    }
+
+    /// Create a files.zip in `dir` containing the given files.
+    pub fn create_zip(dir: &Path, files: &[(&str, &[u8])]) {
+        let zip_path = dir.join("files.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, content) in files {
+            zip.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut zip, content).unwrap();
+        }
+        zip.finish().unwrap();
     }
 }
