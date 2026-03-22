@@ -160,6 +160,21 @@ impl HttpClient {
         }
         Ok(resp)
     }
+
+    fn post(&self, url: &str, body: Vec<u8>) -> io::Result<reqwest::blocking::Response> {
+        let mut req = self.client.post(url).body(body);
+        if !self.config.username.is_empty() {
+            req = req.basic_auth(&self.config.username, Some(&self.config.password));
+        }
+        let resp = req.send().map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Authentication failed. Check username/password in 'blob config'.",
+            ));
+        }
+        Ok(resp)
+    }
 }
 
 /// Fetch the package index from the server.
@@ -581,6 +596,189 @@ pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Resu
     }
 
     Ok(())
+}
+
+/// Parse mapping rules ("`glob:dest_dir`/") and match files.
+/// Absolute globs use basename as filename. Relative globs use path relative to `from`.
+/// Returns a map of (filename → `dest_dir`) and a map of (filename → absolute source path).
+fn resolve_mappings(
+    from: &Path,
+    mappings: &[String],
+) -> io::Result<(BTreeMap<String, String>, BTreeMap<String, PathBuf>)> {
+    let mut files = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    let from = dunce::canonicalize(from)?;
+
+    for mapping in mappings {
+        let (pattern, dest) = mapping.rsplit_once(':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid mapping (missing ':'): {mapping}"))
+        })?;
+
+        let is_absolute = Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
+
+        let full_pattern =
+            if is_absolute { pattern.to_string() } else { from.join(pattern).to_string_lossy().to_string() };
+
+        let matched = glob::glob(&full_pattern)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
+
+        for entry in matched {
+            let path = entry.map_err(|e| io::Error::other(format!("Glob error: {e}")))?;
+            if !path.is_file() {
+                continue;
+            }
+            let name = if is_absolute {
+                // Absolute glob: use just the filename
+                path.file_name().ok_or_else(|| io::Error::other("No filename"))?.to_string_lossy().to_string()
+            } else {
+                // Relative glob: preserve path relative to --from
+                path.strip_prefix(&from)
+                    .map_err(|e| io::Error::other(format!("Path error: {e}")))?
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
+            if !files.contains_key(&name) {
+                files.insert(name.clone(), dest.to_string());
+                sources.insert(name, path);
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "No files matched the mapping patterns"));
+    }
+
+    Ok((files, sources))
+}
+
+/// Create a zip file from source paths.
+fn create_package_zip(sources: &BTreeMap<String, PathBuf>) -> io::Result<Vec<u8>> {
+    let mut buf = io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default();
+        for (zip_name, src_path) in sources {
+            let content = fs::read(src_path)?;
+            zip.start_file(zip_name, options).map_err(|e| io::Error::other(format!("Zip error: {e}")))?;
+            io::Write::write_all(&mut zip, &content)?;
+        }
+        zip.finish().map_err(|e| io::Error::other(format!("Zip error: {e}")))?;
+    }
+    Ok(buf.into_inner())
+}
+
+/// Upload a package to the server.
+///
+/// # Errors
+/// Returns an error if glob matching, zip creation, or upload fails.
+pub fn upload(
+    name: &str,
+    version: &str,
+    from: &Path,
+    mappings: &[String],
+    deps: &[String],
+    description: &str,
+    http: &HttpClient,
+) -> io::Result<()> {
+    let (files, sources) = resolve_mappings(from, mappings)?;
+
+    println!("Package: {name}@{version}");
+    println!("Files: {}", files.len());
+    for (file, dest) in &files {
+        println!("  {file} -> {dest}");
+    }
+
+    let manifest = crate::repo::Manifest {
+        name: name.to_string(),
+        description: description.to_string(),
+        files,
+        dependencies: deps.to_vec(),
+    };
+
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
+    let zip_data = create_package_zip(&sources)?;
+
+    println!("Uploading {name}@{version} ({} bytes)...", zip_data.len());
+
+    // Upload manifest
+    let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);
+    let resp = http.post(&url, manifest_json.into_bytes())?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("Failed to upload manifest: {}", resp.status())));
+    }
+
+    // Upload zip
+    let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
+    let resp = http.post(&url, zip_data)?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
+    }
+
+    println!("Uploaded {name}@{version}");
+    Ok(())
+}
+
+fn prompt_line(label: &str, default: &str) -> io::Result<String> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    io::Write::flush(&mut io::stdout())?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    if input.is_empty() { Ok(default.to_string()) } else { Ok(input.to_string()) }
+}
+
+/// Interactive upload — review and edit all fields before uploading.
+///
+/// # Errors
+/// Returns an error if the upload fails.
+pub fn upload_interactive(
+    name: &str,
+    version: &str,
+    from: &Path,
+    existing_mappings: &[String],
+    existing_deps: &[String],
+    existing_desc: &str,
+    http: &HttpClient,
+) -> io::Result<()> {
+    println!("Upload {name}@{version} from {}", from.display());
+
+    // Show existing mappings, allow adding more
+    let mut mappings: Vec<String> = existing_mappings.to_vec();
+    if !mappings.is_empty() {
+        println!("Current mappings:");
+        for m in &mappings {
+            println!("  {m}");
+        }
+    }
+    println!("Enter additional file mappings (glob:dest_dir/), empty line to finish:");
+    loop {
+        print!("  mapping> ");
+        io::Write::flush(&mut io::stdout())?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        mappings.push(line.to_string());
+    }
+
+    if mappings.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No mappings provided"));
+    }
+
+    let description = prompt_line("Description", existing_desc)?;
+
+    let deps_default = existing_deps.join(", ");
+    let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
+    let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+
+    upload(name, version, from, &mappings, &deps, &description, http)
 }
 
 /// Find all installed packages that depend on `name`.

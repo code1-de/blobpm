@@ -13,8 +13,9 @@ use std::sync::Arc;
 use crate::repo::RepoIndex;
 
 pub struct AppState {
-    pub index: RepoIndex,
+    pub index: std::sync::RwLock<RepoIndex>,
     pub auth: (String, String),
+    pub repo_path: PathBuf,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -22,6 +23,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/index", get(get_index))
         .route("/packages/{name}", get(get_versions))
         .route("/packages/{name}/{version}/{filename}", get(get_file))
+        .route(
+            "/upload/{name}/{version}/{filename}",
+            axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -49,7 +54,9 @@ pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::
     let index = RepoIndex::scan(&repo_path)?;
     let pkg_count = index.packages.len();
 
-    let state = Arc::new(AppState { index, auth });
+    println!("Serving repo {} on https://0.0.0.0:{port}", repo_path.display());
+
+    let state = Arc::new(AppState { index: std::sync::RwLock::new(index), auth, repo_path });
     let app = build_router(state);
 
     let (cert_path, key_path) = crate::tls::ensure_certs()?;
@@ -57,7 +64,6 @@ pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("Serving repo {} on https://{addr}", repo_path.display());
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
     println!("Basic Auth: enabled");
@@ -66,7 +72,10 @@ pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let value = serde_json::to_value(state.index.index_summary()).unwrap_or_default();
+    let Ok(index) = state.index.read() else {
+        return Json(serde_json::Value::Object(serde_json::Map::default()));
+    };
+    let value = serde_json::to_value(index.index_summary()).unwrap_or_default();
     let size = serde_json::to_string(&value).map_or(0, |s| s.len());
     println!("GET /index ({size} bytes)");
     Json(value)
@@ -76,7 +85,10 @@ async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     if !is_safe_segment(&name) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let Some(pkg) = state.index.packages.get(&name) else {
+    let Ok(index) = state.index.read() else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let Some(pkg) = index.packages.get(&name) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let value = serde_json::json!({
@@ -102,24 +114,31 @@ async fn get_file(
     State(state): State<Arc<AppState>>,
     Path((name, version, filename)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let Some(pkg) = state.index.packages.get(&name) else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    if !pkg.versions.contains(&version) {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
     if !is_safe_segment(&name) || !is_safe_segment(&version) || !is_safe_segment(&filename) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let path = state.index.package_file_path(&name, &version, &filename);
+    // Check index (lock scope limited to avoid holding across await)
+    {
+        let Ok(index) = state.index.read() else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(pkg) = index.packages.get(&name) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        if !pkg.versions.contains(&version) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+
+    let path = state.repo_path.join("packages").join(&name).join(&version).join(&filename);
 
     // Verify resolved path is inside the repo
     let Ok(canonical) = tokio::fs::canonicalize(&path).await else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(repo_base) = tokio::fs::canonicalize(state.index.package_file_path(&name, &version, "")).await else {
+    let Ok(repo_base) = tokio::fs::canonicalize(state.repo_path.join("packages").join(&name).join(&version)).await
+    else {
         return Err(StatusCode::NOT_FOUND);
     };
     if !canonical.starts_with(&repo_base) {
@@ -132,6 +151,44 @@ async fn get_file(
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
+}
+
+async fn post_upload(
+    State(state): State<Arc<AppState>>,
+    Path((name, version, filename)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if !is_safe_segment(&name) || !is_safe_segment(&version) || !is_safe_segment(&filename) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Only allow manifest.json and files.zip
+    if filename != "manifest.json" && filename != "files.zip" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let dir = state.repo_path.join("packages").join(&name).join(&version);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("Failed to create dir {}: {e}", dir.display());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let path = dir.join(&filename);
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        eprintln!("Failed to write {}: {e}", path.display());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    println!("POST /upload/{name}/{version}/{filename} ({} bytes)", body.len());
+
+    // Rescan index after manifest upload
+    if filename == "manifest.json"
+        && let Ok(new_index) = RepoIndex::scan(&state.repo_path)
+        && let Ok(mut index) = state.index.write()
+    {
+        *index = new_index;
+    }
+
+    Ok(StatusCode::CREATED)
 }
 
 #[cfg(test)]
@@ -270,5 +327,59 @@ mod tests {
 
         let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn test_upload_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Upload a manifest
+        let manifest = r#"{"name":"newpkg","description":"test","files":{"new.exe":"util/"},"dependencies":[]}"#;
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/newpkg/1.0/manifest.json"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(manifest.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Upload a zip
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut zip_buf);
+            zip.start_file("new.exe", zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, b"new-binary").unwrap();
+            zip.finish().unwrap();
+        }
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/newpkg/1.0/files.zip"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(zip_buf.into_inner())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Verify files exist on disk
+        assert!(tmp.path().join("packages/newpkg/1.0/manifest.json").is_file());
+        assert!(tmp.path().join("packages/newpkg/1.0/files.zip").is_file());
+    }
+
+    #[test]
+    fn test_upload_rejects_bad_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/pkg/1.0/evil.txt"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body("data")
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }

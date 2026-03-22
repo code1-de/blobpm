@@ -92,6 +92,30 @@ enum Commands {
         /// Package name (optional, show details for this package)
         name: Option<String>,
     },
+    /// Upload a package to the server
+    Upload {
+        /// Package name@version
+        package: String,
+
+        /// File mappings: "`glob:dest_dir`/" (first match wins)
+        mappings: Vec<String>,
+
+        /// Source directory (default: current dir)
+        #[arg(long, default_value = ".")]
+        from: PathBuf,
+
+        /// Dependencies
+        #[arg(long = "dep", short)]
+        deps: Vec<String>,
+
+        /// Package description
+        #[arg(long, default_value = "")]
+        description: String,
+
+        /// Interactive mode — review and edit all fields before uploading
+        #[arg(long, short)]
+        interactive: bool,
+    },
     /// Generate TLS certificate and key
     GenerateKeys,
     /// Configure blob settings
@@ -108,6 +132,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Serve { repo, port, username, password } => {
@@ -189,6 +214,18 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+        }
+        Commands::Upload { package, mappings, from, deps, description, interactive } => {
+            let (pkg_name, version) = parse_package_spec(package);
+            let version = version.ok_or("Version required: use name@version")?;
+            let config = client::Config::load()?;
+            let http = client::HttpClient::new(&config)?;
+
+            if *interactive || mappings.is_empty() {
+                client::upload_interactive(&pkg_name, &version, from, mappings, deps, description, &http)?;
+            } else {
+                client::upload(&pkg_name, &version, from, mappings, deps, description, &http)?;
             }
         }
         Commands::GenerateKeys => {

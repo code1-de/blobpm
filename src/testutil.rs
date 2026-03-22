@@ -27,7 +27,8 @@ pub mod helpers {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let index = RepoIndex::scan(repo_path).unwrap();
-        let state = Arc::new(AppState { index, auth });
+        let state =
+            Arc::new(AppState { index: std::sync::RwLock::new(index), auth, repo_path: repo_path.to_path_buf() });
         let app = server::build_router(state);
 
         let key_pair = rcgen::KeyPair::generate().unwrap();

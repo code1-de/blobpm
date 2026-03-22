@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::{fs, io};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +20,6 @@ pub struct PackageInfo {
 #[derive(Debug)]
 pub struct RepoIndex {
     pub packages: BTreeMap<String, PackageInfo>,
-    repo_path: PathBuf,
 }
 
 impl RepoIndex {
@@ -33,7 +32,7 @@ impl RepoIndex {
         let mut packages = BTreeMap::new();
 
         if !packages_dir.is_dir() {
-            return Ok(Self { packages, repo_path: repo_path.to_path_buf() });
+            return Ok(Self { packages });
         }
 
         for entry in fs::read_dir(&packages_dir)? {
@@ -69,11 +68,7 @@ impl RepoIndex {
             packages.insert(pkg_name, PackageInfo { latest, versions });
         }
 
-        Ok(Self { packages, repo_path: repo_path.to_path_buf() })
-    }
-
-    pub fn package_file_path(&self, name: &str, version: &str, file: &str) -> PathBuf {
-        self.repo_path.join("packages").join(name).join(version).join(file)
+        Ok(Self { packages })
     }
 
     /// Build a summary index mapping package names to their latest version.
