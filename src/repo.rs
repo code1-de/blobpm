@@ -12,15 +12,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone)]
-pub struct PackageVersion {
-    pub version: String,
-    pub path: PathBuf,
-    pub manifest: Manifest,
-}
-
-#[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub name: String,
     pub latest: String,
     pub versions: Vec<String>,
 }
@@ -41,10 +33,7 @@ impl RepoIndex {
         let mut packages = BTreeMap::new();
 
         if !packages_dir.is_dir() {
-            return Ok(Self {
-                packages,
-                repo_path: repo_path.to_path_buf(),
-            });
+            return Ok(Self { packages, repo_path: repo_path.to_path_buf() });
         }
 
         for entry in fs::read_dir(&packages_dir)? {
@@ -77,65 +66,20 @@ impl RepoIndex {
             let Some(latest) = versions.last().cloned() else {
                 continue;
             };
-            packages.insert(
-                pkg_name.clone(),
-                PackageInfo {
-                    name: pkg_name,
-                    latest,
-                    versions,
-                },
-            );
+            packages.insert(pkg_name, PackageInfo { latest, versions });
         }
 
-        Ok(Self {
-            packages,
-            repo_path: repo_path.to_path_buf(),
-        })
-    }
-
-    /// Load the manifest for a specific package version.
-    ///
-    /// # Errors
-    /// Returns an error if the manifest file cannot be read or parsed.
-    pub fn load_manifest(&self, name: &str, version: &str) -> io::Result<PackageVersion> {
-        let manifest_path = self
-            .repo_path
-            .join("packages")
-            .join(name)
-            .join(version)
-            .join("blob.json");
-
-        let content = fs::read_to_string(&manifest_path)?;
-        let manifest: Manifest = serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let path = manifest_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-
-        Ok(PackageVersion {
-            version: version.to_string(),
-            path,
-            manifest,
-        })
+        Ok(Self { packages, repo_path: repo_path.to_path_buf() })
     }
 
     pub fn package_file_path(&self, name: &str, version: &str, file: &str) -> PathBuf {
-        self.repo_path
-            .join("packages")
-            .join(name)
-            .join(version)
-            .join(file)
+        self.repo_path.join("packages").join(name).join(version).join(file)
     }
 
     /// Build a summary index mapping package names to their latest version.
     #[must_use]
     pub fn index_summary(&self) -> BTreeMap<String, String> {
-        self.packages
-            .iter()
-            .map(|(name, info)| (name.clone(), info.latest.clone()))
-            .collect()
+        self.packages.iter().map(|(name, info)| (name.clone(), info.latest.clone())).collect()
     }
 }
 
@@ -151,26 +95,14 @@ struct VersionSegment {
 impl VersionSegment {
     fn parse(s: &str) -> Self {
         // Split on '-' first to detect pre-release
-        let (main, prerelease) = if let Some((m, p)) = s.split_once('-') {
-            (m, Some(p))
-        } else {
-            (s, None)
-        };
+        let (main, prerelease) = if let Some((m, p)) = s.split_once('-') { (m, Some(p)) } else { (s, None) };
 
         // Extract leading digits and trailing text from main part
         let num_end = main.find(|c: char| !c.is_ascii_digit()).unwrap_or(main.len());
         let num = main[..num_end].parse().unwrap_or(0);
-        let suffix = if let Some(pre) = prerelease {
-            pre.to_string()
-        } else {
-            main[num_end..].to_string()
-        };
+        let suffix = if let Some(pre) = prerelease { pre.to_string() } else { main[num_end..].to_string() };
 
-        Self {
-            num,
-            suffix,
-            is_prerelease: prerelease.is_some(),
-        }
+        Self { num, suffix, is_prerelease: prerelease.is_some() }
     }
 }
 
@@ -205,7 +137,7 @@ impl PartialOrd for VersionSegment {
 /// Rules:
 /// - Split on '.' into segments
 /// - Each segment: numeric prefix compared numerically, then suffix
-/// - Letter suffix (1.10a) > no suffix (1.10) > pre-release (1.10-beta)
+/// - No suffix (1.10) > letter suffix (1.10a) > pre-release (1.10-beta)
 /// - Fewer segments < more segments if prefix is equal (1.0 < 1.0.1)
 fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let a_parts: Vec<VersionSegment> = a.split('.').map(VersionSegment::parse).collect();
@@ -270,18 +202,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let index = RepoIndex::scan(tmp.path()).unwrap();
         assert!(index.packages.is_empty());
-    }
-
-    #[test]
-    fn load_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        create_test_repo(tmp.path());
-
-        let index = RepoIndex::scan(tmp.path()).unwrap();
-        let pkg = index.load_manifest("testpkg", "2.0").unwrap();
-        assert_eq!(pkg.manifest.name, "testpkg");
-        assert_eq!(pkg.version, "2.0");
-        assert_eq!(pkg.manifest.files["test.exe"], "util/");
     }
 
     #[test]

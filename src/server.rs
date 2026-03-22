@@ -35,19 +35,14 @@ pub async fn run(repo_path: PathBuf, port: u16) -> std::io::Result<()> {
 
     let (cert_path, key_path) = crate::tls::ensure_certs()?;
     let fingerprint = crate::tls::current_fingerprint()?;
-    let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(std::io::Error::other)?;
+    let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Serving repo {} on https://{addr}", repo_path.display());
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
 
-    axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service())
-        .await
-        .map_err(std::io::Error::other)
+    axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.map_err(std::io::Error::other)
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -57,10 +52,10 @@ async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     Json(value)
 }
 
-async fn get_versions(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
+async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> impl IntoResponse {
+    if !is_safe_segment(&name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let Some(pkg) = state.index.packages.get(&name) else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -104,9 +99,7 @@ async fn get_file(
     let Ok(canonical) = tokio::fs::canonicalize(&path).await else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(repo_base) = tokio::fs::canonicalize(
-        state.index.package_file_path(&name, &version, ""),
-    ).await else {
+    let Ok(repo_base) = tokio::fs::canonicalize(state.index.package_file_path(&name, &version, "")).await else {
         return Err(StatusCode::NOT_FOUND);
     };
     if !canonical.starts_with(&repo_base) {
@@ -123,11 +116,8 @@ async fn get_file(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
+    use crate::testutil::helpers::{start_tls_server, tls_client};
     use std::fs;
-    use tower::ServiceExt;
 
     fn create_test_repo(base: &std::path::Path) {
         let pkg_dir = base.join("packages").join("testpkg").join("1.0");
@@ -140,145 +130,86 @@ mod tests {
         fs::write(pkg_dir.join("test.exe"), b"fake-exe-content").unwrap();
     }
 
-    fn build_test_app(repo_path: &std::path::Path) -> Router {
-        let index = RepoIndex::scan(repo_path).unwrap();
-        let state = Arc::new(AppState { index });
-        build_router(state)
-    }
-
-    #[tokio::test]
-    async fn test_get_index() {
+    #[test]
+    fn test_get_index() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(Request::get("/index").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resp = client.get(format!("https://localhost:{port}/index")).send().unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().unwrap();
         assert_eq!(json["testpkg"], "1.0");
     }
 
-    #[tokio::test]
-    async fn test_get_manifest() {
+    #[test]
+    fn test_get_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/testpkg/1.0/blob.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/blob.json")).send().unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().unwrap();
         assert_eq!(json["name"], "testpkg");
     }
 
-    #[tokio::test]
-    async fn test_get_file() {
+    #[test]
+    fn test_get_file() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/testpkg/1.0/test.exe")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(body.as_ref(), b"fake-exe-content");
+        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/test.exe")).send().unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().unwrap().as_ref(), b"fake-exe-content");
     }
 
-    #[tokio::test]
-    async fn test_not_found_package() {
+    #[test]
+    fn test_not_found_package() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/nonexistent/1.0/blob.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = client.get(format!("https://localhost:{port}/packages/nonexistent/1.0/blob.json")).send().unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
-    #[tokio::test]
-    async fn test_not_found_version() {
+    #[test]
+    fn test_not_found_version() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/testpkg/9.9/blob.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/9.9/blob.json")).send().unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
-    #[tokio::test]
-    async fn test_not_found_file() {
+    #[test]
+    fn test_not_found_file() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/testpkg/1.0/missing.exe")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/missing.exe")).send().unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
-    #[tokio::test]
-    async fn test_path_traversal_rejected() {
+    #[test]
+    fn test_path_traversal_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let app = build_test_app(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client(&fp);
 
-        let resp = app
-            .oneshot(
-                Request::get("/packages/testpkg/1.0/..%2F..%2F..%2Fetc%2Fpasswd")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(resp.status(), StatusCode::OK);
+        let resp =
+            client.get(format!("https://localhost:{port}/packages/testpkg/1.0/..%2F..%2Fetc%2Fpasswd")).send().unwrap();
+        assert_ne!(resp.status(), 200);
     }
 }

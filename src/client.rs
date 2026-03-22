@@ -30,7 +30,6 @@ pub struct InstalledPackage {
     pub reason: InstallReason,
     pub files: BTreeMap<String, PathBuf>,
     pub dependencies: Vec<String>,
-    pub manifest: Manifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,12 +39,13 @@ pub struct Database {
     path: Option<PathBuf>,
 }
 
-fn blob_dir() -> io::Result<PathBuf> {
+pub(crate) fn blob_dir() -> io::Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".blob"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
 }
 
+// TODO: restrict file permissions on config.json (contains password in plaintext), or not. Needs discussion
 pub fn config_path() -> io::Result<PathBuf> {
     blob_dir().map(|p| p.join("config.json"))
 }
@@ -63,18 +63,9 @@ impl Config {
         let path = config_path()?;
         if path.is_file() {
             let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         } else {
-            let config = Self {
-                server_url: "https://localhost:8803".to_string(),
-                base_dir: PathBuf::from("C:/"),
-                username: String::new(),
-                password: String::new(),
-                server_fingerprint: String::new(),
-            };
-            config.save()?;
-            Ok(config)
+            Err(io::Error::new(io::ErrorKind::NotFound, "No config found. Run 'blob config' first."))
         }
     }
 
@@ -87,19 +78,8 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let content = serde_json::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(&path, content)
-    }
-
-    /// Load config from a specific path.
-    ///
-    /// # Errors
-    /// Returns an error if the file cannot be read or parsed.
-    pub fn load_from(path: &Path) -> io::Result<Self> {
-        let content = fs::read_to_string(path)?;
-        serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -129,13 +109,9 @@ impl Database {
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let mut db = if path.is_file() {
             let content = fs::read_to_string(path)?;
-            serde_json::from_str::<Self>(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            serde_json::from_str::<Self>(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         } else {
-            Self {
-                packages: BTreeMap::new(),
-                path: None,
-            }
+            Self { packages: BTreeMap::new(), path: None }
         };
         db.path = Some(path.to_path_buf());
         Ok(db)
@@ -149,8 +125,7 @@ impl Database {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let content = serde_json::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(path, content)
     }
 }
@@ -176,8 +151,7 @@ impl HttpClient {
         if !self.config.username.is_empty() {
             req = req.basic_auth(&self.config.username, Some(&self.config.password));
         }
-        req.send()
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
+        req.send().map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
     }
 }
 
@@ -188,8 +162,7 @@ impl HttpClient {
 pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, String>> {
     let url = format!("{}/index", http.config.server_url);
     let resp = http.get(&url)?;
-    resp.json()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Fetch available versions for a package from the server.
@@ -200,13 +173,9 @@ pub fn fetch_versions(http: &HttpClient, name: &str) -> io::Result<Vec<String>> 
     let url = format!("{}/packages/{name}", http.config.server_url);
     let resp = http.get(&url)?;
     if !resp.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Package {name} not found"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found")));
     }
-    let value: serde_json::Value = resp.json()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let value: serde_json::Value = resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let versions = value["versions"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -222,13 +191,9 @@ pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Resul
     let url = format!("{}/packages/{name}/{version}/blob.json", http.config.server_url);
     let resp = http.get(&url)?;
     if !resp.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Package {name} {version} not found"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found")));
     }
-    resp.json()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Download a file from the server.
@@ -239,14 +204,9 @@ pub fn download_file(http: &HttpClient, name: &str, version: &str, file: &str) -
     let url = format!("{}/packages/{name}/{version}/{file}", http.config.server_url);
     let resp = http.get(&url)?;
     if !resp.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("File {file} not found in {name} {version}"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("File {file} not found in {name} {version}")));
     }
-    resp.bytes()
-        .map(|b| b.to_vec())
-        .map_err(io::Error::other)
+    resp.bytes().map(|b| b.to_vec()).map_err(io::Error::other)
 }
 
 /// Resolve dependencies recursively. Returns packages in install order (dependencies first).
@@ -267,6 +227,7 @@ pub fn resolve_dependencies(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_recursive(
     name: &str,
     version_override: Option<&str>,
@@ -281,19 +242,17 @@ fn resolve_recursive(
         return Ok(());
     }
     if in_stack.contains(name) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Dependency cycle detected: {name}"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Dependency cycle detected: {name}")));
     }
 
     in_stack.insert(name.to_string());
 
     let version = match version_override {
         Some(v) => v.to_string(),
-        None => index.get(name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index"))
-        })?.clone(),
+        None => index
+            .get(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index")))?
+            .clone(),
     };
 
     let manifest = fetch_manifest(http, name, &version)?;
@@ -312,9 +271,8 @@ fn resolve_recursive(
 
 /// Windows reserved device names that must not be used as filenames.
 const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate that a file path and destination directory from a manifest are safe.
@@ -335,10 +293,7 @@ fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Res
         }
         // Reject null bytes (cause path truncation on Windows)
         if value.contains('\0') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Null byte in {label} for {pkg_name}"),
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Null byte in {label} for {pkg_name}")));
         }
     }
     // Check filename against Windows reserved device names
@@ -357,17 +312,6 @@ fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Res
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    let config = &http.config;
-    let index = fetch_index(http)?;
-
-    // Determine which version to install
-    let target_version = match version {
-        Some(v) => v.to_string(),
-        None => index.get(name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index"))
-        })?.clone(),
-    };
-
     // If already installed, just ensure it's marked manual (unless --force)
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
         if existing.reason == InstallReason::Auto {
@@ -382,6 +326,17 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         return Ok(());
     }
 
+    let index = fetch_index(http)?;
+
+    // Determine which version to install
+    let target_version = match version {
+        Some(v) => v.to_string(),
+        None => index
+            .get(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index")))?
+            .clone(),
+    };
+
     let to_install = resolve_dependencies(name, &target_version, http, &index, db)?;
 
     if to_install.is_empty() {
@@ -390,11 +345,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
     }
 
     for (pkg_name, version, manifest) in &to_install {
-        let reason = if pkg_name == name {
-            InstallReason::Manual
-        } else {
-            InstallReason::Auto
-        };
+        let reason = if pkg_name == name { InstallReason::Manual } else { InstallReason::Auto };
 
         println!("Installing {pkg_name} {version}...");
         install_files(pkg_name, version, manifest, reason, http, db)?;
@@ -414,41 +365,33 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    let config = &http.config;
     let index = fetch_index(http)?;
 
-    let packages: Vec<(String, String)> = match name {
-        Some(n) => {
-            if !db.packages.contains_key(n) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{n} is not installed"),
-                ));
-            }
-            let latest = index.get(n).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index"))
-            })?;
-            if *latest == db.packages[n].version {
-                println!("{n} is already at latest version ({latest}).");
-                return Ok(());
-            }
-            vec![(n.to_string(), latest.clone())]
+    let packages: Vec<(String, String)> = if let Some(n) = name {
+        if !db.packages.contains_key(n) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{n} is not installed")));
         }
-        None => {
-            let mut list = Vec::new();
-            for (n, pkg) in &db.packages {
-                if let Some(latest) = index.get(n) {
-                    if *latest != pkg.version {
-                        list.push((n.clone(), latest.clone()));
-                    }
-                }
-            }
-            if list.is_empty() {
-                println!("Everything is up to date.");
-                return Ok(());
-            }
-            list
+        let latest =
+            index.get(n).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index")))?;
+        if *latest == db.packages[n].version {
+            println!("{n} is already at latest version ({latest}).");
+            return Ok(());
         }
+        vec![(n.to_string(), latest.clone())]
+    } else {
+        let mut list = Vec::new();
+        for (n, pkg) in &db.packages {
+            if let Some(latest) = index.get(n)
+                && *latest != pkg.version
+            {
+                list.push((n.clone(), latest.clone()));
+            }
+        }
+        if list.is_empty() {
+            println!("Everything is up to date.");
+            return Ok(());
+        }
+        list
     };
 
     for (pkg_name, new_version) in &packages {
@@ -456,20 +399,23 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
         // Resolve and install new deps
-        let new_deps = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
-        for (dep_name, dep_version, dep_manifest) in &new_deps {
-            if dep_name == pkg_name {
-                continue; // we handle the main package below
-            }
-            if db.packages.contains_key(dep_name) {
+        let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
+
+        // Find the manifest for the main package from the resolved list
+        let manifest = resolved
+            .iter()
+            .find(|(n, _, _)| n == pkg_name)
+            .map(|(_, _, m)| m.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{pkg_name} not in resolved deps")))?;
+
+        // Install new deps
+        for (dep_name, dep_version, dep_manifest) in &resolved {
+            if dep_name == pkg_name || db.packages.contains_key(dep_name) {
                 continue;
             }
             println!("  Installing new dependency {dep_name} {dep_version}...");
             install_files(dep_name, dep_version, dep_manifest, InstallReason::Auto, http, db)?;
         }
-
-        // Get the manifest for the new version
-        let manifest = fetch_manifest(http,pkg_name, new_version)?;
 
         // Remove old files that are no longer in the new manifest
         if let Some(old_pkg) = db.packages.get(pkg_name) {
@@ -501,6 +447,7 @@ fn install_files(
     http: &HttpClient,
     db: &mut Database,
 ) -> io::Result<()> {
+    let canonical_base = dunce::canonicalize(&http.config.base_dir)?;
     let mut installed_files = BTreeMap::new();
 
     for (file, dest_dir) in &manifest.files {
@@ -508,7 +455,6 @@ fn install_files(
 
         let dest = http.config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
 
-        let canonical_base = dunce::canonicalize(&http.config.base_dir)?;
         if !dest.starts_with(&canonical_base) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -520,7 +466,7 @@ fn install_files(
             fs::create_dir_all(parent)?;
         }
 
-        let bytes = download_file(http,name, version, file)?;
+        let bytes = download_file(http, name, version, file)?;
         fs::write(&dest, &bytes)?;
         println!("  {} -> {}", file, dest.display());
         installed_files.insert(file.clone(), dest);
@@ -533,7 +479,6 @@ fn install_files(
             reason,
             files: installed_files,
             dependencies: manifest.dependencies.clone(),
-            manifest: manifest.clone(),
         },
     );
     Ok(())
@@ -553,7 +498,7 @@ pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Resu
     for (name, latest) in &index {
         if re.is_match(name) {
             if show_versions {
-                let versions = fetch_versions(http,name)?;
+                let versions = fetch_versions(http, name)?;
                 println!("{name} (latest: {latest}) — versions: {}", versions.join(", "));
             } else {
                 println!("{name} {latest}");
@@ -571,38 +516,10 @@ pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Resu
 
 /// Find all installed packages that depend on `name`.
 fn reverse_deps(name: &str, db: &Database) -> Vec<String> {
-    db.packages
-        .iter()
-        .filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string()))
-        .map(|(n, _)| n.clone())
-        .collect()
+    db.packages.iter().filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string())).map(|(n, _)| n.clone()).collect()
 }
 
-/// Find auto-installed dependencies of `name` that no other package needs.
-fn orphaned_deps(name: &str, db: &Database) -> Vec<String> {
-    let Some(pkg) = db.packages.get(name) else {
-        return vec![];
-    };
-
-    let mut orphans = Vec::new();
-    for dep in &pkg.dependencies {
-        let Some(dep_pkg) = db.packages.get(dep) else {
-            continue;
-        };
-        if dep_pkg.reason != InstallReason::Auto {
-            continue;
-        }
-        // Check if any other installed package (besides `name`) depends on this
-        let still_needed = db.packages.iter().any(|(n, p)| {
-            n != name && p.dependencies.contains(dep)
-        });
-        if !still_needed {
-            orphans.push(dep.clone());
-        }
-    }
-    orphans
-}
-
+// TODO: build reverse-dep index for O(n) lookup instead of O(n²) per iteration
 /// Remove all orphaned auto-installed packages.
 fn purge_orphans(db: &mut Database) -> io::Result<()> {
     loop {
@@ -610,11 +527,7 @@ fn purge_orphans(db: &mut Database) -> io::Result<()> {
             .packages
             .iter()
             .filter(|(_, pkg)| pkg.reason == InstallReason::Auto)
-            .filter(|(dep_name, _)| {
-                !db.packages
-                    .iter()
-                    .any(|(_, p)| p.dependencies.contains(dep_name))
-            })
+            .filter(|(dep_name, _)| !db.packages.iter().any(|(_, p)| p.dependencies.contains(dep_name)))
             .map(|(n, _)| n.clone())
             .collect();
 
@@ -642,10 +555,7 @@ pub fn purge(db: &mut Database) -> io::Result<()> {
 /// Remove files for a single package and delete its db entry.
 fn remove_package_files(name: &str, db: &mut Database) -> io::Result<()> {
     let Some(pkg) = db.packages.get(name) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{name} is not installed"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{name} is not installed")));
     };
 
     for (file, path) in &pkg.files {
@@ -669,10 +579,7 @@ pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mu
         if transitive {
             return Ok(()); // already removed by cascade
         }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{name} is not installed"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{name} is not installed")));
     }
 
     // Check reverse dependencies
@@ -705,17 +612,14 @@ pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mu
 
     if !no_purge {
         purge_orphans(db)?;
+        db.save()?;
     }
-
-    db.save()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server;
-    use std::sync::Arc;
 
     fn create_test_repo(base: &Path) {
         let pkg_dir = base.join("packages").join("toolA").join("1.0");
@@ -723,7 +627,8 @@ mod tests {
         fs::write(
             pkg_dir.join("blob.json"),
             r#"{"name":"toolA","description":"Tool A","files":{"toolA.exe":"util/"},"dependencies":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(pkg_dir.join("toolA.exe"), b"toolA-binary").unwrap();
 
         let pkg_dir2 = base.join("packages").join("toolB").join("2.0");
@@ -731,59 +636,12 @@ mod tests {
         fs::write(
             pkg_dir2.join("blob.json"),
             r#"{"name":"toolB","description":"Tool B","files":{"toolB.exe":"util/"},"dependencies":["toolA"]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(pkg_dir2.join("toolB.exe"), b"toolB-binary").unwrap();
     }
 
-    /// Start a TLS test server and return (runtime, port, fingerprint).
-    fn start_test_server(repo_path: &Path) -> (tokio::runtime::Runtime, u16, String) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let index = crate::repo::RepoIndex::scan(repo_path).unwrap();
-        let state = Arc::new(server::AppState { index });
-        let app = server::build_router(state);
-
-        // Generate a test cert
-        let key_pair = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.distinguished_name.push(
-            rcgen::DnType::CommonName,
-            rcgen::DnValue::Utf8String("test".to_string()),
-        );
-        let cert = params.self_signed(&key_pair).unwrap();
-        let cert_der = cert.der();
-        let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
-        let fingerprint = crate::tls::cert_fingerprint(cert_der.as_ref());
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let port = rt.block_on(async {
-            // Bind a TCP listener first to get the port
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-
-            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-                cert_pem.into_bytes(),
-                key_pem.into_bytes(),
-            ).await.unwrap();
-
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-
-            tokio::spawn(async move {
-                axum_server::bind_rustls(addr, tls_config)
-                    .serve(app.into_make_service())
-                    .await
-                    .unwrap();
-            });
-
-            // Small delay to let the server start
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            port
-        });
-
-        (rt, port, fingerprint)
-    }
+    use crate::testutil::helpers::start_tls_server;
 
     fn test_config(port: u16, base_dir: &Path, fingerprint: &str) -> Config {
         Config {
@@ -799,7 +657,7 @@ mod tests {
     fn fetch_index_from_server() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let (_rt, port, fp) = start_test_server(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
 
         let config = test_config(port, Path::new(""), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -814,7 +672,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -832,7 +690,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -855,7 +713,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -876,7 +734,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -896,7 +754,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -917,7 +775,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -937,7 +795,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -961,7 +819,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -984,7 +842,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1072,7 +930,8 @@ mod tests {
             fs::write(
                 dir.join("blob.json"),
                 format!(r#"{{"name":"{name}","description":"","files":{{"{file}":"util/"}},"dependencies":{deps}}}"#),
-            ).unwrap();
+            )
+            .unwrap();
             fs::write(dir.join(file), format!("{name}-{ver}-binary").as_bytes()).unwrap();
         }
     }
@@ -1083,7 +942,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1103,7 +962,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1125,7 +984,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1146,7 +1005,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1166,7 +1025,7 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1201,16 +1060,18 @@ mod tests {
         fs::write(
             pkg_a.join("blob.json"),
             r#"{"name":"cycleA","description":"A","files":{},"dependencies":["cycleB"]}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let pkg_b = tmp.path().join("packages").join("cycleB").join("1.0");
         fs::create_dir_all(&pkg_b).unwrap();
         fs::write(
             pkg_b.join("blob.json"),
             r#"{"name":"cycleB","description":"B","files":{},"dependencies":["cycleA"]}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let (_rt, port, fp) = start_test_server(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
 
         let config = test_config(port, Path::new(""), &fp);
         let http = HttpClient::new(&config).unwrap();
@@ -1233,13 +1094,10 @@ mod tests {
             server_fingerprint: String::new(),
         };
 
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&config).unwrap(),
-        )
-        .unwrap();
+        fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
-        let loaded = Config::load_from(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let loaded: Config = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.server_url, "http://example.com:9090");
         assert_eq!(loaded.base_dir, PathBuf::from("D:/tools"));
     }
@@ -1258,25 +1116,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("db.json");
 
-        let mut db = Database {
-            packages: BTreeMap::new(),
-            path: None,
-        };
+        let mut db = Database { packages: BTreeMap::new(), path: None };
         db.packages.insert(
             "testpkg".to_string(),
             InstalledPackage {
                 version: "1.0".to_string(),
                 reason: InstallReason::Manual,
-                files: BTreeMap::from([
-                    ("test.exe".to_string(), PathBuf::from("C:/bin/util/test.exe")),
-                ]),
+                files: BTreeMap::from([("test.exe".to_string(), PathBuf::from("C:/bin/util/test.exe"))]),
                 dependencies: vec![],
-                manifest: Manifest {
-                    name: "testpkg".to_string(),
-                    description: "A test".to_string(),
-                    files: BTreeMap::from([("test.exe".to_string(), "util/".to_string())]),
-                    dependencies: vec![],
-                },
             },
         );
 
@@ -1285,18 +1132,12 @@ mod tests {
         let loaded = Database::load_from(&path).unwrap();
         assert_eq!(loaded.packages.len(), 1);
         assert_eq!(loaded.packages["testpkg"].version, "1.0");
-        assert_eq!(
-            loaded.packages["testpkg"].files["test.exe"],
-            PathBuf::from("C:/bin/util/test.exe")
-        );
+        assert_eq!(loaded.packages["testpkg"].files["test.exe"], PathBuf::from("C:/bin/util/test.exe"));
     }
 
     #[test]
     fn database_roundtrip_json() {
-        let db = Database {
-            packages: BTreeMap::new(),
-            path: None,
-        };
+        let db = Database { packages: BTreeMap::new(), path: None };
         let json = serde_json::to_string(&db).unwrap();
         let loaded: Database = serde_json::from_str(&json).unwrap();
         assert!(loaded.packages.is_empty());

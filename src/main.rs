@@ -5,6 +5,8 @@ use std::path::PathBuf;
 mod client;
 mod repo;
 mod server;
+#[cfg(test)]
+mod testutil;
 mod tls;
 
 #[derive(Parser)]
@@ -172,11 +174,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                         println!("No packages installed.");
                     } else {
                         for (n, pkg) in &db.packages {
-                            let suffix = if pkg.reason == client::InstallReason::Auto {
-                                " (auto)"
-                            } else {
-                                ""
-                            };
+                            let suffix = if pkg.reason == client::InstallReason::Auto { " (auto)" } else { "" };
                             println!("{n} {}{suffix}", pkg.version);
                         }
                     }
@@ -208,11 +206,7 @@ fn prompt(label: &str, default: &str) -> std::io::Result<String> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     let input = input.trim();
-    if input.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input.to_string())
-    }
+    if input.is_empty() { Ok(default.to_string()) } else { Ok(input.to_string()) }
 }
 
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {

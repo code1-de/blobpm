@@ -6,18 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io};
 
-fn blob_dir() -> io::Result<PathBuf> {
-    dirs::home_dir()
-        .map(|p| p.join(".blob"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
-}
-
 /// Path to the server certificate.
 ///
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn cert_path() -> io::Result<PathBuf> {
-    blob_dir().map(|p| p.join("cert.pem"))
+    crate::client::blob_dir().map(|p| p.join("cert.pem"))
 }
 
 /// Path to the server private key.
@@ -25,7 +19,7 @@ pub fn cert_path() -> io::Result<PathBuf> {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn key_path() -> io::Result<PathBuf> {
-    blob_dir().map(|p| p.join("key.pem"))
+    crate::client::blob_dir().map(|p| p.join("key.pem"))
 }
 
 /// Generate a self-signed TLS certificate and key.
@@ -44,19 +38,13 @@ pub fn generate_keys() -> io::Result<String> {
         }
     }
 
-    let key_pair = KeyPair::generate()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Key generation failed: {e}")))?;
+    let key_pair = KeyPair::generate().map_err(|e| io::Error::other(format!("Key generation failed: {e}")))?;
 
     let mut params = CertificateParams::new(vec!["localhost".to_string()])
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Cert params failed: {e}")))?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        rcgen::DnValue::Utf8String("blob server".to_string()),
-    );
+        .map_err(|e| io::Error::other(format!("Cert params failed: {e}")))?;
+    params.distinguished_name.push(rcgen::DnType::CommonName, rcgen::DnValue::Utf8String("blob server".to_string()));
 
-    let cert = params
-        .self_signed(&key_pair)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Cert generation failed: {e}")))?;
+    let cert = params.self_signed(&key_pair).map_err(|e| io::Error::other(format!("Cert generation failed: {e}")))?;
 
     let cert_der = cert.der().to_vec();
     let cert_pem = cert.pem();
@@ -80,7 +68,7 @@ pub fn generate_keys() -> io::Result<String> {
     Ok(fingerprint)
 }
 
-/// Ensure certs exist, generate if missing. Returns (cert_path, key_path).
+/// Ensure certs exist, generate if missing. Returns (`cert_path`, `key_path`).
 ///
 /// # Errors
 /// Returns an error if cert generation or path resolution fails.
@@ -102,10 +90,7 @@ pub fn cert_fingerprint(der_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(der_bytes);
     let hash = hasher.finalize();
-    hash.chunks(2)
-        .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
-        .collect::<Vec<_>>()
-        .join(":")
+    hash.chunks(2).map(|pair| format!("{:02x}{:02x}", pair[0], pair[1])).collect::<Vec<_>>().join(":")
 }
 
 /// Read the fingerprint of the current server cert.
@@ -135,13 +120,11 @@ impl TofuVerifier {
     /// Create a new TOFU verifier with the saved fingerprint from config.
     #[must_use]
     pub fn new(saved_fingerprint: String, config_path: PathBuf) -> Self {
-        Self {
-            saved_fingerprint,
-            config_path,
-        }
+        Self { saved_fingerprint, config_path }
     }
 }
 
+// TODO: add --accept-fingerprint flag for non-interactive use (scripts, CI), otherwise TLS handshake will hang
 impl ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
@@ -162,11 +145,11 @@ impl ServerCertVerifier for TofuVerifier {
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
                 // Save fingerprint to config
-                if let Ok(content) = fs::read_to_string(&self.config_path) {
-                    if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                        config["server_fingerprint"] = serde_json::Value::String(fingerprint);
-                        let _ = fs::write(&self.config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
-                    }
+                if let Ok(content) = fs::read_to_string(&self.config_path)
+                    && let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content)
+                {
+                    config["server_fingerprint"] = serde_json::Value::String(fingerprint);
+                    let _ = fs::write(&self.config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
                 }
                 return Ok(ServerCertVerified::assertion());
             }
@@ -229,16 +212,13 @@ pub fn build_client(config: &super::client::Config) -> io::Result<reqwest::block
 
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuVerifier::new(
-            config.server_fingerprint.clone(),
-            config_path,
-        )))
+        .with_custom_certificate_verifier(Arc::new(TofuVerifier::new(config.server_fingerprint.clone(), config_path)))
         .with_no_client_auth();
 
     reqwest::blocking::Client::builder()
         .use_preconfigured_tls(tls_config)
         .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build HTTP client: {e}")))
+        .map_err(|e| io::Error::other(format!("Failed to build HTTP client: {e}")))
 }
 
 #[cfg(test)]
