@@ -3,9 +3,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use axum_server::tls_rustls::RustlsConfig;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
 use crate::repo::RepoIndex;
 
@@ -32,12 +33,19 @@ pub async fn run(repo_path: PathBuf, port: u16) -> std::io::Result<()> {
     let state = Arc::new(AppState { index });
     let app = build_router(state);
 
-    let addr = format!("0.0.0.0:{port}");
-    println!("Serving repo {} on {addr}", repo_path.display());
-    println!("{pkg_count} packages available");
+    let (cert_path, key_path) = crate::tls::ensure_certs()?;
+    let fingerprint = crate::tls::current_fingerprint()?;
+    let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(std::io::Error::other)?;
 
-    let listener = TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("Serving repo {} on https://{addr}", repo_path.display());
+    println!("{pkg_count} packages available");
+    println!("Fingerprint: {fingerprint}");
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
         .await
         .map_err(std::io::Error::other)
 }

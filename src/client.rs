@@ -9,6 +9,12 @@ use crate::repo::Manifest;
 pub struct Config {
     pub server_url: String,
     pub base_dir: PathBuf,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub server_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +46,7 @@ fn blob_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
 }
 
-fn config_path() -> io::Result<PathBuf> {
+pub fn config_path() -> io::Result<PathBuf> {
     blob_dir().map(|p| p.join("config.json"))
 }
 
@@ -61,8 +67,11 @@ impl Config {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         } else {
             let config = Self {
-                server_url: "http://localhost:8803".to_string(),
+                server_url: "https://localhost:8803".to_string(),
                 base_dir: PathBuf::from("C:/"),
+                username: String::new(),
+                password: String::new(),
+                server_fingerprint: String::new(),
             };
             config.save()?;
             Ok(config)
@@ -146,14 +155,39 @@ impl Database {
     }
 }
 
+/// An HTTP client with config for auth.
+pub struct HttpClient {
+    client: reqwest::blocking::Client,
+    pub config: Config,
+}
+
+impl HttpClient {
+    /// Build an HTTP client from config, handling TLS/TOFU.
+    ///
+    /// # Errors
+    /// Returns an error if the TLS config or client build fails.
+    pub fn new(config: &Config) -> io::Result<Self> {
+        let client = crate::tls::build_client(config)?;
+        Ok(Self { client, config: config.clone() })
+    }
+
+    fn get(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
+        let mut req = self.client.get(url);
+        if !self.config.username.is_empty() {
+            req = req.basic_auth(&self.config.username, Some(&self.config.password));
+        }
+        req.send()
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
+    }
+}
+
 /// Fetch the package index from the server.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
-pub fn fetch_index(server_url: &str) -> io::Result<BTreeMap<String, String>> {
-    let url = format!("{server_url}/index");
-    let resp = reqwest::blocking::get(&url)
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, String>> {
+    let url = format!("{}/index", http.config.server_url);
+    let resp = http.get(&url)?;
     resp.json()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -162,10 +196,9 @@ pub fn fetch_index(server_url: &str) -> io::Result<BTreeMap<String, String>> {
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
-pub fn fetch_versions(server_url: &str, name: &str) -> io::Result<Vec<String>> {
-    let url = format!("{server_url}/packages/{name}");
-    let resp = reqwest::blocking::get(&url)
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+pub fn fetch_versions(http: &HttpClient, name: &str) -> io::Result<Vec<String>> {
+    let url = format!("{}/packages/{name}", http.config.server_url);
+    let resp = http.get(&url)?;
     if !resp.status().is_success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -185,10 +218,9 @@ pub fn fetch_versions(server_url: &str, name: &str) -> io::Result<Vec<String>> {
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
-pub fn fetch_manifest(server_url: &str, name: &str, version: &str) -> io::Result<Manifest> {
-    let url = format!("{server_url}/packages/{name}/{version}/blob.json");
-    let resp = reqwest::blocking::get(&url)
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Result<Manifest> {
+    let url = format!("{}/packages/{name}/{version}/blob.json", http.config.server_url);
+    let resp = http.get(&url)?;
     if !resp.status().is_success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -203,10 +235,9 @@ pub fn fetch_manifest(server_url: &str, name: &str, version: &str) -> io::Result
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails.
-pub fn download_file(server_url: &str, name: &str, version: &str, file: &str) -> io::Result<Vec<u8>> {
-    let url = format!("{server_url}/packages/{name}/{version}/{file}");
-    let resp = reqwest::blocking::get(&url)
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+pub fn download_file(http: &HttpClient, name: &str, version: &str, file: &str) -> io::Result<Vec<u8>> {
+    let url = format!("{}/packages/{name}/{version}/{file}", http.config.server_url);
+    let resp = http.get(&url)?;
     if !resp.status().is_success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -225,21 +256,21 @@ pub fn download_file(server_url: &str, name: &str, version: &str, file: &str) ->
 pub fn resolve_dependencies(
     name: &str,
     target_version: &str,
-    server_url: &str,
+    http: &HttpClient,
     index: &BTreeMap<String, String>,
     db: &Database,
 ) -> io::Result<Vec<(String, String, Manifest)>> {
     let mut result = Vec::new();
     let mut visited = HashSet::new();
     let mut in_stack = HashSet::new();
-    resolve_recursive(name, Some(target_version), server_url, index, db, &mut result, &mut visited, &mut in_stack)?;
+    resolve_recursive(name, Some(target_version), http, index, db, &mut result, &mut visited, &mut in_stack)?;
     Ok(result)
 }
 
 fn resolve_recursive(
     name: &str,
     version_override: Option<&str>,
-    server_url: &str,
+    http: &HttpClient,
     index: &BTreeMap<String, String>,
     db: &Database,
     result: &mut Vec<(String, String, Manifest)>,
@@ -265,11 +296,11 @@ fn resolve_recursive(
         })?.clone(),
     };
 
-    let manifest = fetch_manifest(server_url, name, &version)?;
+    let manifest = fetch_manifest(http, name, &version)?;
 
     for dep in &manifest.dependencies {
         if !db.packages.contains_key(dep) {
-            resolve_recursive(dep, None, server_url, index, db, result, visited, in_stack)?;
+            resolve_recursive(dep, None, http, index, db, result, visited, in_stack)?;
         }
     }
 
@@ -325,8 +356,9 @@ fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Res
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, db: &mut Database) -> io::Result<()> {
-    let index = fetch_index(&config.server_url)?;
+pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    let config = &http.config;
+    let index = fetch_index(http)?;
 
     // Determine which version to install
     let target_version = match version {
@@ -350,7 +382,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, 
         return Ok(());
     }
 
-    let to_install = resolve_dependencies(name, &target_version, &config.server_url, &index, db)?;
+    let to_install = resolve_dependencies(name, &target_version, http, &index, db)?;
 
     if to_install.is_empty() {
         println!("{name} is already installed");
@@ -365,7 +397,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, 
         };
 
         println!("Installing {pkg_name} {version}...");
-        install_files(pkg_name, version, manifest, reason, config, db)?;
+        install_files(pkg_name, version, manifest, reason, http, db)?;
         println!("  Installed {pkg_name} {version}");
     }
 
@@ -381,8 +413,9 @@ pub fn install(name: &str, version: Option<&str>, force: bool, config: &Config, 
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn update(name: Option<&str>, config: &Config, db: &mut Database) -> io::Result<()> {
-    let index = fetch_index(&config.server_url)?;
+pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    let config = &http.config;
+    let index = fetch_index(http)?;
 
     let packages: Vec<(String, String)> = match name {
         Some(n) => {
@@ -423,7 +456,7 @@ pub fn update(name: Option<&str>, config: &Config, db: &mut Database) -> io::Res
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
         // Resolve and install new deps
-        let new_deps = resolve_dependencies(pkg_name, new_version, &config.server_url, &index, db)?;
+        let new_deps = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
         for (dep_name, dep_version, dep_manifest) in &new_deps {
             if dep_name == pkg_name {
                 continue; // we handle the main package below
@@ -432,11 +465,11 @@ pub fn update(name: Option<&str>, config: &Config, db: &mut Database) -> io::Res
                 continue;
             }
             println!("  Installing new dependency {dep_name} {dep_version}...");
-            install_files(dep_name, dep_version, dep_manifest, InstallReason::Auto, config, db)?;
+            install_files(dep_name, dep_version, dep_manifest, InstallReason::Auto, http, db)?;
         }
 
         // Get the manifest for the new version
-        let manifest = fetch_manifest(&config.server_url, pkg_name, new_version)?;
+        let manifest = fetch_manifest(http,pkg_name, new_version)?;
 
         // Remove old files that are no longer in the new manifest
         if let Some(old_pkg) = db.packages.get(pkg_name) {
@@ -449,7 +482,7 @@ pub fn update(name: Option<&str>, config: &Config, db: &mut Database) -> io::Res
         }
 
         let reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
-        install_files(pkg_name, new_version, &manifest, reason, config, db)?;
+        install_files(pkg_name, new_version, &manifest, reason, http, db)?;
     }
 
     purge_orphans(db)?;
@@ -465,7 +498,7 @@ fn install_files(
     version: &str,
     manifest: &Manifest,
     reason: InstallReason,
-    config: &Config,
+    http: &HttpClient,
     db: &mut Database,
 ) -> io::Result<()> {
     let mut installed_files = BTreeMap::new();
@@ -473,9 +506,9 @@ fn install_files(
     for (file, dest_dir) in &manifest.files {
         validate_manifest_path(file, dest_dir, name)?;
 
-        let dest = config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
+        let dest = http.config.base_dir.join(dest_dir.replace('/', "\\")).join(file);
 
-        let canonical_base = dunce::canonicalize(&config.base_dir)?;
+        let canonical_base = dunce::canonicalize(&http.config.base_dir)?;
         if !dest.starts_with(&canonical_base) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -487,7 +520,7 @@ fn install_files(
             fs::create_dir_all(parent)?;
         }
 
-        let bytes = download_file(&config.server_url, name, version, file)?;
+        let bytes = download_file(http,name, version, file)?;
         fs::write(&dest, &bytes)?;
         println!("  {} -> {}", file, dest.display());
         installed_files.insert(file.clone(), dest);
@@ -510,17 +543,17 @@ fn install_files(
 ///
 /// # Errors
 /// Returns an error if the index cannot be fetched or the regex is invalid.
-pub fn search(pattern: &str, show_versions: bool, config: &Config) -> io::Result<()> {
+pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Result<()> {
     let re = regex::Regex::new(pattern)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex: {e}")))?;
 
-    let index = fetch_index(&config.server_url)?;
+    let index = fetch_index(http)?;
     let mut found = false;
 
     for (name, latest) in &index {
         if re.is_match(name) {
             if show_versions {
-                let versions = fetch_versions(&config.server_url, name)?;
+                let versions = fetch_versions(http,name)?;
                 println!("{name} (latest: {latest}) — versions: {}", versions.join(", "));
             } else {
                 println!("{name} {latest}");
@@ -702,31 +735,75 @@ mod tests {
         fs::write(pkg_dir2.join("toolB.exe"), b"toolB-binary").unwrap();
     }
 
-    fn start_test_server(repo_path: &Path) -> (tokio::runtime::Runtime, u16) {
+    /// Start a TLS test server and return (runtime, port, fingerprint).
+    fn start_test_server(repo_path: &Path) -> (tokio::runtime::Runtime, u16, String) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let index = crate::repo::RepoIndex::scan(repo_path).unwrap();
         let state = Arc::new(server::AppState { index });
         let app = server::build_router(state);
 
+        // Generate a test cert
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("test".to_string()),
+        );
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+        let fingerprint = crate::tls::cert_fingerprint(cert_der.as_ref());
+
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let listener = rt.block_on(async {
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
-        });
-        let port = listener.local_addr().unwrap().port();
+        let port = rt.block_on(async {
+            // Bind a TCP listener first to get the port
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        rt.spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+                cert_pem.into_bytes(),
+                key_pem.into_bytes(),
+            ).await.unwrap();
+
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+
+            tokio::spawn(async move {
+                axum_server::bind_rustls(addr, tls_config)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            });
+
+            // Small delay to let the server start
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            port
         });
 
-        (rt, port)
+        (rt, port, fingerprint)
+    }
+
+    fn test_config(port: u16, base_dir: &Path, fingerprint: &str) -> Config {
+        Config {
+            server_url: format!("https://localhost:{port}"),
+            base_dir: base_dir.to_path_buf(),
+            username: String::new(),
+            password: String::new(),
+            server_fingerprint: fingerprint.to_string(),
+        }
     }
 
     #[test]
     fn fetch_index_from_server() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
-        let (_rt, port) = start_test_server(tmp.path());
+        let (_rt, port, fp) = start_test_server(tmp.path());
 
-        let index = fetch_index(&format!("http://127.0.0.1:{port}")).unwrap();
+        let config = test_config(port, Path::new(""), &fp);
+        let http = HttpClient::new(&config).unwrap();
+        let index = fetch_index(&http).unwrap();
         assert_eq!(index["toolA"], "1.0");
         assert_eq!(index["toolB"], "2.0");
     }
@@ -737,15 +814,13 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, &config, &mut db).unwrap();
+        install("toolA", None, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert_eq!(db.packages["toolA"].version, "1.0");
@@ -757,15 +832,13 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
@@ -782,20 +855,18 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolB, which auto-installs toolA
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         // Explicitly install toolA — should flip to manual
-        install("toolA", None, false, &config, &mut db).unwrap();
+        install("toolA", None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
     }
 
@@ -805,15 +876,13 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, &config, &mut db).unwrap();
+        install("toolA", None, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
 
         remove("toolA", false, false, false, &mut db).unwrap();
@@ -827,15 +896,13 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
 
         // toolA is a dep of toolB — remove should fail
         let result = remove("toolA", false, false, false, &mut db);
@@ -850,15 +917,13 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
 
         // Force remove toolA even though toolB depends on it
         remove("toolA", true, false, false, &mut db).unwrap();
@@ -872,16 +937,14 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // toolB depends on toolA (auto-installed)
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         // Remove toolB: toolA should be auto-cleaned (orphaned auto dep)
@@ -898,17 +961,15 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolB (auto-installs toolA), then manually install toolA
-        install("toolB", None, false, &config, &mut db).unwrap();
-        install("toolA", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
 
         // Remove toolB: toolA should stay (it's manual)
@@ -923,16 +984,14 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_test_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // toolB depends on toolA
-        install("toolB", None, false, &config, &mut db).unwrap();
+        install("toolB", None, false, &http, &mut db).unwrap();
 
         // Remove toolA with --transitive: should also remove toolB
         remove("toolA", false, true, false, &mut db).unwrap();
@@ -1024,17 +1083,15 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install C and D — both depend on B which depends on A
-        install("depC", None, false, &config, &mut db).unwrap();
-        install("depD", None, false, &config, &mut db).unwrap();
+        install("depC", None, false, &http, &mut db).unwrap();
+        install("depD", None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 4); // A, B, C, D
         assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
         assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
@@ -1046,16 +1103,14 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &config, &mut db).unwrap();
-        install("depD", None, false, &config, &mut db).unwrap();
+        install("depC", None, false, &http, &mut db).unwrap();
+        install("depD", None, false, &http, &mut db).unwrap();
 
         // Remove C — B and A should stay because D still needs B
         remove("depC", false, false, false, &mut db).unwrap();
@@ -1070,16 +1125,14 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &config, &mut db).unwrap();
-        install("depD", None, false, &config, &mut db).unwrap();
+        install("depC", None, false, &http, &mut db).unwrap();
+        install("depD", None, false, &http, &mut db).unwrap();
 
         // Remove C, then D — everything should be cleaned up
         remove("depC", false, false, false, &mut db).unwrap();
@@ -1093,16 +1146,14 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &config, &mut db).unwrap();
-        install("depD", None, false, &config, &mut db).unwrap();
+        install("depC", None, false, &http, &mut db).unwrap();
+        install("depD", None, false, &http, &mut db).unwrap();
 
         // Transitive remove A — should cascade up through B to C and D
         remove("depA", false, true, false, &mut db).unwrap();
@@ -1115,20 +1166,18 @@ mod tests {
         let install_tmp = tempfile::tempdir().unwrap();
         let db_path = install_tmp.path().join("db.json");
         create_diamond_repo(repo_tmp.path());
-        let (_rt, port) = start_test_server(repo_tmp.path());
+        let (_rt, port, fp) = start_test_server(repo_tmp.path());
 
-        let config = Config {
-            server_url: format!("http://127.0.0.1:{port}"),
-            base_dir: install_tmp.path().to_path_buf(),
-        };
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         // Install toolE v1.0 (no deps)
-        install("toolE", Some("1.0"), false, &config, &mut db).unwrap();
+        install("toolE", Some("1.0"), false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 1);
 
         // Update — toolE goes to v2.0 which depends on depA
-        update(None, &config, &mut db).unwrap();
+        update(None, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolE"].version, "2.0");
         assert!(db.packages.contains_key("depA"));
     }
@@ -1161,11 +1210,13 @@ mod tests {
             r#"{"name":"cycleB","description":"B","files":{},"dependencies":["cycleA"]}"#,
         ).unwrap();
 
-        let (_rt, port) = start_test_server(tmp.path());
+        let (_rt, port, fp) = start_test_server(tmp.path());
 
-        let index = fetch_index(&format!("http://127.0.0.1:{port}")).unwrap();
+        let config = test_config(port, Path::new(""), &fp);
+        let http = HttpClient::new(&config).unwrap();
+        let index = fetch_index(&http).unwrap();
         let db = Database { packages: BTreeMap::new(), path: None };
-        let result = resolve_dependencies("cycleA", "1.0", &format!("http://127.0.0.1:{port}"), &index, &db);
+        let result = resolve_dependencies("cycleA", "1.0", &http, &index, &db);
         assert!(result.is_err());
     }
 
@@ -1177,6 +1228,9 @@ mod tests {
         let config = Config {
             server_url: "http://example.com:9090".to_string(),
             base_dir: PathBuf::from("D:/tools"),
+            username: String::new(),
+            password: String::new(),
+            server_fingerprint: String::new(),
         };
 
         fs::write(

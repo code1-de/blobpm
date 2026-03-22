@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod client;
 mod repo;
 mod server;
+mod tls;
 
 #[derive(Parser)]
 #[command(
@@ -81,11 +82,14 @@ enum Commands {
         /// Package name (optional, show details for this package)
         name: Option<String>,
     },
+    /// Generate TLS certificate and key
+    GenerateKeys,
     /// Configure blob settings
     Config,
 }
 
 fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
 
     if let Err(e) = run_command(&cli.command) {
@@ -102,13 +106,15 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Install { name, force } => {
             let config = client::Config::load()?;
+            let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
             let (pkg_name, version) = parse_package_spec(name);
-            client::install(&pkg_name, version.as_deref(), *force, &config, &mut db)?;
+            client::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
         }
         Commands::Search { pattern, versions } => {
             let config = client::Config::load()?;
-            client::search(pattern, *versions, &config)?;
+            let http = client::HttpClient::new(&config)?;
+            client::search(pattern, *versions, &http)?;
         }
         Commands::Remove { name, force, transitive, keep } => {
             let mut db = client::Database::load()?;
@@ -137,8 +143,9 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Update { name } => {
             let config = client::Config::load()?;
+            let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
-            client::update(name.as_deref(), &config, &mut db)?;
+            client::update(name.as_deref(), &http, &mut db)?;
         }
         Commands::List { name } => {
             let db = client::Database::load()?;
@@ -176,6 +183,9 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::GenerateKeys => {
+            tls::generate_keys()?;
+        }
         Commands::Config => {
             run_config()?;
         }
@@ -207,8 +217,11 @@ fn prompt(label: &str, default: &str) -> std::io::Result<String> {
 
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
-        server_url: "http://localhost:8803".to_string(),
+        server_url: "https://localhost:8803".to_string(),
         base_dir: PathBuf::from("C:/"),
+        username: String::new(),
+        password: String::new(),
+        server_fingerprint: String::new(),
     });
 
     println!("blob configuration");
@@ -216,6 +229,8 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_url = prompt("Server URL", &config.server_url)?;
     let base_dir = prompt("Base install directory", &config.base_dir.display().to_string())?;
+    let username = prompt("Username", &config.username)?;
+    let password = prompt("Password", &config.password)?;
 
     let base_dir = PathBuf::from(base_dir);
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
@@ -223,6 +238,9 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let new_config = client::Config {
         server_url,
         base_dir,
+        username,
+        password,
+        server_fingerprint: config.server_fingerprint.clone(),
     };
 
     new_config.save()?;
