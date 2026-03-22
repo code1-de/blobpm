@@ -826,7 +826,14 @@ fn purge_orphans(db: &mut Database) -> io::Result<()> {
 /// # Errors
 /// Returns an error if file removal or database save fails.
 pub fn purge(db: &mut Database) -> io::Result<()> {
+    let before = db.packages.len();
     purge_orphans(db)?;
+    let removed = before - db.packages.len();
+    if removed == 0 {
+        println!("No orphaned packages found.");
+    } else {
+        println!("Purged {removed} orphaned package(s).");
+    }
     db.save()
 }
 

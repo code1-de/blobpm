@@ -21,7 +21,65 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the package server
+    /// Install a package (use name@version for a specific version)
+    Install {
+        /// Package name, or name@version for a specific version
+        name: String,
+
+        /// Reinstall even if already installed (e.g. to change version)
+        #[arg(long, short)]
+        force: bool,
+    },
+    /// Remove a package (auto-removes orphaned auto-installed dependencies)
+    Remove {
+        /// Package name
+        name: String,
+
+        /// Remove even if other packages depend on it (leaves them broken)
+        #[arg(long)]
+        force: bool,
+
+        /// Also remove packages that depend on this one (cascades upward)
+        #[arg(long)]
+        transitive: bool,
+
+        /// Keep orphaned auto-installed dependencies instead of removing them
+        #[arg(long)]
+        keep: bool,
+    },
+    /// Update installed packages to latest versions
+    Update {
+        /// Package name (optional, updates all if omitted)
+        name: Option<String>,
+    },
+    /// List installed packages (with package name: show details)
+    List {
+        /// Package name (optional, show deps, files, install reason)
+        name: Option<String>,
+
+        /// Show details for all packages (deps, files)
+        #[arg(long, short = 'l')]
+        long: bool,
+    },
+    /// Search for packages on the server (regex pattern, use ".*" for all)
+    Search {
+        /// Regex pattern to match package names
+        pattern: String,
+
+        /// Show all available versions (sorted, latest last)
+        #[arg(long = "available", short = 'a')]
+        versions: bool,
+    },
+    /// Configure blob settings interactively (server URL, base dir, credentials)
+    Config,
+    /// Mark a package as manually installed (prevents auto-removal as orphan)
+    Manual {
+        /// Package name
+        name: String,
+    },
+    /// Remove all orphaned auto-installed packages (auto deps no longer needed)
+    Purge,
+    /// Run the package server (HTTPS with auto-generated TLS cert)
     Serve {
         /// Path to the repository directory
         #[arg(long)]
@@ -31,79 +89,31 @@ enum Commands {
         #[arg(long, default_value = "8803")]
         port: u16,
 
-        /// Username for Basic Auth (or set `BLOB_USERNAME` env var)
+        /// Username for Basic Auth
         #[arg(long, env = "BLOB_USERNAME")]
         username: String,
 
-        /// Password for Basic Auth (or set `BLOB_PASSWORD` env var)
+        /// Password for Basic Auth
         #[arg(long, env = "BLOB_PASSWORD")]
         password: String,
     },
-    /// Install a package
-    Install {
-        /// Package name
-        name: String,
-
-        /// Reinstall even if already installed
-        #[arg(long, short)]
-        force: bool,
-    },
-    /// Remove an installed package
-    Remove {
-        /// Package name
-        name: String,
-
-        /// Remove even if other packages depend on it
-        #[arg(long)]
-        force: bool,
-
-        /// Also remove dependencies that are no longer needed
-        #[arg(long)]
-        transitive: bool,
-
-        /// Don't auto-remove orphaned dependencies
-        #[arg(long)]
-        keep: bool,
-    },
-    /// Search for packages on the server (regex)
-    Search {
-        /// Regex pattern to match package names
-        pattern: String,
-
-        /// Show all available versions
-        #[arg(long = "available", short = 'a')]
-        versions: bool,
-    },
-    /// Mark a package as manually installed
-    Manual {
-        /// Package name
-        name: String,
-    },
-    /// Remove all orphaned auto-installed packages
-    Purge,
-    /// Update installed packages
-    Update {
-        /// Package name (optional, updates all if omitted)
-        name: Option<String>,
-    },
-    /// List installed packages
-    List {
-        /// Package name (optional, show details for this package)
-        name: Option<String>,
-    },
     /// Upload a package to the server
+    ///
+    /// Maps files to destination dirs using glob:dest patterns.
+    /// Absolute globs use filename only, relative globs preserve path from --from.
+    /// Examples: "*.exe:bin" "C:\tools\7z*.exe:util" --from src "lib/**:lib"
     Upload {
-        /// Package name@version
+        /// Package name@version (e.g. helper@3.0)
         package: String,
 
-        /// File mappings: "`glob:dest_dir`/" (first match wins)
+        /// File mappings: "glob:dest" (first match wins). Use absolute paths or relative to --from
         mappings: Vec<String>,
 
-        /// Source directory (default: current dir)
+        /// Base directory for relative glob patterns
         #[arg(long, default_value = ".")]
         from: PathBuf,
 
-        /// Dependencies
+        /// Package dependency (can be repeated: --dep zip --dep helper)
         #[arg(long = "dep", short)]
         deps: Vec<String>,
 
@@ -119,10 +129,12 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
-    /// Generate TLS certificate and key
-    GenerateKeys,
-    /// Configure blob settings
-    Config,
+    /// Generate or regenerate TLS certificate and key (~/.blob/cert.pem, key.pem)
+    GenerateKeys {
+        /// Overwrite existing keys without asking
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -185,15 +197,29 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let mut db = client::Database::load()?;
             client::update(name.as_deref(), &http, &mut db)?;
         }
-        Commands::List { name } => {
+        Commands::List { name, long } => {
             let db = client::Database::load()?;
-            match name {
-                Some(n) => {
-                    if let Some(pkg) = db.packages.get(n.as_str()) {
-                        let reason = match pkg.reason {
-                            client::InstallReason::Manual => "manual",
-                            client::InstallReason::Auto => "auto",
-                        };
+            if db.packages.is_empty() {
+                println!("No packages installed.");
+            } else {
+                let packages: Vec<_> = match name {
+                    Some(n) => {
+                        if !db.packages.contains_key(n.as_str()) {
+                            println!("{n} is not installed");
+                            return Ok(());
+                        }
+                        vec![n.as_str()]
+                    }
+                    None => db.packages.keys().map(String::as_str).collect(),
+                };
+                let show_details = *long || name.is_some();
+                for n in &packages {
+                    let pkg = &db.packages[*n];
+                    let reason = match pkg.reason {
+                        client::InstallReason::Manual => "manual",
+                        client::InstallReason::Auto => "auto",
+                    };
+                    if show_details {
                         println!("{n} {} [{reason}]", pkg.version);
                         if !pkg.dependencies.is_empty() {
                             println!("  Dependencies: {}", pkg.dependencies.join(", "));
@@ -202,17 +228,8 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                             println!("  {file} -> {}", path.display());
                         }
                     } else {
-                        println!("{n} is not installed");
-                    }
-                }
-                None => {
-                    if db.packages.is_empty() {
-                        println!("No packages installed.");
-                    } else {
-                        for (n, pkg) in &db.packages {
-                            let suffix = if pkg.reason == client::InstallReason::Auto { " (auto)" } else { "" };
-                            println!("{n} {}{suffix}", pkg.version);
-                        }
+                        let suffix = if pkg.reason == client::InstallReason::Auto { " (auto)" } else { "" };
+                        println!("{n} {}{suffix}", pkg.version);
                     }
                 }
             }
@@ -229,8 +246,8 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 client::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             }
         }
-        Commands::GenerateKeys => {
-            tls::generate_keys()?;
+        Commands::GenerateKeys { force } => {
+            tls::generate_keys(*force)?;
         }
         Commands::Config => {
             run_config()?;

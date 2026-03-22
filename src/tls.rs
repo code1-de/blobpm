@@ -26,10 +26,10 @@ pub fn key_path() -> io::Result<PathBuf> {
 ///
 /// # Errors
 /// Returns an error if certificate generation or file writing fails.
-pub fn generate_keys() -> io::Result<String> {
+pub fn generate_keys(force: bool) -> io::Result<String> {
     let cert = cert_path()?;
     let key = key_path()?;
-    if cert.is_file() || key.is_file() {
+    if !force && (cert.is_file() || key.is_file()) {
         eprint!("TLS certificates already exist. Overwrite? [y/N] ");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -78,7 +78,7 @@ pub fn ensure_certs() -> io::Result<(PathBuf, PathBuf)> {
 
     if !cert.is_file() || !key.is_file() {
         println!("No TLS certificates found, generating...");
-        generate_keys()?;
+        generate_keys(true)?;
     }
 
     Ok((cert, key))
