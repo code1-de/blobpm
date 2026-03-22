@@ -31,6 +31,14 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value = "8803")]
         port: u16,
+
+        /// Username for Basic Auth (optional, no auth if omitted)
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Password for Basic Auth
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Install a package
     Install {
@@ -102,9 +110,11 @@ fn main() {
 
 fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Serve { repo, port } => {
+        Commands::Serve { repo, port, username, password } => {
+            let u = username.as_ref().ok_or("--username is required")?;
+            let p = password.as_ref().ok_or("--password is required")?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(repo.clone(), *port))?;
+            rt.block_on(server::run(repo.clone(), *port, (u.clone(), p.clone())))?;
         }
         Commands::Install { name, force } => {
             let config = client::Config::load()?;

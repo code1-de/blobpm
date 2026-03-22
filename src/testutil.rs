@@ -7,12 +7,23 @@ pub mod helpers {
     use std::path::Path;
     use std::sync::Arc;
 
-    /// Start a TLS test server and return (runtime, port, fingerprint).
+    pub const TEST_USER: &str = "test";
+    pub const TEST_PASS: &str = "test";
+
+    /// Start a TLS test server with default test credentials.
     pub fn start_tls_server(repo_path: &Path) -> (tokio::runtime::Runtime, u16, String) {
+        start_tls_server_with_auth(repo_path, (TEST_USER.to_string(), TEST_PASS.to_string()))
+    }
+
+    /// Start a TLS test server with specific auth credentials.
+    pub fn start_tls_server_with_auth(
+        repo_path: &Path,
+        auth: (String, String),
+    ) -> (tokio::runtime::Runtime, u16, String) {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let index = RepoIndex::scan(repo_path).unwrap();
-        let state = Arc::new(AppState { index });
+        let state = Arc::new(AppState { index, auth });
         let app = server::build_router(state);
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -47,8 +58,8 @@ pub mod helpers {
         (rt, port, fingerprint)
     }
 
-    /// Build a reqwest client that trusts a specific fingerprint.
-    pub fn tls_client(fingerprint: &str) -> reqwest::blocking::Client {
+    /// Build a reqwest client that trusts a specific fingerprint (no auth).
+    pub fn tls_client_no_auth(fingerprint: &str) -> reqwest::blocking::Client {
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(crate::tls::TofuVerifier::new(

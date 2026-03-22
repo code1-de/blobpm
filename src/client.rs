@@ -151,7 +151,14 @@ impl HttpClient {
         if !self.config.username.is_empty() {
             req = req.basic_auth(&self.config.username, Some(&self.config.password));
         }
-        req.send().map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
+        let resp = req.send().map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Authentication failed. Check username/password in 'blob config'.",
+            ));
+        }
+        Ok(resp)
     }
 }
 
@@ -499,7 +506,7 @@ pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Resu
         if re.is_match(name) {
             if show_versions {
                 let versions = fetch_versions(http, name)?;
-                println!("{name} (latest: {latest}) — versions: {}", versions.join(", "));
+                println!("{name} — {}", versions.join(", "));
             } else {
                 println!("{name} {latest}");
             }
@@ -641,14 +648,14 @@ mod tests {
         fs::write(pkg_dir2.join("toolB.exe"), b"toolB-binary").unwrap();
     }
 
-    use crate::testutil::helpers::start_tls_server;
+    use crate::testutil::helpers::{TEST_PASS, TEST_USER, start_tls_server};
 
     fn test_config(port: u16, base_dir: &Path, fingerprint: &str) -> Config {
         Config {
             server_url: format!("https://localhost:{port}"),
             base_dir: base_dir.to_path_buf(),
-            username: String::new(),
-            password: String::new(),
+            username: TEST_USER.to_string(),
+            password: TEST_PASS.to_string(),
             server_fingerprint: fingerprint.to_string(),
         }
     }

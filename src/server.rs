@@ -1,9 +1,11 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
+use base64::Engine;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use crate::repo::RepoIndex;
 
 pub struct AppState {
     pub index: RepoIndex,
+    pub auth: (String, String),
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -19,18 +22,34 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/index", get(get_index))
         .route("/packages/{name}", get(get_versions))
         .route("/packages/{name}/{version}/{filename}", get(get_file))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
+}
+
+async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let (expected_user, expected_pass) = &state.auth;
+
+    let authorized = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|creds| creds.split_once(':').is_some_and(|(u, p)| u == expected_user && p == expected_pass));
+
+    if authorized { next.run(req).await } else { (StatusCode::UNAUTHORIZED, "Unauthorized").into_response() }
 }
 
 /// Start the server on the given port.
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or run.
-pub async fn run(repo_path: PathBuf, port: u16) -> std::io::Result<()> {
+pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::io::Result<()> {
     let index = RepoIndex::scan(&repo_path)?;
     let pkg_count = index.packages.len();
 
-    let state = Arc::new(AppState { index });
+    let state = Arc::new(AppState { index, auth });
     let app = build_router(state);
 
     let (cert_path, key_path) = crate::tls::ensure_certs()?;
@@ -41,6 +60,7 @@ pub async fn run(repo_path: PathBuf, port: u16) -> std::io::Result<()> {
     println!("Serving repo {} on https://{addr}", repo_path.display());
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
+    println!("Basic Auth: enabled");
 
     axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.map_err(std::io::Error::other)
 }
@@ -116,7 +136,7 @@ async fn get_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::helpers::{start_tls_server, tls_client};
+    use crate::testutil::helpers::{TEST_PASS, TEST_USER, start_tls_server, tls_client_no_auth};
     use std::fs;
 
     fn create_test_repo(base: &std::path::Path) {
@@ -130,14 +150,18 @@ mod tests {
         fs::write(pkg_dir.join("test.exe"), b"fake-exe-content").unwrap();
     }
 
+    fn auth_get(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
+        client.get(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
+    }
+
     #[test]
     fn test_get_index() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/index")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().unwrap();
         assert_eq!(json["testpkg"], "1.0");
@@ -148,9 +172,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/blob.json")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/blob.json"));
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().unwrap();
         assert_eq!(json["name"], "testpkg");
@@ -161,9 +185,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/test.exe")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/test.exe"));
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.bytes().unwrap().as_ref(), b"fake-exe-content");
     }
@@ -173,9 +197,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/packages/nonexistent/1.0/blob.json")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/nonexistent/1.0/blob.json"));
         assert_eq!(resp.status(), 404);
     }
 
@@ -184,9 +208,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/9.9/blob.json")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/9.9/blob.json"));
         assert_eq!(resp.status(), 404);
     }
 
@@ -195,9 +219,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
 
-        let resp = client.get(format!("https://localhost:{port}/packages/testpkg/1.0/missing.exe")).send().unwrap();
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/missing.exe"));
         assert_eq!(resp.status(), 404);
     }
 
@@ -206,10 +230,44 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_test_repo(tmp.path());
         let (_rt, port, fp) = start_tls_server(tmp.path());
-        let client = tls_client(&fp);
+        let client = tls_client_no_auth(&fp);
+
+        let resp = auth_get(&client, &format!("https://localhost:{port}/packages/testpkg/1.0/..%2F..%2Fetc%2Fpasswd"));
+        assert_ne!(resp.status(), 200);
+    }
+
+    #[test]
+    fn test_auth_rejected_without_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // No auth header
+        let resp = client.get(format!("https://localhost:{port}/index")).send().unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[test]
+    fn test_auth_rejected_wrong_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
 
         let resp =
-            client.get(format!("https://localhost:{port}/packages/testpkg/1.0/..%2F..%2Fetc%2Fpasswd")).send().unwrap();
-        assert_ne!(resp.status(), 200);
+            client.get(format!("https://localhost:{port}/index")).basic_auth("admin", Some("wrong")).send().unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[test]
+    fn test_auth_accepted_correct_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
+        assert_eq!(resp.status(), 200);
     }
 }

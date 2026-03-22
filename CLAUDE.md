@@ -43,3 +43,4 @@ cargo run -- install <pkg>
 - Manifest file is called `blob.json`
 - DRY: Don't repeat yourself — extract shared logic into functions, never duplicate code
 - **No big refactors without asking first.** Discuss architectural changes before implementing them.
+- **No automatic commits or pushes.** Only commit or push when the user explicitly asks.
