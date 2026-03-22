@@ -85,6 +85,10 @@ enum Commands {
         #[arg(long)]
         repo: PathBuf,
 
+        /// Address to bind to (default: 127.0.0.1, use 0.0.0.0 to expose to network)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+
         /// Port to listen on
         #[arg(long, default_value = "8803")]
         port: u16,
@@ -150,9 +154,13 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Serve { repo, port, username, password } => {
+        Commands::Serve { repo, bind, port, username, password } => {
+            if std::env::var("BLOB_PASSWORD").is_err() {
+                eprintln!("Warning: password passed via command line — visible in process listings.");
+                eprintln!("         Prefer setting BLOB_PASSWORD environment variable instead.");
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(repo.clone(), *port, (username.clone(), password.clone())))?;
+            rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone())))?;
         }
         Commands::Install { name, force } => {
             let config = client::Config::load()?;

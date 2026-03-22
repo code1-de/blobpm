@@ -1,4 +1,4 @@
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -6,16 +6,24 @@ use axum::routing::get;
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::repo::{Manifest, RepoIndex};
+
+/// Maximum failed auth attempts per IP before lockout.
+const MAX_AUTH_FAILURES: u32 = 5;
+/// Lockout duration after exceeding `MAX_AUTH_FAILURES`.
+const AUTH_LOCKOUT_SECS: u64 = 30;
 
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
     pub auth: (String, String),
     pub repo_path: PathBuf,
+    pub auth_failures: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -29,11 +37,34 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::map_response(add_security_headers))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(5))
         .with_state(state)
 }
 
-// TODO: Security: add rate limiting / IP-based throttling on failed auth attempts to prevent brute-force attacks
-async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+
+    // Check rate limit before processing auth
+    if let Ok(failures) = state.auth_failures.lock()
+        && let Some((count, last)) = failures.get(&ip)
+        && *count >= MAX_AUTH_FAILURES
+        && last.elapsed().as_secs() < AUTH_LOCKOUT_SECS
+    {
+        eprintln!("Auth rate-limited: {ip} (locked out for {AUTH_LOCKOUT_SECS}s)");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
+            "Too many failed attempts. Try again later.",
+        )
+            .into_response();
+    }
+
     let (expected_user, expected_pass) = &state.auth;
 
     let authorized = req
@@ -45,39 +76,81 @@ async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next:
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .is_some_and(|creds| {
             creds.split_once(':').is_some_and(|(u, p)| {
-                constant_time_eq::constant_time_eq(u.as_bytes(), expected_user.as_bytes())
-                    && constant_time_eq::constant_time_eq(p.as_bytes(), expected_pass.as_bytes())
+                let u_ok = constant_time_eq::constant_time_eq(u.as_bytes(), expected_user.as_bytes());
+                let p_ok = constant_time_eq::constant_time_eq(p.as_bytes(), expected_pass.as_bytes());
+                u_ok & p_ok
             })
         });
 
-    if authorized { next.run(req).await } else { (StatusCode::UNAUTHORIZED, "Unauthorized").into_response() }
+    if authorized {
+        // Clear failures on successful auth
+        if let Ok(mut failures) = state.auth_failures.lock() {
+            failures.remove(&ip);
+        }
+        next.run(req).await
+    } else {
+        if let Ok(mut failures) = state.auth_failures.lock() {
+            let entry = failures.entry(ip).or_insert((0, Instant::now()));
+            // Reset counter if lockout period has passed
+            if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
+                *entry = (0, Instant::now());
+            }
+            entry.0 += 1;
+            entry.1 = Instant::now();
+            eprintln!("Auth failed from {ip} ({}/{MAX_AUTH_FAILURES})", entry.0);
+        }
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
+            "Unauthorized",
+        )
+            .into_response()
+    }
 }
 
 /// Start the server on the given port.
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or run.
-pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::io::Result<()> {
+pub async fn run(repo_path: PathBuf, bind: &str, port: u16, auth: (String, String)) -> std::io::Result<()> {
+    if auth.0.is_empty() || auth.1.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Username and password must not be empty. Set via --username/--password or BLOB_USERNAME/BLOB_PASSWORD.",
+        ));
+    }
+
     let index = RepoIndex::scan(&repo_path)?;
     let pkg_count = index.packages.len();
 
-    println!("Serving repo {} on https://0.0.0.0:{port}", repo_path.display());
+    let bind_addr: std::net::IpAddr = bind
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address: {e}")))?;
 
-    let state = Arc::new(AppState { index: std::sync::RwLock::new(index), auth, repo_path });
+    println!("Serving repo {} on https://{bind}:{port}", repo_path.display());
+
+    let state = Arc::new(AppState {
+        index: std::sync::RwLock::new(index),
+        auth,
+        repo_path,
+        auth_failures: std::sync::Mutex::new(HashMap::new()),
+    });
     let app = build_router(state);
 
     let (cert_path, key_path) = crate::tls::ensure_certs()?;
     let fingerprint = crate::tls::current_fingerprint()?;
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
-    // TODO: Security: add --bind CLI option and default to 127.0.0.1 to avoid exposing to all interfaces
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from((bind_addr, port));
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
     // TODO: add structured logging with timestamps and audit trail for uploads/downloads
     println!("Basic Auth: enabled");
 
-    axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.map_err(std::io::Error::other)
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .map_err(std::io::Error::other)
 }
 
 async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -112,15 +185,27 @@ async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     Ok(Json(value))
 }
 
-/// Check that a URL path segment contains no traversal or special characters.
+/// Check that a URL path segment contains only safe printable ASCII,
+/// no traversal, no Windows-reserved names, no dangerous special characters.
 fn is_safe_segment(s: &str) -> bool {
-    !s.is_empty()
-        && !s.contains("..")
-        && !s.contains('/')
-        && !s.contains('\\')
-        && !s.contains(':')
-        && !s.contains('\0')
-        && !s.starts_with('.')
+    if s.is_empty() || s.starts_with('.') || s.ends_with('.') || s.ends_with(' ') {
+        return false;
+    }
+    // Only printable ASCII 33–126, excluding dangerous characters
+    if !s.bytes().all(crate::client::is_safe_spec_char) {
+        return false;
+    }
+    // Reject Windows reserved device names (CON, PRN, NUL, COM1, etc.)
+    let stem = s.split('.').next().unwrap_or(s);
+    !crate::client::WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem))
+}
+
+async fn add_security_headers(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        "max-age=63072000; includeSubDomains".parse().unwrap(),
+    );
+    resp
 }
 
 async fn get_file(
@@ -180,6 +265,29 @@ async fn get_file(
     }
 }
 
+/// Verify that a zip file contains all files listed in the manifest (and no extras).
+fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std::path::Path) -> Result<(), String> {
+    let manifest_data = std::fs::read(manifest_path).map_err(|e| format!("read manifest: {e}"))?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_data).map_err(|e| format!("parse manifest: {e}"))?;
+    let zip_file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
+    let archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("parse zip: {e}"))?;
+
+    let zip_names: std::collections::HashSet<String> = (0..archive.len())
+        .filter_map(|i| archive.name_for_index(i).map(String::from))
+        .collect();
+    let manifest_names: std::collections::HashSet<&String> = manifest.files.keys().collect();
+
+    let missing: Vec<_> = manifest_names.iter().filter(|f| !zip_names.contains(**f)).collect();
+    if !missing.is_empty() {
+        return Err(format!("files in manifest but missing from zip: {missing:?}"));
+    }
+    let extra: Vec<_> = zip_names.iter().filter(|f| !manifest_names.contains(f)).collect();
+    if !extra.is_empty() {
+        return Err(format!("files in zip but not in manifest: {extra:?}"));
+    }
+    Ok(())
+}
+
 async fn post_upload(
     State(state): State<Arc<AppState>>,
     Path((name, version, filename)): Path<(String, String, String)>,
@@ -235,6 +343,19 @@ async fn post_upload(
     }
 
     println!("POST /upload/{name}/{version}/{filename} ({} bytes)", body.len());
+
+    // Cross-validate: when both manifest.json and files.zip exist, check zip contains all manifest files
+    let manifest_path = canonical_dir.join("manifest.json");
+    let zip_path = canonical_dir.join("files.zip");
+    if manifest_path.is_file()
+        && zip_path.is_file()
+        && let Err(e) = validate_zip_against_manifest(&manifest_path, &zip_path)
+    {
+        eprintln!("Zip/manifest mismatch for {name}/{version}: {e}");
+        // Remove the just-uploaded file so we don't leave inconsistent state
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"

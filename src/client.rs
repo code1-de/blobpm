@@ -5,6 +5,37 @@ use std::{fs, io};
 
 use crate::repo::Manifest;
 
+/// Validate that a package name or version contains only safe characters.
+/// Allowed: printable ASCII 33–126, excluding `/\,:;*?'"` and whitespace.
+/// Must not be empty, start with `.`, or end with `.` or space.
+pub(crate) const FORBIDDEN_SPEC_CHARS: &[u8] = b"/\\,:;*?'`\"";
+
+/// Check if a byte is a safe printable ASCII character (33–126, not in `FORBIDDEN_SPEC_CHARS`).
+pub(crate) fn is_safe_spec_char(b: u8) -> bool {
+    (33..=126).contains(&b) && !FORBIDDEN_SPEC_CHARS.contains(&b)
+}
+
+pub(crate) fn validate_pkg_spec(label: &str, value: &str) -> io::Result<()> {
+    if value.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not be empty")));
+    }
+    if value.starts_with('.') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not start with '.'")));
+    }
+    if value.ends_with('.') || value.ends_with(' ') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not end with '.' or space")));
+    }
+    for &b in value.as_bytes() {
+        if !is_safe_spec_char(b) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} contains invalid character (0x{b:02x}): {value}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
@@ -142,6 +173,12 @@ impl HttpClient {
     /// # Errors
     /// Returns an error if the TLS config or client build fails.
     pub fn new(config: &Config) -> io::Result<Self> {
+        if !config.server_url.starts_with("https://") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Server URL must use https://. Plaintext HTTP would expose credentials on the wire.",
+            ));
+        }
         let client = crate::tls::build_client(config)?;
         Ok(Self { client, config: config.clone() })
     }
@@ -254,6 +291,9 @@ const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
 /// Maximum total decompressed size across all files in a package (2 GB) — aggregate zip bomb protection.
 const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Maximum number of entries in a zip archive — prevents inode exhaustion from many tiny files.
+const MAX_ZIP_ENTRIES: usize = 50_000;
+
 fn extract_zip(
     zip_path: &Path,
     manifest: &Manifest,
@@ -264,6 +304,13 @@ fn extract_zip(
     let zip_file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(zip_file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid zip for {name}: {e}")))?;
+
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Zip for {name} has {} entries (max {MAX_ZIP_ENTRIES})", archive.len()),
+        ));
+    }
 
     let mut installed_files = BTreeMap::new();
     let mut total_written: u64 = 0;
@@ -415,13 +462,17 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Null byte in {label} for {pkg_name}")));
         }
     }
-    // Check filename against Windows reserved device names
-    let file_stem = file.split('.').next().unwrap_or(file);
-    if WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(file_stem)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Reserved device name in file for {pkg_name}: {file}"),
-        ));
+    // Check both file and dest_dir segments against Windows reserved device names
+    for (label, value) in [("file", file), ("dest_dir", dest_dir)] {
+        for segment in value.split(['/', '\\']) {
+            let stem = segment.split('.').next().unwrap_or(segment);
+            if WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Reserved device name in {label} for {pkg_name}: {segment}"),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -431,6 +482,10 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    validate_pkg_spec("package name", name)?;
+    if let Some(v) = version {
+        validate_pkg_spec("version", v)?;
+    }
     // If already installed, just ensure it's marked manual (unless --force)
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
         if existing.reason == InstallReason::Auto {
@@ -710,6 +765,8 @@ pub fn upload(
     force: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
+    validate_pkg_spec("package name", name)?;
+    validate_pkg_spec("version", version)?;
     // Check if version already exists on server
     if !force {
         let versions = fetch_versions(http, name).unwrap_or_default();

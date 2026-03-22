@@ -28,7 +28,12 @@ pub mod helpers {
 
         let index = RepoIndex::scan(repo_path).unwrap();
         let state =
-            Arc::new(AppState { index: std::sync::RwLock::new(index), auth, repo_path: repo_path.to_path_buf() });
+            Arc::new(AppState {
+                index: std::sync::RwLock::new(index),
+                auth,
+                repo_path: repo_path.to_path_buf(),
+                auth_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            });
         let app = server::build_router(state);
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -50,7 +55,10 @@ pub mod helpers {
 
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             tokio::spawn(async move {
-                axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.unwrap();
+                axum_server::bind_rustls(addr, tls_config)
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await
+                    .unwrap();
             });
 
             // Wait for the server to be ready

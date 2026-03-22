@@ -21,6 +21,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 tokio = { version = "1.50.0", features = ["full"] }
+tower = { version = "0.5", features = ["limit"] }
 zip = "8.3.1"
 
 [dev-dependencies]
