@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::io::Write;
 use std::path::PathBuf;
 
 mod client;
@@ -32,11 +31,11 @@ enum Commands {
         #[arg(long, default_value = "8803")]
         port: u16,
 
-        /// Username for Basic Auth (optional, no auth if omitted)
+        /// Username for Basic Auth (required)
         #[arg(long)]
         username: Option<String>,
 
-        /// Password for Basic Auth
+        /// Password for Basic Auth (required)
         #[arg(long)]
         password: Option<String>,
     },
@@ -115,6 +114,10 @@ enum Commands {
         /// Interactive mode — review and edit all fields before uploading
         #[arg(long, short)]
         interactive: bool,
+
+        /// Overwrite if version already exists on server
+        #[arg(long, short)]
+        force: bool,
     },
     /// Generate TLS certificate and key
     GenerateKeys,
@@ -216,16 +219,16 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Upload { package, mappings, from, deps, description, interactive } => {
+        Commands::Upload { package, mappings, from, deps, description, interactive, force } => {
             let (pkg_name, version) = parse_package_spec(package);
             let version = version.ok_or("Version required: use name@version")?;
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
 
             if *interactive || mappings.is_empty() {
-                client::upload_interactive(&pkg_name, &version, from, mappings, deps, description, &http)?;
+                client::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             } else {
-                client::upload(&pkg_name, &version, from, mappings, deps, description, &http)?;
+                client::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             }
         }
         Commands::GenerateKeys => {
@@ -247,15 +250,6 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     }
 }
 
-fn prompt(label: &str, default: &str) -> std::io::Result<String> {
-    print!("{label} [{default}]: ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim();
-    if input.is_empty() { Ok(default.to_string()) } else { Ok(input.to_string()) }
-}
-
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
         server_url: "https://localhost:8803".to_string(),
@@ -268,10 +262,10 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     println!("blob configuration");
     println!("Press Enter to keep current value.\n");
 
-    let server_url = prompt("Server URL", &config.server_url)?;
-    let base_dir = prompt("Base install directory", &config.base_dir.display().to_string())?;
-    let username = prompt("Username", &config.username)?;
-    let password = prompt("Password", &config.password)?;
+    let server_url = client::prompt_line("Server URL", &config.server_url)?;
+    let base_dir = client::prompt_line("Base install directory", &config.base_dir.display().to_string())?;
+    let username = client::prompt_line("Username", &config.username)?;
+    let password = client::prompt_line("Password", &config.password)?;
 
     let base_dir = PathBuf::from(base_dir);
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);

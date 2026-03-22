@@ -85,17 +85,19 @@ async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     if !is_safe_segment(&name) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let Ok(index) = state.index.read() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let value = {
+        let Ok(index) = state.index.read() else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(pkg) = index.packages.get(&name) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        serde_json::json!({
+            "name": name,
+            "latest": pkg.latest,
+            "versions": pkg.versions,
+        })
     };
-    let Some(pkg) = index.packages.get(&name) else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    let value = serde_json::json!({
-        "name": name,
-        "latest": pkg.latest,
-        "versions": pkg.versions,
-    });
     Ok(Json(value))
 }
 
@@ -180,7 +182,7 @@ async fn post_upload(
 
     println!("POST /upload/{name}/{version}/{filename} ({} bytes)", body.len());
 
-    // Rescan index after manifest upload
+    // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"
         && let Ok(new_index) = RepoIndex::scan(&state.repo_path)
         && let Ok(mut index) = state.index.write()

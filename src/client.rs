@@ -425,10 +425,26 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         return Ok(());
     }
 
+    download_and_install(&to_install, name, http, db)?;
+
+    // Clean up orphaned auto-deps (e.g. after --force changed the dep tree)
+    purge_orphans(db)?;
+
+    db.save()?;
+    Ok(())
+}
+
+/// Download all zips then extract all. `manual_name` is the top-level package (marked manual).
+fn download_and_install(
+    packages: &[(String, String, Manifest)],
+    manual_name: &str,
+    http: &HttpClient,
+    db: &mut Database,
+) -> io::Result<()> {
     // Phase 1: download all zips
-    println!("Downloading {} package(s)...", to_install.len());
+    println!("Downloading {} package(s)...", packages.len());
     let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
-    for (pkg_name, version, manifest) in &to_install {
+    for (pkg_name, version, manifest) in packages {
         let zip_path = download_zip(http, pkg_name, version)?;
         println!("  Downloaded {pkg_name} {version}");
         downloads.push((pkg_name, version, manifest, zip_path));
@@ -436,7 +452,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
 
     // Phase 2: extract all
     for (pkg_name, version, manifest, zip_path) in &downloads {
-        let reason = if *pkg_name == name { InstallReason::Manual } else { InstallReason::Auto };
+        let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
         println!("Installing {pkg_name} {version}...");
         let installed_files = extract_zip(zip_path, manifest, &http.config.base_dir, pkg_name)?;
@@ -452,11 +468,6 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         );
         println!("  Installed {pkg_name} {version}");
     }
-
-    // Clean up orphaned auto-deps (e.g. after --force changed the dep tree)
-    purge_orphans(db)?;
-
-    db.save()?;
     Ok(())
 }
 
@@ -495,70 +506,35 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         list
     };
 
-    // Phase 1: resolve and download all zips
-    #[allow(clippy::type_complexity)]
-    let mut all_downloads: Vec<(String, String, Vec<(String, String, Manifest)>)> = Vec::new();
     for (pkg_name, new_version) in &packages {
-        let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
-        // Download zips for all new packages in this resolution
-        for (dep_name, dep_version, _) in &resolved {
-            download_zip(http, dep_name, dep_version)?;
-        }
-        all_downloads.push((pkg_name.clone(), new_version.clone(), resolved));
-    }
-
-    // Phase 2: extract and install
-    for (pkg_name, new_version, resolved) in &all_downloads {
         let old_version = db.packages[pkg_name].version.clone();
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
-        let manifest = resolved
-            .iter()
-            .find(|(n, _, _)| n == pkg_name)
-            .map(|(_, _, m)| m.clone())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{pkg_name} not in resolved deps")))?;
-
-        // Install new deps
-        for (dep_name, dep_version, dep_manifest) in resolved {
-            if dep_name == pkg_name || db.packages.contains_key(dep_name) {
-                continue;
-            }
-            println!("  Installing new dependency {dep_name} {dep_version}...");
-            let zip_path = cache_zip_path_in(dep_name, dep_version, &http.config.base_dir);
-            let installed_files = extract_zip(&zip_path, dep_manifest, &http.config.base_dir, dep_name)?;
-            db.packages.insert(
-                dep_name.clone(),
-                InstalledPackage {
-                    version: dep_version.clone(),
-                    reason: InstallReason::Auto,
-                    files: installed_files,
-                    dependencies: dep_manifest.dependencies.clone(),
-                },
-            );
-        }
+        let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
 
         // Remove old files that are no longer in the new manifest
-        if let Some(old_pkg) = db.packages.get(pkg_name) {
+        if let Some(new_manifest) = resolved.iter().find(|(n, _, _)| n == pkg_name).map(|(_, _, m)| m)
+            && let Some(old_pkg) = db.packages.get(pkg_name)
+        {
             for (old_file, old_path) in &old_pkg.files {
-                if !manifest.files.contains_key(old_file) && old_path.is_file() {
+                if !new_manifest.files.contains_key(old_file) && old_path.is_file() {
                     fs::remove_file(old_path)?;
                     println!("  Removed old file {old_file}");
                 }
             }
         }
 
-        let reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
-        let zip_path = cache_zip_path_in(pkg_name, new_version, &http.config.base_dir);
-        let installed_files = extract_zip(&zip_path, &manifest, &http.config.base_dir, pkg_name)?;
-        db.packages.insert(
-            pkg_name.clone(),
-            InstalledPackage {
-                version: new_version.clone(),
-                reason,
-                files: installed_files,
-                dependencies: manifest.dependencies.clone(),
-            },
-        );
+        // Filter to only packages that need installing (skip already-installed deps)
+        let to_install: Vec<_> =
+            resolved.into_iter().filter(|(n, _, _)| n == pkg_name || !db.packages.contains_key(n)).collect();
+
+        // Use a sentinel — download_and_install marks main as Manual,
+        // but for updates we preserve the original reason
+        let original_reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
+        download_and_install(&to_install, pkg_name, http, db)?;
+        if let Some(pkg) = db.packages.get_mut(pkg_name) {
+            pkg.reason = original_reason;
+        }
     }
 
     purge_orphans(db)?;
@@ -607,7 +583,7 @@ fn resolve_mappings(
 ) -> io::Result<(BTreeMap<String, String>, BTreeMap<String, PathBuf>)> {
     let mut files = BTreeMap::new();
     let mut sources = BTreeMap::new();
-    let from = dunce::canonicalize(from)?;
+    let mut from_cache: Option<PathBuf> = None;
 
     for mapping in mappings {
         let (pattern, dest) = mapping.rsplit_once(':').ok_or_else(|| {
@@ -616,8 +592,18 @@ fn resolve_mappings(
 
         let is_absolute = Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
 
-        let full_pattern =
-            if is_absolute { pattern.to_string() } else { from.join(pattern).to_string_lossy().to_string() };
+        let full_pattern = if is_absolute {
+            pattern.to_string()
+        } else {
+            let base = if let Some(p) = &from_cache {
+                p.clone()
+            } else {
+                let p = dunce::canonicalize(from)?;
+                from_cache = Some(p.clone());
+                p
+            };
+            base.join(pattern).to_string_lossy().to_string()
+        };
 
         let matched = glob::glob(&full_pattern)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
@@ -628,11 +614,10 @@ fn resolve_mappings(
                 continue;
             }
             let name = if is_absolute {
-                // Absolute glob: use just the filename
                 path.file_name().ok_or_else(|| io::Error::other("No filename"))?.to_string_lossy().to_string()
             } else {
-                // Relative glob: preserve path relative to --from
-                path.strip_prefix(&from)
+                let base = from_cache.as_ref().ok_or_else(|| io::Error::other("No base path"))?;
+                path.strip_prefix(base)
                     .map_err(|e| io::Error::other(format!("Path error: {e}")))?
                     .to_string_lossy()
                     .replace('\\', "/")
@@ -652,6 +637,8 @@ fn resolve_mappings(
 }
 
 /// Create a zip file from source paths.
+/// Note: loads all files into memory. This is acceptable for typical package sizes.
+// TODO: for very large packages (thousands of files), consider streaming to a temp file instead.
 fn create_package_zip(sources: &BTreeMap<String, PathBuf>) -> io::Result<Vec<u8>> {
     let mut buf = io::Cursor::new(Vec::new());
     {
@@ -671,6 +658,7 @@ fn create_package_zip(sources: &BTreeMap<String, PathBuf>) -> io::Result<Vec<u8>
 ///
 /// # Errors
 /// Returns an error if glob matching, zip creation, or upload fails.
+#[allow(clippy::too_many_arguments)]
 pub fn upload(
     name: &str,
     version: &str,
@@ -678,8 +666,20 @@ pub fn upload(
     mappings: &[String],
     deps: &[String],
     description: &str,
+    force: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
+    // Check if version already exists on server
+    if !force {
+        let versions = fetch_versions(http, name).unwrap_or_default();
+        if versions.contains(&version.to_string()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{name}@{version} already exists on server. Use --force to overwrite."),
+            ));
+        }
+    }
+
     let (files, sources) = resolve_mappings(from, mappings)?;
 
     println!("Package: {name}@{version}");
@@ -701,25 +701,25 @@ pub fn upload(
 
     println!("Uploading {name}@{version} ({} bytes)...", zip_data.len());
 
-    // Upload manifest
-    let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);
-    let resp = http.post(&url, manifest_json.into_bytes())?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!("Failed to upload manifest: {}", resp.status())));
-    }
-
-    // Upload zip
+    // Upload zip first, then manifest (server updates index on manifest upload,
+    // so if zip upload fails, the package won't appear in the index)
     let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
     let resp = http.post(&url, zip_data)?;
     if !resp.status().is_success() {
         return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
     }
 
+    let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);
+    let resp = http.post(&url, manifest_json.into_bytes())?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("Failed to upload manifest: {}", resp.status())));
+    }
+
     println!("Uploaded {name}@{version}");
     Ok(())
 }
 
-fn prompt_line(label: &str, default: &str) -> io::Result<String> {
+pub fn prompt_line(label: &str, default: &str) -> io::Result<String> {
     if default.is_empty() {
         print!("{label}: ");
     } else {
@@ -736,6 +736,7 @@ fn prompt_line(label: &str, default: &str) -> io::Result<String> {
 ///
 /// # Errors
 /// Returns an error if the upload fails.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_interactive(
     name: &str,
     version: &str,
@@ -743,6 +744,7 @@ pub fn upload_interactive(
     existing_mappings: &[String],
     existing_deps: &[String],
     existing_desc: &str,
+    force: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
     println!("Upload {name}@{version} from {}", from.display());
@@ -778,7 +780,7 @@ pub fn upload_interactive(
     let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
     let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
 
-    upload(name, version, from, &mappings, &deps, &description, http)
+    upload(name, version, from, &mappings, &deps, &description, force, http)
 }
 
 /// Find all installed packages that depend on `name`.
@@ -1508,5 +1510,35 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("b.exe"));
+    }
+
+    #[test]
+    fn upload_and_install_roundtrip() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+
+        // Create empty repo, start server
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        // Create a source file
+        fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
+
+        // Upload
+        upload("newtool", "1.0", src_tmp.path(), &["*.exe:util/".to_string()], &[], "A new tool", false, &http)
+            .unwrap();
+
+        // Verify it appears in index
+        let index = fetch_index(&http).unwrap();
+        assert_eq!(index["newtool"], "1.0");
+
+        // Install it
+        let mut db = Database::load_from(&db_path).unwrap();
+        install("newtool", None, false, &http, &mut db).unwrap();
+        assert!(install_tmp.path().join("util").join("tool.exe").exists());
     }
 }
