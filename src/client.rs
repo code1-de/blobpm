@@ -45,7 +45,7 @@ pub(crate) fn blob_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
 }
 
-// TODO: restrict file permissions on config.json (contains password in plaintext), or not. Needs discussion
+// TODO: Security: restrict file permissions on config.json to owner-only (contains password in plaintext)
 pub fn config_path() -> io::Result<PathBuf> {
     blob_dir().map(|p| p.join("config.json"))
 }
@@ -207,7 +207,14 @@ pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Resul
     if !resp.status().is_success() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found")));
     }
-    resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let manifest: Manifest = resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if manifest.name != name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Manifest name mismatch for {name}: manifest contains '{}'", manifest.name),
+        ));
+    }
+    Ok(manifest)
 }
 
 /// Download a package zip to the cache. Returns the path to the cached zip.
@@ -220,6 +227,7 @@ fn cache_zip_path_in(name: &str, version: &str, base_dir: &Path) -> PathBuf {
 
 fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<PathBuf> {
     let zip_path = cache_zip_path_in(name, version, &http.config.base_dir);
+    // TODO: Security: verify cached zip integrity (hash) against server-provided checksum to prevent cache poisoning
     if zip_path.is_file() {
         return Ok(zip_path);
     }
@@ -243,6 +251,9 @@ fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<Path
 /// Maximum decompressed file size (1 GB) — zip bomb protection.
 const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Maximum total decompressed size across all files in a package (2 GB) — aggregate zip bomb protection.
+const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 fn extract_zip(
     zip_path: &Path,
     manifest: &Manifest,
@@ -255,11 +266,12 @@ fn extract_zip(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid zip for {name}: {e}")))?;
 
     let mut installed_files = BTreeMap::new();
+    let mut total_written: u64 = 0;
 
     for (file, dest_dir) in &manifest.files {
         validate_manifest_path(file, dest_dir, name)?;
 
-        let dest = base_dir.join(dest_dir.replace('/', "\\")).join(file);
+        let dest = canonical_base.join(dest_dir.replace('/', "\\")).join(file);
         if !dest.starts_with(&canonical_base) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -269,6 +281,14 @@ fn extract_zip(
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
+            // Defense in depth: verify canonical path is still inside base after mkdir (catches symlink escapes)
+            let canonical_parent = dunce::canonicalize(parent)?;
+            if !canonical_parent.starts_with(&canonical_base) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Install target escapes base dir for {name}: {}", canonical_parent.display()),
+                ));
+            }
         }
 
         let mut entry = archive
@@ -289,6 +309,15 @@ fn extract_zip(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("File {file} in {name} exceeded max size during extraction"),
+            ));
+        }
+
+        total_written = total_written.saturating_add(written);
+        if total_written > MAX_TOTAL_EXTRACT_SIZE {
+            fs::remove_file(&dest)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Total extraction size exceeds 2 GB limit for {name}"),
             ));
         }
 
@@ -360,13 +389,13 @@ fn resolve_recursive(
 }
 
 /// Windows reserved device names that must not be used as filenames.
-const WINDOWS_RESERVED: &[&str] = &[
+pub(crate) const WINDOWS_RESERVED: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
     "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate that a file path and destination directory from a manifest are safe.
-fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Result<()> {
+pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str) -> io::Result<()> {
     for (label, value) in [("file", file), ("dest_dir", dest_dir)] {
         if value.contains("..") {
             return Err(io::Error::new(
@@ -558,6 +587,9 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
 /// # Errors
 /// Returns an error if the index cannot be fetched or the regex is invalid.
 pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Result<()> {
+    if pattern.len() > 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Regex pattern too long (max 1024 bytes)"));
+    }
     let re = regex::Regex::new(pattern)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex: {e}")))?;
 

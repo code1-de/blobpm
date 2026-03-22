@@ -1,5 +1,5 @@
 use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::repo::RepoIndex;
+use crate::repo::{Manifest, RepoIndex};
 
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
@@ -23,6 +23,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/index", get(get_index))
         .route("/packages/{name}", get(get_versions))
         .route("/packages/{name}/{version}/{filename}", get(get_file))
+        // TODO: Security: consider per-IP rate limiting on uploads to prevent disk exhaustion
         .route(
             "/upload/{name}/{version}/{filename}",
             axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
@@ -31,6 +32,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+// TODO: Security: add rate limiting / IP-based throttling on failed auth attempts to prevent brute-force attacks
 async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let (expected_user, expected_pass) = &state.auth;
 
@@ -68,9 +70,11 @@ pub async fn run(repo_path: PathBuf, port: u16, auth: (String, String)) -> std::
     let fingerprint = crate::tls::current_fingerprint()?;
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
+    // TODO: Security: add --bind CLI option and default to 127.0.0.1 to avoid exposing to all interfaces
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
+    // TODO: add structured logging with timestamps and audit trail for uploads/downloads
     println!("Basic Auth: enabled");
 
     axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service()).await.map_err(std::io::Error::other)
@@ -156,7 +160,21 @@ async fn get_file(
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
             println!("GET /packages/{name}/{version}/{filename} ({} bytes)", bytes.len());
-            Ok(bytes)
+            let content_type = if std::path::Path::new(&filename)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                "application/json"
+            } else {
+                "application/octet-stream"
+            };
+            Ok((
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                bytes,
+            ))
         }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
@@ -175,13 +193,42 @@ async fn post_upload(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Validate manifest content before writing to disk
+    if filename == "manifest.json" {
+        let manifest: Manifest = serde_json::from_slice(&body).map_err(|e| {
+            eprintln!("Invalid manifest JSON for {name}/{version}: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+        if manifest.name != name {
+            eprintln!("Manifest name mismatch: URL={name}, manifest={}", manifest.name);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        for (file, dest_dir) in &manifest.files {
+            if crate::client::validate_manifest_path(file, dest_dir, &name).is_err() {
+                eprintln!("Unsafe path in manifest for {name}/{version}: {file} -> {dest_dir}");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
     let dir = state.repo_path.join("packages").join(&name).join(&version);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         eprintln!("Failed to create dir {}: {e}", dir.display());
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let path = dir.join(&filename);
+    // Defense in depth: verify resolved path stays inside repo
+    let Ok(canonical_dir) = tokio::fs::canonicalize(&dir).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let Ok(canonical_packages) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    if !canonical_dir.starts_with(&canonical_packages) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let path = canonical_dir.join(&filename);
     if let Err(e) = tokio::fs::write(&path, &body).await {
         eprintln!("Failed to write {}: {e}", path.display());
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
