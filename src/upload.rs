@@ -78,13 +78,15 @@ fn resolve_mappings(
                 path.file_name().ok_or_else(|| io::Error::other("No filename"))?.to_string_lossy().to_string()
             } else {
                 let base = from_cache.as_ref().ok_or_else(|| io::Error::other("No base path"))?;
-                path.strip_prefix(base)
-                    .map_err(|e| io::Error::other(format!("Path error: {e}")))?
-                    .to_string_lossy()
-                    .replace('\\', "/")
+                crate::platform::to_manifest_path(
+                    &path
+                        .strip_prefix(base)
+                        .map_err(|e| io::Error::other(format!("Path error: {e}")))?
+                        .to_string_lossy(),
+                )
             };
             if !files.contains_key(&name) {
-                files.insert(name.clone(), dest.to_string());
+                files.insert(name.clone(), crate::platform::to_manifest_path(dest));
                 sources.insert(name, path);
             }
         }
@@ -288,5 +290,66 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
         install("newtool", None, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("tool.exe").exists());
+    }
+
+    #[test]
+    fn manifest_dest_normalized_to_forward_slashes() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
+
+        // Upload with backslash dest — manifest should store forward slashes
+        upload(
+            "slashtest",
+            "1.0",
+            src_tmp.path(),
+            &["*.exe:sub\\dir\\".to_string()],
+            &[],
+            "",
+            false,
+            &http,
+        )
+        .unwrap();
+
+        // Read the manifest back and verify forward slashes
+        let manifest = crate::install::fetch_manifest(&http, "slashtest", "1.0").unwrap();
+        let dest = manifest.files.get("tool.exe").unwrap();
+        assert!(!dest.contains('\\'), "manifest dest should use / not \\: {dest}");
+        assert_eq!(dest, "sub/dir/");
+    }
+
+    #[test]
+    fn upload_with_forward_slash_dest_unchanged() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        fs::write(src_tmp.path().join("lib.dll"), b"lib-binary").unwrap();
+
+        upload(
+            "fwdtest",
+            "1.0",
+            src_tmp.path(),
+            &["*.dll:lib/native/".to_string()],
+            &[],
+            "",
+            false,
+            &http,
+        )
+        .unwrap();
+
+        let manifest = crate::install::fetch_manifest(&http, "fwdtest", "1.0").unwrap();
+        let dest = manifest.files.get("lib.dll").unwrap();
+        assert_eq!(dest, "lib/native/");
     }
 }

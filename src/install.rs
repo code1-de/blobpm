@@ -155,7 +155,7 @@ fn extract_zip(
     for (file, dest_dir) in &manifest.files {
         validate_manifest_path(file, dest_dir, name)?;
 
-        let dest = canonical_base.join(dest_dir.replace('/', "\\")).join(file);
+        let dest = canonical_base.join(crate::platform::to_native_path(dest_dir)).join(file);
         if !dest.starts_with(&canonical_base) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

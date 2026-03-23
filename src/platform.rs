@@ -1,7 +1,33 @@
-//! Platform-specific functionality (file permissions, etc.)
+//! Platform-specific functionality (file permissions, path conventions, etc.)
 
 use std::io;
 use std::path::Path;
+
+/// Normalize a path string to manifest convention (always forward slashes).
+/// On Windows, converts `\` to `/`. On Linux, `\` is a valid filename character — left as-is.
+#[cfg(windows)]
+pub(crate) fn to_manifest_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// On Linux, paths already use `/`. Backslash is a valid filename char, not a separator.
+#[cfg(not(windows))]
+pub(crate) fn to_manifest_path(path: &str) -> String {
+    path.to_string()
+}
+
+/// Convert a manifest path (forward slashes) to the native OS separator.
+#[cfg(windows)]
+pub(crate) fn to_native_path(path: &str) -> String {
+    path.replace('/', "\\")
+}
+
+/// Convert a manifest path (forward slashes) to the native OS separator.
+/// On Unix, manifest convention already matches — no conversion needed.
+#[cfg(not(windows))]
+pub(crate) fn to_native_path(path: &str) -> String {
+    path.to_string()
+}
 
 /// Restrict file permissions to owner-only, but only if the file still has default
 /// (inherited) permissions. If the user has customized the ACLs, don't touch them.
@@ -111,4 +137,61 @@ pub fn restrict_to_owner_if_inherited(path: &Path) -> io::Result<bool> {
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Path convention tests ---
+
+    #[test]
+    fn manifest_paths_use_forward_slashes() {
+        assert_eq!(to_manifest_path("util/sub"), "util/sub");
+        assert_eq!(to_manifest_path("already/fine"), "already/fine");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn manifest_path_converts_backslash_on_windows() {
+        assert_eq!(to_manifest_path("util\\sub"), "util/sub");
+        assert_eq!(to_manifest_path("a\\b\\c"), "a/b/c");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn manifest_path_ignores_backslash_on_linux() {
+        // On Linux, backslash is a valid filename character, not a separator
+        assert_eq!(to_manifest_path("util\\sub"), "util\\sub");
+    }
+
+    #[test]
+    fn manifest_path_preserves_no_separators() {
+        assert_eq!(to_manifest_path("file.exe"), "file.exe");
+        assert_eq!(to_manifest_path(""), "");
+    }
+
+    #[test]
+    fn native_path_on_current_os() {
+        // Manifest uses /, native should convert to OS separator
+        let native = to_native_path("util/sub/dir");
+        #[cfg(windows)]
+        assert_eq!(native, "util\\sub\\dir");
+        #[cfg(not(windows))]
+        assert_eq!(native, "util/sub/dir");
+    }
+
+    #[test]
+    fn native_path_no_separators_unchanged() {
+        assert_eq!(to_native_path("file.exe"), "file.exe");
+        assert_eq!(to_native_path(""), "");
+    }
+
+    #[test]
+    fn roundtrip_manifest_to_native_to_manifest() {
+        let original = "lib/sub/file.dll";
+        let native = to_native_path(original);
+        let back = to_manifest_path(&native);
+        assert_eq!(back, original, "roundtrip must preserve manifest path");
+    }
 }
