@@ -42,6 +42,7 @@ cargo run -- install <pkg>
 - No async where not needed (server is async, client can be blocking)
 - Manifest file is called `manifest.json`
 - DRY: Don't repeat yourself — extract shared logic into functions, never duplicate code
+- **Imports:** Prefer `use crate::module::Item;` at the top of the file over inline `crate::module::Item` paths in code
 - **No big refactors without asking first.** Discuss architectural changes before implementing them.
 - **No automatic commits or pushes.** Only commit or push when the user explicitly asks.
 - **Before committing:** Review and update `PLAN.md` — check off completed items, add new items if needed.

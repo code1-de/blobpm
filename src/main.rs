@@ -2,11 +2,15 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod client;
+mod install;
+mod platform;
+mod remove;
 mod repo;
 mod server;
 #[cfg(test)]
 mod testutil;
 mod tls;
+mod upload;
 
 #[derive(Parser)]
 #[command(
@@ -169,16 +173,16 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
             let (pkg_name, version) = parse_package_spec(name);
-            client::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
+            install::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
         }
         Commands::Search { pattern, versions } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
-            client::search(pattern, *versions, &http)?;
+            upload::search(pattern, *versions, &http)?;
         }
         Commands::Remove { name, force, transitive, keep } => {
             let mut db = client::Database::load()?;
-            client::remove(name, *force, *transitive, *keep, &mut db)?;
+            remove::remove(name, *force, *transitive, *keep, &mut db)?;
         }
         Commands::Manual { name } => {
             let mut db = client::Database::load()?;
@@ -199,18 +203,18 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Purge => {
             let mut db = client::Database::load()?;
-            client::purge(&mut db)?;
+            remove::purge(&mut db)?;
         }
         Commands::CleanCache => {
             let config = client::Config::load()?;
             println!("Cleaning cache (max age: {} day(s))...", config.cache_days);
-            client::clean_cache(&config.base_dir, config.cache_days);
+            install::clean_cache(&config.base_dir, config.cache_days);
         }
         Commands::Update { name } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
-            client::update(name.as_deref(), &http, &mut db)?;
+            install::update(name.as_deref(), &http, &mut db)?;
         }
         Commands::List { name, long } => {
             let db = client::Database::load()?;
@@ -256,9 +260,9 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let http = client::HttpClient::new(&config)?;
 
             if *interactive || mappings.is_empty() {
-                client::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
+                upload::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             } else {
-                client::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
+                upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             }
         }
         Commands::GenerateKeys { force } => {
@@ -293,11 +297,11 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     println!("blob configuration");
     println!("Press Enter to keep current value.\n");
 
-    let server_url = client::prompt_line("Server URL", &config.server_url)?;
-    let base_dir = client::prompt_line("Base install directory", &config.base_dir.display().to_string())?;
-    let username = client::prompt_line("Username", &config.username)?;
-    let password = client::prompt_line("Password", &config.password)?;
-    let cache_days_str = client::prompt_line("Cache max age (days, 0=no cache)", &config.cache_days.to_string())?;
+    let server_url = upload::prompt_line("Server URL", &config.server_url)?;
+    let base_dir = upload::prompt_line("Base install directory", &config.base_dir.display().to_string())?;
+    let username = upload::prompt_line("Username", &config.username)?;
+    let password = upload::prompt_line("Password", &config.password)?;
+    let cache_days_str = upload::prompt_line("Cache max age (days, 0=no cache)", &config.cache_days.to_string())?;
     let cache_days: u32 = cache_days_str.parse().unwrap_or(config.cache_days);
 
     let base_dir = PathBuf::from(base_dir);

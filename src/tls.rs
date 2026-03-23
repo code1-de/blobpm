@@ -62,7 +62,7 @@ pub fn generate_keys(force: bool) -> io::Result<String> {
     fs::write(&key_file, &key_pem)?;
 
     for (label, path) in [("cert", &cert_file), ("key", &key_file)] {
-        match crate::client::restrict_to_owner_if_inherited(path) {
+        match crate::platform::restrict_to_owner_if_inherited(path) {
             Ok(true) => println!("Restricted {label} to owner-only: {}", path.display()),
             Ok(false) => {}
             Err(e) => eprintln!("Warning: could not restrict {label} permissions on {}: {e}", path.display()),
