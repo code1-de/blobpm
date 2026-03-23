@@ -59,8 +59,15 @@ pub fn generate_keys(force: bool) -> io::Result<String> {
     }
 
     fs::write(&cert_file, &cert_pem)?;
-    // TODO: Security: restrict key.pem file permissions (e.g. 0600 / owner-only ACL) to prevent other users from reading the private key
     fs::write(&key_file, &key_pem)?;
+
+    for (label, path) in [("cert", &cert_file), ("key", &key_file)] {
+        match crate::client::restrict_to_owner_if_inherited(path) {
+            Ok(true) => println!("Restricted {label} to owner-only: {}", path.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!("Warning: could not restrict {label} permissions on {}: {e}", path.display()),
+        }
+    }
 
     let fingerprint = cert_fingerprint(&cert_der);
 

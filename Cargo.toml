@@ -24,6 +24,13 @@ tokio = { version = "1.50.0", features = ["full"] }
 tower = { version = "0.5", features = ["limit"] }
 zip = "8.3.1"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

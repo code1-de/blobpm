@@ -33,6 +33,7 @@ pub mod helpers {
                 auth,
                 repo_path: repo_path.to_path_buf(),
                 auth_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+                global_auth_failures: std::sync::Mutex::new((0, std::time::Instant::now())),
             });
         let app = server::build_router(state);
 

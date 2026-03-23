@@ -46,6 +46,13 @@ pub struct Config {
     pub password: String,
     #[serde(default)]
     pub server_fingerprint: String,
+    /// Number of days to keep cached downloads (0 = no cache, default: 1)
+    #[serde(default = "default_cache_days")]
+    pub cache_days: u32,
+}
+
+fn default_cache_days() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +83,107 @@ pub(crate) fn blob_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
 }
 
-// TODO: Security: restrict file permissions on config.json to owner-only (contains password in plaintext)
+/// Restrict file permissions to owner-only, but only if the file still has default
+/// (inherited) permissions. If the user has customized the ACLs, don't touch them.
+/// Returns `Ok(true)` if permissions were changed, `Ok(false)` if already customized.
+#[cfg(windows)]
+pub(crate) fn restrict_to_owner_if_inherited(path: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_TYPE, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, OBJECT_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const SE_DACL_PROTECTED: u16 = 0x1000;
+    const PROTECTED_DACL: OBJECT_SECURITY_INFORMATION = OBJECT_SECURITY_INFORMATION(0x8000_0000);
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let pcwstr = windows::core::PCWSTR(wide.as_ptr());
+
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let mut owner = PSID::default();
+        let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+
+        GetNamedSecurityInfoW(
+            pcwstr,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&raw mut owner),
+            None,
+            Some(&raw mut dacl),
+            None,
+            &raw mut sd,
+        )
+        .ok()
+        .map_err(|e| io::Error::other(format!("GetNamedSecurityInfo: {e}")))?;
+
+        // Check if DACL is already protected (user has customized permissions)
+        let mut control: u16 = 0;
+        let mut revision = 0u32;
+        GetSecurityDescriptorControl(sd, &raw mut control, &raw mut revision)
+            .map_err(|e| io::Error::other(format!("GetSecurityDescriptorControl: {e}")))?;
+
+        if control & SE_DACL_PROTECTED != 0 {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+            return Ok(false);
+        }
+
+        // Build new ACL: only owner gets full control
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: windows::Win32::Security::ACE_FLAGS(0), // NO_INHERITANCE
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_TYPE(0),
+                ptstrName: windows::core::PWSTR(owner.0.cast::<u16>()),
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation:
+                    windows::Win32::Security::Authorization::MULTIPLE_TRUSTEE_OPERATION(0),
+            },
+        };
+
+        let mut new_acl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+        SetEntriesInAclW(Some(&[ea]), None, &raw mut new_acl)
+            .ok()
+            .map_err(|e| {
+                let _ = LocalFree(Some(HLOCAL(sd.0)));
+                io::Error::other(format!("SetEntriesInAcl: {e}"))
+            })?;
+
+        // Set new DACL with PROTECTED flag (stops inheritance)
+        let result = SetNamedSecurityInfoW(
+            pcwstr,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+        .ok();
+
+        let _ = LocalFree(Some(HLOCAL(new_acl.cast())));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+
+        result.map_err(|e| io::Error::other(format!("SetNamedSecurityInfo: {e}")))?;
+    }
+
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn restrict_to_owner_if_inherited(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 pub fn config_path() -> io::Result<PathBuf> {
     blob_dir().map(|p| p.join("config.json"))
 }
@@ -110,7 +217,13 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&path, content)
+        fs::write(&path, &content)?;
+        match restrict_to_owner_if_inherited(&path) {
+            Ok(true) => println!("Restricted {} to owner-only (contains credentials)", path.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!("Warning: could not restrict permissions on {}: {e}", path.display()),
+        }
+        Ok(())
     }
 }
 
@@ -264,7 +377,7 @@ fn cache_zip_path_in(name: &str, version: &str, base_dir: &Path) -> PathBuf {
 
 fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<PathBuf> {
     let zip_path = cache_zip_path_in(name, version, &http.config.base_dir);
-    // TODO: Security: verify cached zip integrity (hash) against server-provided checksum to prevent cache poisoning
+    // TODO: Security: sign zips on server, verify signature on client before extraction
     if zip_path.is_file() {
         return Ok(zip_path);
     }
@@ -279,6 +392,43 @@ fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<Path
     let bytes = resp.bytes().map_err(io::Error::other)?;
     fs::write(&zip_path, &bytes)?;
     Ok(zip_path)
+}
+
+/// Delete cached files older than `max_age_days` (0 = delete all). Silently skips errors.
+pub fn clean_cache(base_dir: &Path, max_age_days: u32) {
+    let cache_dir = base_dir.join(".cache");
+    if !cache_dir.is_dir() {
+        return;
+    }
+    let max_age = std::time::Duration::from_secs(u64::from(max_age_days) * 86400);
+    let mut removed = 0u32;
+    let Ok(packages) = fs::read_dir(&cache_dir) else { return };
+    for pkg_entry in packages.flatten() {
+        let Ok(versions) = fs::read_dir(pkg_entry.path()) else { continue };
+        for ver_entry in versions.flatten() {
+            let Ok(meta) = ver_entry.path().join("files.zip").metadata() else { continue };
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > max_age);
+            if stale {
+                let pkg_name = pkg_entry.file_name();
+                let ver_name = ver_entry.file_name();
+                if fs::remove_dir_all(ver_entry.path()).is_ok() {
+                    println!("  Removed {}/{}", pkg_name.to_string_lossy(), ver_name.to_string_lossy());
+                    removed += 1;
+                }
+            }
+        }
+        // Remove empty package dirs
+        if fs::read_dir(pkg_entry.path()).is_ok_and(|mut d| d.next().is_none()) {
+            let _ = fs::remove_dir(pkg_entry.path());
+        }
+    }
+    if removed > 0 {
+        println!("Cleaned {removed} stale cache entries (older than {max_age_days} day(s))");
+    }
 }
 
 /// Extract files from a zip to target directories based on the manifest.
@@ -328,7 +478,10 @@ fn extract_zip(
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
-            // Defense in depth: verify canonical path is still inside base after mkdir (catches symlink escapes)
+            // Defense in depth: verify canonical path is still inside base after mkdir (catches symlink escapes).
+            // Known TOCTOU race: a local attacker with write access to base_dir could swap the directory
+            // between this check and File::create below. Accepted by design — such an attacker already
+            // has equivalent access to overwrite installed files directly.
             let canonical_parent = dunce::canonicalize(parent)?;
             if !canonical_parent.starts_with(&canonical_base) {
                 return Err(io::Error::new(
@@ -411,6 +564,7 @@ fn resolve_recursive(
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Dependency cycle detected: {name}")));
     }
 
+    validate_pkg_spec("dependency", name)?;
     in_stack.insert(name.to_string());
 
     let version = match version_override {
@@ -420,6 +574,7 @@ fn resolve_recursive(
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index")))?
             .clone(),
     };
+    validate_pkg_spec("version", &version)?;
 
     let manifest = fetch_manifest(http, name, &version)?;
 
@@ -482,6 +637,7 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    clean_cache(&http.config.base_dir, http.config.cache_days);
     validate_pkg_spec("package name", name)?;
     if let Some(v) = version {
         validate_pkg_spec("version", v)?;
@@ -570,6 +726,7 @@ fn download_and_install(
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    clean_cache(&http.config.base_dir, http.config.cache_days);
     let index = fetch_index(http)?;
 
     let packages: Vec<(String, String)> = if let Some(n) = name {
@@ -1026,6 +1183,7 @@ mod tests {
             username: TEST_USER.to_string(),
             password: TEST_PASS.to_string(),
             server_fingerprint: fingerprint.to_string(),
+            cache_days: 0,
         }
     }
 
@@ -1468,6 +1626,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             server_fingerprint: String::new(),
+            cache_days: 1,
         };
 
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();

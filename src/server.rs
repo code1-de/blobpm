@@ -18,12 +18,15 @@ use crate::repo::{Manifest, RepoIndex};
 const MAX_AUTH_FAILURES: u32 = 5;
 /// Lockout duration after exceeding `MAX_AUTH_FAILURES`.
 const AUTH_LOCKOUT_SECS: u64 = 30;
+/// Maximum failed auth attempts across all IPs before global lockout.
+const MAX_GLOBAL_AUTH_FAILURES: u32 = 20;
 
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
     pub auth: (String, String),
     pub repo_path: PathBuf,
     pub auth_failures: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    pub global_auth_failures: std::sync::Mutex<(u32, Instant)>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -50,7 +53,21 @@ async fn auth_middleware(
 ) -> Response {
     let ip = addr.ip();
 
-    // Check rate limit before processing auth
+    // Check global rate limit (all IPs combined)
+    if let Ok(global) = state.global_auth_failures.lock()
+        && global.0 >= MAX_GLOBAL_AUTH_FAILURES
+        && global.1.elapsed().as_secs() < AUTH_LOCKOUT_SECS
+    {
+        eprintln!("Auth rate-limited: {ip} (global lockout)");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
+            "Too many failed attempts. Try again later.",
+        )
+            .into_response();
+    }
+
+    // Check per-IP rate limit
     if let Ok(failures) = state.auth_failures.lock()
         && let Some((count, last)) = failures.get(&ip)
         && *count >= MAX_AUTH_FAILURES
@@ -99,6 +116,13 @@ async fn auth_middleware(
             entry.1 = Instant::now();
             eprintln!("Auth failed from {ip} ({}/{MAX_AUTH_FAILURES})", entry.0);
         }
+        if let Ok(mut global) = state.global_auth_failures.lock() {
+            if global.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
+                *global = (0, Instant::now());
+            }
+            global.0 += 1;
+            global.1 = Instant::now();
+        }
         (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
@@ -134,6 +158,7 @@ pub async fn run(repo_path: PathBuf, bind: &str, port: u16, auth: (String, Strin
         auth,
         repo_path,
         auth_failures: std::sync::Mutex::new(HashMap::new()),
+        global_auth_failures: std::sync::Mutex::new((0, Instant::now())),
     });
     let app = build_router(state);
 
@@ -317,6 +342,12 @@ async fn post_upload(
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
+        for dep in &manifest.dependencies {
+            if crate::client::validate_pkg_spec("dependency", dep).is_err() {
+                eprintln!("Invalid dependency name in manifest for {name}/{version}: {dep}");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
     }
 
     let dir = state.repo_path.join("packages").join(&name).join(&version);
@@ -337,25 +368,36 @@ async fn post_upload(
     }
 
     let path = canonical_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&path, &body).await {
-        eprintln!("Failed to write {}: {e}", path.display());
+    let tmp_path = canonical_dir.join(format!(".{filename}.tmp"));
+    if let Err(e) = tokio::fs::write(&tmp_path, &body).await {
+        eprintln!("Failed to write {}: {e}", tmp_path.display());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Cross-validate: when both manifest.json and files.zip exist, check zip contains all manifest files
+    // Use the temp file for the just-uploaded one, the final path for the other
+    let (manifest_check, zip_check) = if filename == "manifest.json" {
+        (tmp_path.clone(), canonical_dir.join("files.zip"))
+    } else {
+        (canonical_dir.join("manifest.json"), tmp_path.clone())
+    };
+    if manifest_check.is_file()
+        && zip_check.is_file()
+        && let Err(e) = validate_zip_against_manifest(&manifest_check, &zip_check)
+    {
+        eprintln!("Zip/manifest mismatch for {name}/{version}: {e}");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Atomic move: temp file → final path (validated)
+    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+        eprintln!("Failed to rename {} -> {}: {e}", tmp_path.display(), path.display());
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     println!("POST /upload/{name}/{version}/{filename} ({} bytes)", body.len());
-
-    // Cross-validate: when both manifest.json and files.zip exist, check zip contains all manifest files
-    let manifest_path = canonical_dir.join("manifest.json");
-    let zip_path = canonical_dir.join("files.zip");
-    if manifest_path.is_file()
-        && zip_path.is_file()
-        && let Err(e) = validate_zip_against_manifest(&manifest_path, &zip_path)
-    {
-        eprintln!("Zip/manifest mismatch for {name}/{version}: {e}");
-        // Remove the just-uploaded file so we don't leave inconsistent state
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(StatusCode::BAD_REQUEST);
-    }
 
     // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"

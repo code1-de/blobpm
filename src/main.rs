@@ -79,6 +79,8 @@ enum Commands {
     },
     /// Remove all orphaned auto-installed packages (auto deps no longer needed)
     Purge,
+    /// Clean the download cache (delete cached zip files)
+    CleanCache,
     /// Run the package server (HTTPS with auto-generated TLS cert)
     Serve {
         /// Path to the repository directory
@@ -90,7 +92,7 @@ enum Commands {
         bind: String,
 
         /// Port to listen on
-        #[arg(long, default_value = "8803")]
+        #[arg(long, default_value = "53777")]
         port: u16,
 
         /// Username for Basic Auth
@@ -199,6 +201,11 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let mut db = client::Database::load()?;
             client::purge(&mut db)?;
         }
+        Commands::CleanCache => {
+            let config = client::Config::load()?;
+            println!("Cleaning cache (max age: {} day(s))...", config.cache_days);
+            client::clean_cache(&config.base_dir, config.cache_days);
+        }
         Commands::Update { name } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
@@ -275,11 +282,12 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
 
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
-        server_url: "https://localhost:8803".to_string(),
+        server_url: "https://localhost:53777".to_string(),
         base_dir: PathBuf::from("C:/"),
         username: String::new(),
         password: String::new(),
         server_fingerprint: String::new(),
+        cache_days: 1,
     });
 
     println!("blob configuration");
@@ -289,6 +297,8 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = client::prompt_line("Base install directory", &config.base_dir.display().to_string())?;
     let username = client::prompt_line("Username", &config.username)?;
     let password = client::prompt_line("Password", &config.password)?;
+    let cache_days_str = client::prompt_line("Cache max age (days, 0=no cache)", &config.cache_days.to_string())?;
+    let cache_days: u32 = cache_days_str.parse().unwrap_or(config.cache_days);
 
     let base_dir = PathBuf::from(base_dir);
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
@@ -299,6 +309,7 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
         username,
         password,
         server_fingerprint: config.server_fingerprint.clone(),
+        cache_days,
     };
 
     new_config.save()?;
