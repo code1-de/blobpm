@@ -10,10 +10,11 @@ pub(crate) fn to_manifest_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-/// On Linux, paths already use `/`. Backslash is a valid filename char, not a separator.
+/// On Linux, also convert backslashes — manifests always use forward slashes,
+/// and backslash-as-filename-char is not a supported use case.
 #[cfg(not(windows))]
 pub(crate) fn to_manifest_path(path: &str) -> String {
-    path.to_string()
+    path.replace('\\', "/")
 }
 
 /// Convert a manifest path (forward slashes) to the native OS separator.
@@ -160,9 +161,9 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn manifest_path_ignores_backslash_on_linux() {
-        // On Linux, backslash is a valid filename character, not a separator
-        assert_eq!(to_manifest_path("util\\sub"), "util\\sub");
+    fn manifest_path_converts_backslash_on_linux() {
+        // Manifests always use forward slashes, even on Linux
+        assert_eq!(to_manifest_path("util\\sub"), "util/sub");
     }
 
     #[test]
