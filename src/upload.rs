@@ -6,6 +6,16 @@ use crate::client::{validate_pkg_spec, HttpClient};
 use crate::install::{fetch_index, fetch_versions};
 use crate::repo::Manifest;
 
+/// Extract the non-glob base directory from a glob pattern.
+/// E.g. `C:\bin\git64\**` → `C:\bin\git64`, `C:\tools\*.exe` → `C:\tools`.
+fn glob_base_dir(pattern: &str) -> PathBuf {
+    let first_glob = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+    let base = &pattern[..first_glob];
+    // Find the last path separator before the glob
+    let last_sep = base.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    PathBuf::from(&pattern[..last_sep])
+}
+
 pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Result<()> {
     if pattern.len() > 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Regex pattern too long (max 1024 bytes)"));
@@ -53,8 +63,10 @@ fn resolve_mappings(
 
         let is_absolute = Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
 
-        let full_pattern = if is_absolute {
-            pattern.to_string()
+        let (full_pattern, strip_base) = if is_absolute {
+            // Find the non-glob base: everything before the first wildcard character
+            let glob_base = glob_base_dir(pattern);
+            (pattern.to_string(), Some(glob_base))
         } else {
             let base = if let Some(p) = &from_cache {
                 p.clone()
@@ -63,10 +75,16 @@ fn resolve_mappings(
                 from_cache = Some(p.clone());
                 p
             };
-            base.join(pattern).to_string_lossy().to_string()
+            (base.join(pattern).to_string_lossy().to_string(), None)
         };
 
-        let matched = glob::glob(&full_pattern)
+        // glob crate treats \ as escape on all platforms — normalize to / for reliable matching.
+        // Also: "dir/**" only matches directories in the glob crate; append "/*" for files.
+        let mut glob_pattern = full_pattern.replace('\\', "/");
+        if glob_pattern.ends_with("/**") || glob_pattern.ends_with("**") && !glob_pattern.ends_with("**/*") {
+            glob_pattern.push_str("/*");
+        }
+        let matched = glob::glob(&glob_pattern)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
 
         for entry in matched {
@@ -74,17 +92,16 @@ fn resolve_mappings(
             if !path.is_file() {
                 continue;
             }
-            let name = if is_absolute {
-                path.file_name().ok_or_else(|| io::Error::other("No filename"))?.to_string_lossy().to_string()
-            } else {
-                let base = from_cache.as_ref().ok_or_else(|| io::Error::other("No base path"))?;
-                crate::platform::to_manifest_path(
-                    &path
-                        .strip_prefix(base)
-                        .map_err(|e| io::Error::other(format!("Path error: {e}")))?
-                        .to_string_lossy(),
-                )
-            };
+            let base = strip_base
+                .as_deref()
+                .or(from_cache.as_deref())
+                .ok_or_else(|| io::Error::other("No base path"))?;
+            let name = crate::platform::to_manifest_path(
+                &path
+                    .strip_prefix(base)
+                    .map_err(|e| io::Error::other(format!("Path error: {e}")))?
+                    .to_string_lossy(),
+            );
             if !files.contains_key(&name) {
                 files.insert(name.clone(), crate::platform::to_manifest_path(dest));
                 sources.insert(name, path);
