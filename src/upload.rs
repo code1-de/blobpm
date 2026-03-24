@@ -151,6 +151,9 @@ pub fn upload(
 ) -> io::Result<()> {
     validate_pkg_spec("package name", name)?;
     validate_pkg_spec("version", version)?;
+    for dep in deps {
+        validate_pkg_spec("dependency", dep)?;
+    }
     // Check if version already exists on server
     if !force {
         let versions = fetch_versions(http, name).unwrap_or_default();

@@ -124,11 +124,11 @@ enum Commands {
         from: PathBuf,
 
         /// Package dependency (can be repeated: --dep zip --dep helper)
-        #[arg(long = "dep", short)]
+        #[arg(long = "dep", short = 'D')]
         deps: Vec<String>,
 
         /// Package description
-        #[arg(long, default_value = "")]
+        #[arg(long, short, default_value = "")]
         description: String,
 
         /// Interactive mode — review and edit all fields before uploading
