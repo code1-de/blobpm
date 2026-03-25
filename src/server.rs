@@ -1,4 +1,5 @@
 use axum::extract::{ConnectInfo, Path, Request, State};
+use futures_util::StreamExt;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -214,6 +215,7 @@ pub async fn run(
     println!("Basic Auth: enabled");
 
     axum_server::bind_rustls(addr, tls_config)
+        .http1_only()
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(std::io::Error::other)
@@ -382,8 +384,10 @@ async fn post_upload(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((name, version, filename)): Path<(String, String, String)>,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> impl IntoResponse {
+    use tokio::io::AsyncWriteExt;
+
     let url_path = format!("/upload/{name}/{version}/{filename}");
     let ip = addr.ip();
 
@@ -394,36 +398,6 @@ async fn post_upload(
     if filename != "manifest.json" && filename != "files.zip" {
         state.log_entry(ip, "POST", &url_path, 400, Some("filename must be manifest.json or files.zip"));
         return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Validate manifest content before writing to disk
-    if filename == "manifest.json" {
-        let manifest: Manifest = match serde_json::from_slice(&body) {
-            Ok(m) => m,
-            Err(e) => {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid manifest JSON: {e}")));
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        };
-        if manifest.name != name {
-            state.log_entry(
-                ip, "POST", &url_path, 400,
-                Some(&format!("manifest name mismatch: URL={name}, manifest={}", manifest.name)),
-            );
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        for (file, dest_dir) in &manifest.files {
-            if crate::client::validate_manifest_path(file, dest_dir, &name).is_err() {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("unsafe path: {file} -> {dest_dir}")));
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-        for dep in &manifest.dependencies {
-            if crate::client::validate_pkg_spec("dependency", dep).is_err() {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid dependency name: {dep}")));
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
     }
 
     let dir = state.repo_path.join("packages").join(&name).join(&version);
@@ -447,33 +421,105 @@ async fn post_upload(
 
     let final_path = canonical_dir.join(&filename);
     let tmp_path = canonical_dir.join(format!(".{filename}.tmp"));
-    if let Err(e) = tokio::fs::write(&tmp_path, &body).await {
-        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write temp file failed: {e}")));
+
+    // Stream body directly to temp file — avoids buffering large uploads in RAM
+    let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create temp file: {e}")));
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let mut stream = request.into_body().into_data_stream();
+    let mut bytes_written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                state.log_entry(
+                    ip, "POST", &url_path, 500,
+                    Some(&format!("stream error after {bytes_written} bytes: {e}")),
+                );
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        if let Err(e) = tmp_file.write_all(&chunk).await {
+            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write error: {e}")));
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        bytes_written += chunk.len() as u64;
+    }
+    if let Err(e) = tmp_file.flush().await {
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("flush error: {e}")));
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    drop(tmp_file);
 
-    // Cross-validate zip against manifest when both are present
-    let (manifest_check, zip_check) = if filename == "manifest.json" {
-        (tmp_path.clone(), canonical_dir.join("files.zip"))
-    } else {
-        (canonical_dir.join("manifest.json"), tmp_path.clone())
-    };
-    if manifest_check.is_file()
-        && zip_check.is_file()
-        && let Err(e) = validate_zip_against_manifest(&manifest_check, &zip_check)
-    {
-        state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(StatusCode::BAD_REQUEST);
+    // Validate manifest content (re-read from temp file; manifests are tiny)
+    if filename == "manifest.json" {
+        let data = match tokio::fs::read(&tmp_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                state.log_entry(ip, "POST", &url_path, 500, Some(&format!("read manifest: {e}")));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        let manifest: Manifest = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid manifest JSON: {e}")));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+        if manifest.name != name {
+            state.log_entry(
+                ip, "POST", &url_path, 400,
+                Some(&format!("manifest name mismatch: URL={name}, manifest={}", manifest.name)),
+            );
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        for (file, dest_dir) in &manifest.files {
+            if crate::client::validate_manifest_path(file, dest_dir, &name).is_err() {
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("unsafe path: {file} -> {dest_dir}")));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        for dep in &manifest.dependencies {
+            if crate::client::validate_pkg_spec("dependency", dep).is_err() {
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid dependency name: {dep}")));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    // Cross-validate zip against manifest when uploading the manifest (always uploaded second).
+    // Skip validation when uploading the zip — the manifest may not exist yet or may be stale.
+    if filename == "manifest.json" {
+        let zip_check = canonical_dir.join("files.zip");
+        if zip_check.is_file() {
+            if let Err(e) = validate_zip_against_manifest(&tmp_path, &zip_check) {
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
     }
 
     if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
-        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename temp file failed: {e}")));
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename failed: {e}")));
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    state.log_entry(ip, "POST", &url_path, 201, Some(&format!("{} bytes", body.len())));
+    state.log_entry(ip, "POST", &url_path, 201, Some(&format!("{bytes_written} bytes")));
 
     // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"

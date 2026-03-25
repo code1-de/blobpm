@@ -236,6 +236,8 @@ pub fn build_client(config: &super::client::Config) -> io::Result<reqwest::block
 
     reqwest::blocking::Client::builder()
         .use_preconfigured_tls(tls_config)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| io::Error::other(format!("Failed to build HTTP client: {e}")))
 }
