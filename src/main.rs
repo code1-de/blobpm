@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod client;
@@ -15,7 +15,7 @@ mod upload;
 #[derive(Parser)]
 #[command(
     name = "blob",
-    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io\nMax file size per extracted file: 1 GB", env!("CARGO_PKG_VERSION")),
+    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io", env!("CARGO_PKG_VERSION")),
     version,
 )]
 struct Cli {
@@ -55,6 +55,10 @@ enum Commands {
     Update {
         /// Package name (optional, updates all if omitted)
         name: Option<String>,
+
+        /// Show what would be updated without actually doing it
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     /// List installed packages (with package name: show details)
     List {
@@ -188,7 +192,29 @@ enum Commands {
 
 fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cli = Cli::parse();
+    let install_limits = format!(
+        "Limits:\n  Max file size per extracted file: {} GB\n  Max total extraction size: {} GB\n  Max zip entries: {}",
+        install::MAX_EXTRACT_SIZE / 1024 / 1024 / 1024,
+        install::MAX_TOTAL_EXTRACT_SIZE / 1024 / 1024 / 1024,
+        install::MAX_ZIP_ENTRIES,
+    );
+    let serve_limits = format!(
+        "Limits:\n  Max upload size: {} MB\n  Max concurrent connections: {}\n  Auth lockout: {} failures per IP / {} global in {} seconds",
+        server::MAX_UPLOAD_SIZE / 1024 / 1024,
+        server::MAX_CONCURRENT,
+        server::MAX_AUTH_FAILURES,
+        server::MAX_GLOBAL_AUTH_FAILURES,
+        server::AUTH_LOCKOUT_SECS,
+    );
+    let upload_limits = format!(
+        "Limits:\n  Max upload size: {} MB",
+        server::MAX_UPLOAD_SIZE / 1024 / 1024,
+    );
+    let cmd = Cli::command()
+        .mut_subcommand("install", |c| c.after_help(install_limits))
+        .mut_subcommand("serve", |c| c.after_help(serve_limits))
+        .mut_subcommand("upload", |c| c.after_help(upload_limits));
+    let cli = Cli::from_arg_matches(&cmd.get_matches()).expect("cli parse");
 
     if let Err(e) = run_command(&cli.command) {
         eprintln!("Error: {e}");
@@ -250,11 +276,11 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             println!("Cleaning cache (max age: {max_days} day(s))...");
             install::clean_cache(&config.cache_dir()?, max_days);
         }
-        Commands::Update { name } => {
+        Commands::Update { name, dry_run } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
-            install::update(name.as_deref(), &http, &mut db)?;
+            install::update(name.as_deref(), *dry_run, &http, &mut db)?;
         }
         Commands::List { name, long } => {
             let db = client::Database::load()?;

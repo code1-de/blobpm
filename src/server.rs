@@ -17,11 +17,15 @@ use std::time::Instant;
 use crate::repo::{Manifest, RepoIndex};
 
 /// Maximum failed auth attempts per IP before lockout.
-const MAX_AUTH_FAILURES: u32 = 5;
+pub(crate) const MAX_AUTH_FAILURES: u32 = 5;
 /// Lockout duration after exceeding `MAX_AUTH_FAILURES`.
-const AUTH_LOCKOUT_SECS: u64 = 30;
+pub(crate) const AUTH_LOCKOUT_SECS: u64 = 30;
 /// Maximum failed auth attempts across all IPs before global lockout.
-const MAX_GLOBAL_AUTH_FAILURES: u32 = 20;
+pub(crate) const MAX_GLOBAL_AUTH_FAILURES: u32 = 20;
+/// Maximum upload body size (512 MB).
+pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
+/// Maximum concurrent connections.
+pub(crate) const MAX_CONCURRENT: usize = 5;
 
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
@@ -63,12 +67,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // TODO: Security: consider per-IP rate limiting on uploads to prevent disk exhaustion
         .route(
             "/upload/{name}/{version}/{filename}",
-            axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+            axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_SIZE)),
         )
         .route("/packages/{name}/{version}", axum::routing::delete(delete_version))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::map_response(add_security_headers))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(5))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT))
         .with_state(state)
 }
 

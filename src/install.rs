@@ -117,13 +117,13 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
 /// # Errors
 /// Returns an error if extraction or path validation fails.
 /// Maximum decompressed file size (1 GB) — zip bomb protection.
-const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Maximum total decompressed size across all files in a package (2 GB) — aggregate zip bomb protection.
-const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of entries in a zip archive — prevents inode exhaustion from many tiny files.
-const MAX_ZIP_ENTRIES: usize = 50_000;
+pub(crate) const MAX_ZIP_ENTRIES: usize = 50_000;
 
 fn extract_zip(
     zip_path: &Path,
@@ -390,8 +390,10 @@ fn download_and_install(
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    if let Ok(cache_dir) = http.config.cache_dir() {
+pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+    if !dry_run
+        && let Ok(cache_dir) = http.config.cache_dir()
+    {
         clean_cache(&cache_dir, http.config.cache_days);
     }
     let index = fetch_index(http)?;
@@ -425,6 +427,15 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         }
         list
     };
+
+    if dry_run {
+        println!("Would update {} package(s):", packages.len());
+        for (pkg_name, new_version) in &packages {
+            let old_version = &db.packages[pkg_name].version;
+            println!("  {pkg_name} {old_version} -> {new_version}");
+        }
+        return Ok(());
+    }
 
     for (pkg_name, new_version) in &packages {
         let old_version = db.packages[pkg_name].version.clone();
@@ -648,7 +659,7 @@ mod tests {
         install("toolE", Some("1.0"), false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 1);
 
-        update(None, &http, &mut db).unwrap();
+        update(None, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolE"].version, "2.0");
         assert!(db.packages.contains_key("depA"));
     }
