@@ -35,8 +35,8 @@ pub(crate) fn validate_pkg_spec(label: &str, value: &str) -> io::Result<()> {
 
 /// Windows reserved device names that must not be used as filenames.
 pub(crate) const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate that a file path and destination directory from a manifest are safe.
@@ -100,11 +100,7 @@ pub struct Config {
 
 impl Config {
     pub(crate) fn cache_dir(&self) -> io::Result<PathBuf> {
-        if let Some(dir) = &self.cache_dir {
-            Ok(dir.clone())
-        } else {
-            default_cache_dir()
-        }
+        if let Some(dir) = &self.cache_dir { Ok(dir.clone()) } else { default_cache_dir() }
     }
 
     /// Resolve a manifest `dest_dir` to a local directory path.
@@ -303,12 +299,7 @@ impl HttpClient {
         self.send(self.client.delete(url))
     }
 
-    pub(crate) fn download_to_file(
-        &self,
-        url: &str,
-        dest: &std::path::Path,
-        label: &str,
-    ) -> io::Result<()> {
+    pub(crate) fn download_to_file(&self, url: &str, dest: &std::path::Path, label: &str) -> io::Result<()> {
         let mut resp = self.get(url)?;
         if !resp.status().is_success() {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("GET {url}: {}", resp.status())));
@@ -316,11 +307,9 @@ impl HttpClient {
         let total = resp.content_length().unwrap_or(0);
         let pb = indicatif::ProgressBar::new(total);
         pb.set_style(
-            indicatif::ProgressStyle::with_template(
-                "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
-            )
-            .expect("hardcoded progress template")
-            .progress_chars("=>-"),
+            indicatif::ProgressStyle::with_template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .expect("hardcoded progress template")
+                .progress_chars("=>-"),
         );
         pb.set_message(label.to_string());
         let file = std::fs::File::create(dest)?;
@@ -339,11 +328,9 @@ impl HttpClient {
         let total = body.len() as u64;
         let pb = indicatif::ProgressBar::new(total);
         pb.set_style(
-            indicatif::ProgressStyle::with_template(
-                "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
-            )
-            .expect("hardcoded progress template")
-            .progress_chars("=>-"),
+            indicatif::ProgressStyle::with_template("{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .expect("hardcoded progress template")
+                .progress_chars("=>-"),
         );
         pb.set_message(label.to_string());
         let reader = pb.wrap_read(std::io::Cursor::new(body));

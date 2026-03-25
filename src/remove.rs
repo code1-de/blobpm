@@ -3,11 +3,7 @@ use std::io;
 use crate::client::{Database, InstallReason};
 
 fn reverse_deps(name: &str, db: &Database) -> Vec<String> {
-    db.packages
-        .iter()
-        .filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string()))
-        .map(|(n, _)| n.clone())
-        .collect()
+    db.packages.iter().filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string())).map(|(n, _)| n.clone()).collect()
 }
 
 // TODO: build reverse-dep index for O(n) lookup instead of O(n²) per iteration

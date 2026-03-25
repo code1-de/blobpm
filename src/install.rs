@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use crate::client::{validate_manifest_path, validate_pkg_spec, Database, HttpClient, InstallReason, InstalledPackage};
+use crate::client::{Database, HttpClient, InstallReason, InstalledPackage, validate_manifest_path, validate_pkg_spec};
 use crate::remove::purge_orphans;
 use crate::repo::{IndexEntry, Manifest};
 
@@ -93,8 +93,8 @@ fn download_zip(
     http.download_to_file(&url, &zip_path, &format!("Downloading {name} {version}"))?;
 
     // Save manifest alongside zip for future cache validation
-    let manifest_json = serde_json::to_string_pretty(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest_json =
+        serde_json::to_string_pretty(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(&manifest_path, manifest_json)?;
 
     Ok(zip_path)
@@ -112,11 +112,7 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
         let Ok(versions) = fs::read_dir(pkg_entry.path()) else { continue };
         for ver_entry in versions.flatten() {
             let Ok(meta) = ver_entry.path().join("files.zip").metadata() else { continue };
-            let stale = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > max_age);
+            let stale = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
             if stale {
                 let pkg_name = pkg_entry.file_name();
                 let ver_name = ver_entry.file_name();
@@ -323,7 +319,14 @@ fn resolve_recursive(
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn install(name: &str, version: Option<&str>, force: bool, no_cache: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+pub fn install(
+    name: &str,
+    version: Option<&str>,
+    force: bool,
+    no_cache: bool,
+    http: &HttpClient,
+    db: &mut Database,
+) -> io::Result<()> {
     if let Ok(cache_dir) = http.config.cache_dir() {
         clean_cache(&cache_dir, http.config.cache_days);
     }
@@ -416,9 +419,7 @@ fn download_and_install(
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    if !dry_run
-        && let Ok(cache_dir) = http.config.cache_dir()
-    {
+    if !dry_run && let Ok(cache_dir) = http.config.cache_dir() {
         clean_cache(&cache_dir, http.config.cache_days);
     }
     let index = fetch_index(http)?;

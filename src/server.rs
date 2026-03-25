@@ -1,5 +1,4 @@
 use axum::extract::{ConnectInfo, Path, Request, State};
-use futures_util::StreamExt;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -7,6 +6,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -159,12 +159,7 @@ async fn auth_middleware(
             global.1 = Instant::now();
         }
         state.log_entry(ip, &method, &path, 401, Some(&format!("auth failed ({count}/{MAX_AUTH_FAILURES})")));
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
-            "Unauthorized",
-        )
-            .into_response()
+        (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")], "Unauthorized").into_response()
     }
 }
 
@@ -294,10 +289,8 @@ fn is_safe_segment(s: &str) -> bool {
 }
 
 async fn add_security_headers(mut resp: Response) -> Response {
-    resp.headers_mut().insert(
-        header::STRICT_TRANSPORT_SECURITY,
-        "max-age=63072000; includeSubDomains".parse().unwrap(),
-    );
+    resp.headers_mut()
+        .insert(header::STRICT_TRANSPORT_SECURITY, "max-age=63072000; includeSubDomains".parse().unwrap());
     resp
 }
 
@@ -346,21 +339,13 @@ async fn get_file(
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
             state.log_entry(addr.ip(), "GET", &url_path, 200, Some(&format!("{} bytes", bytes.len())));
-            let content_type = if std::path::Path::new(&filename)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-            {
-                "application/json"
-            } else {
-                "application/octet-stream"
-            };
-            Ok((
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                ],
-                bytes,
-            ))
+            let content_type =
+                if std::path::Path::new(&filename).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+                    "application/json"
+                } else {
+                    "application/octet-stream"
+                };
+            Ok(([(header::CONTENT_TYPE, content_type), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes))
         }
         Err(e) => {
             state.log_entry(addr.ip(), "GET", &url_path, 404, Some(&format!("read error: {}", sanitize_io_error(&e))));
@@ -376,9 +361,8 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
     let zip_file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
     let archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("parse zip: {e}"))?;
 
-    let zip_names: std::collections::HashSet<String> = (0..archive.len())
-        .filter_map(|i| archive.name_for_index(i).map(String::from))
-        .collect();
+    let zip_names: std::collections::HashSet<String> =
+        (0..archive.len()).filter_map(|i| archive.name_for_index(i).map(String::from)).collect();
     let manifest_names: std::collections::HashSet<&String> = manifest.files.keys().collect();
 
     let missing: Vec<_> = manifest_names.iter().filter(|f| !zip_names.contains(**f)).collect();
@@ -399,11 +383,9 @@ async fn validate_uploaded_manifest(
     expected_name: &str,
     package_dir: &std::path::Path,
 ) -> Result<(), (u16, String)> {
-    let data = tokio::fs::read(manifest_path)
-        .await
-        .map_err(|e| (500, format!("read manifest: {}", sanitize_io_error(&e))))?;
-    let manifest: Manifest =
-        serde_json::from_slice(&data).map_err(|e| (400, format!("invalid manifest JSON: {e}")))?;
+    let data =
+        tokio::fs::read(manifest_path).await.map_err(|e| (500, format!("read manifest: {}", sanitize_io_error(&e))))?;
+    let manifest: Manifest = serde_json::from_slice(&data).map_err(|e| (400, format!("invalid manifest JSON: {e}")))?;
     if manifest.name != expected_name {
         return Err((400, format!("manifest name mismatch: URL={expected_name}, manifest={}", manifest.name)));
     }
@@ -483,7 +465,10 @@ async fn post_upload(
             Ok(c) => c,
             Err(e) => {
                 state.log_entry(
-                    ip, "POST", &url_path, 500,
+                    ip,
+                    "POST",
+                    &url_path,
+                    500,
                     Some(&format!("stream error after {bytes_written} bytes: {e}")),
                 );
                 let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -817,7 +802,8 @@ mod tests {
         fs::write(
             pkg_dir.join("manifest.json"),
             r#"{"name":"testpkg","description":"A test","files":{"test.exe":"util/"},"dependencies":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         create_zip(&pkg_dir, &[("test.exe", b"v2-binary")]);
 
         let (_rt, port, fp) = start_tls_server(tmp.path());

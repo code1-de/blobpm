@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use crate::client::{validate_pkg_spec, HttpClient};
+use crate::client::{HttpClient, validate_pkg_spec};
 use crate::install::{fetch_index, fetch_versions};
 use crate::repo::IndexEntry;
 use crate::repo::Manifest;
@@ -31,11 +31,8 @@ pub fn search(pattern: &str, show_versions: bool, search_desc: bool, http: &Http
 
     for (name, IndexEntry { latest, description }) in &index {
         if re.is_match(name) || (search_desc && re.is_match(description)) {
-            let version_str = if show_versions {
-                fetch_versions(http, name).unwrap_or_default().join(", ")
-            } else {
-                latest.clone()
-            };
+            let version_str =
+                if show_versions { fetch_versions(http, name).unwrap_or_default().join(", ") } else { latest.clone() };
             rows.push((name.clone(), version_str, description.clone()));
         }
     }
@@ -78,8 +75,7 @@ fn resolve_mappings(
 
         // Support "a.exe;b.dll:bin" — semicolon-separated files sharing the same dest
         for pattern in patterns_str.split(';') {
-            let is_absolute =
-                Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
+            let is_absolute = Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
 
             let (full_pattern, strip_base) = if is_absolute {
                 let glob_base = glob_base_dir(pattern);
@@ -109,10 +105,8 @@ fn resolve_mappings(
                 if !path.is_file() {
                     continue;
                 }
-                let base = strip_base
-                    .as_deref()
-                    .or(from_cache.as_deref())
-                    .ok_or_else(|| io::Error::other("No base path"))?;
+                let base =
+                    strip_base.as_deref().or(from_cache.as_deref()).ok_or_else(|| io::Error::other("No base path"))?;
                 let mut name = crate::platform::to_manifest_path(
                     &path
                         .strip_prefix(base)
@@ -203,12 +197,8 @@ pub fn upload(
         println!("  {file} -> {dest}");
     }
 
-    let manifest = Manifest {
-        name: name.to_string(),
-        description: description.to_string(),
-        files,
-        dependencies: deps.to_vec(),
-    };
+    let manifest =
+        Manifest { name: name.to_string(), description: description.to_string(), files, dependencies: deps.to_vec() };
 
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
@@ -360,10 +350,17 @@ mod tests {
 
         // "a.exe;b.dll:bin" means both go to bin/, "c.txt:doc" separately
         upload(
-            "grouped", "1.0", src_tmp.path(),
+            "grouped",
+            "1.0",
+            src_tmp.path(),
             &["a.exe;b.dll:bin".to_string(), "c.txt:doc".to_string()],
-            &[], "", false, false, &http,
-        ).unwrap();
+            &[],
+            "",
+            false,
+            false,
+            &http,
+        )
+        .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "grouped", "1.0").unwrap();
         assert_eq!(manifest.files["a.exe"], "bin");
@@ -384,14 +381,15 @@ mod tests {
         fs::write(src_tmp.path().join("MyTool.EXE"), b"binary").unwrap();
 
         // Literal filename with --lowercase
-        upload(
-            "lc-literal", "1.0", src_tmp.path(),
-            &["MyTool.EXE:bin".to_string()],
-            &[], "", false, true, &http,
-        ).unwrap();
+        upload("lc-literal", "1.0", src_tmp.path(), &["MyTool.EXE:bin".to_string()], &[], "", false, true, &http)
+            .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "lc-literal", "1.0").unwrap();
-        assert!(manifest.files.contains_key("mytool.exe"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
+        assert!(
+            manifest.files.contains_key("mytool.exe"),
+            "expected lowercase: {:?}",
+            manifest.files.keys().collect::<Vec<_>>()
+        );
         assert!(!manifest.files.contains_key("MyTool.EXE"));
     }
 
@@ -410,14 +408,29 @@ mod tests {
 
         // Glob pattern with --lowercase
         upload(
-            "lc-glob", "1.0", src_tmp.path(),
+            "lc-glob",
+            "1.0",
+            src_tmp.path(),
             &["*.DLL:lib".to_string(), "*.EXE:bin".to_string()],
-            &[], "", false, true, &http,
-        ).unwrap();
+            &[],
+            "",
+            false,
+            true,
+            &http,
+        )
+        .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "lc-glob", "1.0").unwrap();
-        assert!(manifest.files.contains_key("helper.dll"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
-        assert!(manifest.files.contains_key("main.exe"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
+        assert!(
+            manifest.files.contains_key("helper.dll"),
+            "expected lowercase: {:?}",
+            manifest.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            manifest.files.contains_key("main.exe"),
+            "expected lowercase: {:?}",
+            manifest.files.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -433,18 +446,8 @@ mod tests {
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
         // Upload with backslash dest — manifest should store forward slashes
-        upload(
-            "slashtest",
-            "1.0",
-            src_tmp.path(),
-            &["*.exe:sub\\dir\\".to_string()],
-            &[],
-            "",
-            false,
-            false,
-            &http,
-        )
-        .unwrap();
+        upload("slashtest", "1.0", src_tmp.path(), &["*.exe:sub\\dir\\".to_string()], &[], "", false, false, &http)
+            .unwrap();
 
         // Read the manifest back and verify forward slashes
         let manifest = crate::install::fetch_manifest(&http, "slashtest", "1.0").unwrap();
@@ -465,18 +468,8 @@ mod tests {
 
         fs::write(src_tmp.path().join("lib.dll"), b"lib-binary").unwrap();
 
-        upload(
-            "fwdtest",
-            "1.0",
-            src_tmp.path(),
-            &["*.dll:lib/native/".to_string()],
-            &[],
-            "",
-            false,
-            false,
-            &http,
-        )
-        .unwrap();
+        upload("fwdtest", "1.0", src_tmp.path(), &["*.dll:lib/native/".to_string()], &[], "", false, false, &http)
+            .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "fwdtest", "1.0").unwrap();
         let dest = manifest.files.get("lib.dll").unwrap();

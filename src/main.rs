@@ -214,10 +214,7 @@ fn main() {
         server::MAX_GLOBAL_AUTH_FAILURES,
         server::AUTH_LOCKOUT_SECS,
     );
-    let upload_limits = format!(
-        "Limits:\n  Max upload size: {} MB",
-        server::MAX_UPLOAD_SIZE / 1024 / 1024,
-    );
+    let upload_limits = format!("Limits:\n  Max upload size: {} MB", server::MAX_UPLOAD_SIZE / 1024 / 1024,);
     let cmd = Cli::command()
         .mut_subcommand("install", |c| c.after_help(install_limits))
         .mut_subcommand("serve", |c| c.after_help(serve_limits))
@@ -341,11 +338,14 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    let rows: Vec<_> = packages.iter().map(|n| {
-                        let pkg = &db.packages[*n];
-                        let reason = if pkg.reason == client::InstallReason::Auto { "auto" } else { "" };
-                        (*n, pkg.version.as_str(), reason)
-                    }).collect();
+                    let rows: Vec<_> = packages
+                        .iter()
+                        .map(|n| {
+                            let pkg = &db.packages[*n];
+                            let reason = if pkg.reason == client::InstallReason::Auto { "auto" } else { "" };
+                            (*n, pkg.version.as_str(), reason)
+                        })
+                        .collect();
                     let w0 = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
                     let w1 = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
                     for (n, version, reason) in &rows {
@@ -365,18 +365,24 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let http = client::HttpClient::new(&config)?;
 
             if *interactive || mappings.is_empty() {
-                upload::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
+                upload::upload_interactive(
+                    &pkg_name,
+                    &version,
+                    from,
+                    mappings,
+                    deps,
+                    description,
+                    *force,
+                    *lowercase,
+                    &http,
+                )?;
             } else {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
             }
         }
         Commands::Status { paths, all, missing, no_recurse, depth } => {
             let db = client::Database::load()?;
-            let dirs: Vec<PathBuf> = if paths.is_empty() {
-                vec![std::env::current_dir()?]
-            } else {
-                paths.clone()
-            };
+            let dirs: Vec<PathBuf> = if paths.is_empty() { vec![std::env::current_dir()?] } else { paths.clone() };
             let max_depth = if *no_recurse { Some(0) } else { *depth };
             for dir in &dirs {
                 if dirs.len() > 1 {
@@ -422,7 +428,13 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     }
 }
 
-fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, show_missing: bool, max_depth: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_status(
+    dir: &std::path::Path,
+    db: &client::Database,
+    show_all: bool,
+    show_missing: bool,
+    max_depth: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
 
     let dir = dunce::canonicalize(dir).map_err(|e| format!("Cannot access {}: {e}", dir.display()))?;
@@ -475,14 +487,22 @@ fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, show
     }
 
     if show_missing && missing_count > 0 {
-        println!("\n{managed} managed, {unmanaged} unmanaged, {missing_count} missing, {} on disk", managed + unmanaged);
+        println!(
+            "\n{managed} managed, {unmanaged} unmanaged, {missing_count} missing, {} on disk",
+            managed + unmanaged
+        );
     } else {
         println!("\n{managed} managed, {unmanaged} unmanaged, {} on disk", managed + unmanaged);
     }
     Ok(())
 }
 
-fn collect_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, current_depth: usize, max_depth: Option<usize>) -> std::io::Result<()> {
+fn collect_files(
+    dir: &std::path::Path,
+    out: &mut Vec<PathBuf>,
+    current_depth: usize,
+    max_depth: Option<usize>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();

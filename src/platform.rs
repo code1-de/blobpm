@@ -38,8 +38,8 @@ pub fn restrict_to_owner_if_inherited(path: &Path) -> io::Result<bool> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_TYPE, TRUSTEE_W,
+        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+        TRUSTEE_IS_SID, TRUSTEE_TYPE, TRUSTEE_W,
     };
     use windows::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, OBJECT_SECURITY_INFORMATION,
@@ -92,18 +92,15 @@ pub fn restrict_to_owner_if_inherited(path: &Path) -> io::Result<bool> {
                 TrusteeType: TRUSTEE_TYPE(0),
                 ptstrName: windows::core::PWSTR(owner.0.cast::<u16>()),
                 pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation:
-                    windows::Win32::Security::Authorization::MULTIPLE_TRUSTEE_OPERATION(0),
+                MultipleTrusteeOperation: windows::Win32::Security::Authorization::MULTIPLE_TRUSTEE_OPERATION(0),
             },
         };
 
         let mut new_acl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
-        SetEntriesInAclW(Some(&[ea]), None, &raw mut new_acl)
-            .ok()
-            .map_err(|e| {
-                let _ = LocalFree(Some(HLOCAL(sd.0)));
-                io::Error::other(format!("SetEntriesInAcl: {e}"))
-            })?;
+        SetEntriesInAclW(Some(&[ea]), None, &raw mut new_acl).ok().map_err(|e| {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+            io::Error::other(format!("SetEntriesInAcl: {e}"))
+        })?;
 
         // Set new DACL with PROTECTED flag (stops inheritance)
         let result = SetNamedSecurityInfoW(

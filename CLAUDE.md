@@ -21,7 +21,7 @@ cargo run -- install <pkg>
 
 - Each phase must compile and work (as far as implemented)
 - Tests for every new feature: `cargo test`
-- Lint clean: `cargo clippy --all-targets -- -W clippy::all -W clippy::pedantic`
+- **Before every commit, run in this order:** `cargo test`, `cargo clippy --all-targets -- -W clippy::all -W clippy::pedantic`, `cargo fmt`
 - All clippy warnings must be fixed
 - Default build is debug (`cargo build`), not release
 - Production-grade error handling: no `unwrap()` or `expect()` in non-test code

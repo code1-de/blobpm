@@ -40,9 +40,8 @@ pub fn generate_keys(force: bool) -> io::Result<String> {
 
     let key_pair = KeyPair::generate().map_err(|e| io::Error::other(format!("Key generation failed: {e}")))?;
 
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()])
-            .map_err(|e| io::Error::other(format!("Cert params failed: {e}")))?;
+    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()])
+        .map_err(|e| io::Error::other(format!("Cert params failed: {e}")))?;
     params.distinguished_name.push(rcgen::DnType::CommonName, rcgen::DnValue::Utf8String("blob server".to_string()));
 
     let cert = params.self_signed(&key_pair).map_err(|e| io::Error::other(format!("Cert generation failed: {e}")))?;
