@@ -83,7 +83,7 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
     }
     let max_age = std::time::Duration::from_secs(u64::from(max_age_days) * 86400);
     let mut removed = 0u32;
-    let Ok(packages) = fs::read_dir(&cache_dir) else { return };
+    let Ok(packages) = fs::read_dir(cache_dir) else { return };
     for pkg_entry in packages.flatten() {
         let Ok(versions) = fs::read_dir(pkg_entry.path()) else { continue };
         for ver_entry in versions.flatten() {
@@ -128,10 +128,9 @@ const MAX_ZIP_ENTRIES: usize = 50_000;
 fn extract_zip(
     zip_path: &Path,
     manifest: &Manifest,
-    base_dir: &Path,
+    config: &crate::client::Config,
     name: &str,
 ) -> io::Result<BTreeMap<String, PathBuf>> {
-    let canonical_base = dunce::canonicalize(base_dir)?;
     let zip_file = fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(zip_file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid zip for {name}: {e}")))?;
@@ -149,25 +148,42 @@ fn extract_zip(
     for (file, dest_dir) in &manifest.files {
         validate_manifest_path(file, dest_dir, name)?;
 
-        let dest = canonical_base.join(crate::platform::to_native_path(dest_dir)).join(file);
-        if !dest.starts_with(&canonical_base) {
+        let resolved_dir = config.resolve_dest(dest_dir);
+        let dest = resolved_dir.join(file);
+
+        // Confinement check: the resolved root is either a mapped path or base_dir.
+        // Ensure the final destination stays inside that root.
+        let native_dest_dir = crate::platform::to_native_path(dest_dir);
+        let root = {
+            let first_seg = std::path::Path::new(&native_dest_dir)
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned());
+            match first_seg.as_deref().and_then(|k| config.path_map.get(k)) {
+                Some(mapped) => mapped.clone(),
+                None => config.base_dir.clone(),
+            }
+        };
+        if !dest.starts_with(&root) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Install target escapes base dir for {name}: {}", dest.display()),
+                format!("Install target escapes allowed root for {name}: {}", dest.display()),
             ));
         }
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
-            // Defense in depth: verify canonical path is still inside base after mkdir (catches symlink escapes).
-            // Known TOCTOU race: a local attacker with write access to base_dir could swap the directory
-            // between this check and File::create below. Accepted by design — such an attacker already
-            // has equivalent access to overwrite installed files directly.
+            // Defense in depth: verify canonical path is still inside the allowed root after mkdir
+            // (catches symlink escapes).
+            // Known TOCTOU race: a local attacker with write access could swap the directory
+            // between this check and File::create below. Accepted by design — such an attacker
+            // already has equivalent access to overwrite installed files directly.
             let canonical_parent = dunce::canonicalize(parent)?;
-            if !canonical_parent.starts_with(&canonical_base) {
+            let canonical_root = dunce::canonicalize(&root).unwrap_or(root.clone());
+            if !canonical_parent.starts_with(&canonical_root) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Install target escapes base dir for {name}: {}", canonical_parent.display()),
+                    format!("Install target escapes allowed root for {name}: {}", canonical_parent.display()),
                 ));
             }
         }
@@ -353,7 +369,7 @@ fn download_and_install(
         let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
         println!("Installing {pkg_name} {version}...");
-        let installed_files = extract_zip(zip_path, manifest, &http.config.base_dir, pkg_name)?;
+        let installed_files = extract_zip(zip_path, manifest, &http.config, pkg_name)?;
 
         db.packages.insert(
             pkg_name.to_string(),
@@ -485,7 +501,21 @@ mod tests {
             password: TEST_PASS.to_string(),
             server_fingerprint: fingerprint.to_string(),
             cache_days: 0,
+            path_map: BTreeMap::new(),
             cache_dir: Some(base_dir.join(".cache")),
+        }
+    }
+
+    fn minimal_config(base_dir: &Path) -> Config {
+        Config {
+            server_url: String::new(),
+            base_dir: base_dir.to_path_buf(),
+            username: String::new(),
+            password: String::new(),
+            server_fingerprint: String::new(),
+            cache_days: 0,
+            path_map: BTreeMap::new(),
+            cache_dir: None,
         }
     }
 
@@ -744,7 +774,7 @@ mod tests {
         let base = tmp.path().join("install");
         fs::create_dir_all(&base).unwrap();
 
-        let result = extract_zip(&zip_path, &manifest, &base, "bad");
+        let result = extract_zip(&zip_path, &manifest, &minimal_config(&base), "bad");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unexpected entry type"), "got: {err}");
@@ -771,7 +801,7 @@ mod tests {
         let base = tmp.path().join("install");
         fs::create_dir_all(&base).unwrap();
 
-        let result = extract_zip(&zip_path, &manifest, &base, "bad");
+        let result = extract_zip(&zip_path, &manifest, &minimal_config(&base), "bad");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unexpected entry type"), "got: {err}");
@@ -793,9 +823,93 @@ mod tests {
         let base = tmp.path().join("install");
         fs::create_dir_all(&base).unwrap();
 
-        let result = extract_zip(&tmp.path().join("files.zip"), &manifest, &base, "bad");
+        let result = extract_zip(&tmp.path().join("files.zip"), &manifest, &minimal_config(&base), "bad");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("b.exe"));
+    }
+
+    #[test]
+    fn resolve_dest_uses_path_map() {
+        let mut config = minimal_config(Path::new("C:\\base"));
+        config.path_map.insert("bin".to_string(), PathBuf::from("D:\\tools\\bin"));
+
+        // Mapped segment
+        assert_eq!(config.resolve_dest("bin"), PathBuf::from("D:\\tools\\bin"));
+        assert_eq!(config.resolve_dest("bin/sub"), PathBuf::from("D:\\tools\\bin\\sub"));
+
+        // Unmapped segment falls back to base_dir
+        assert_eq!(config.resolve_dest("util"), PathBuf::from("C:\\base\\util"));
+        assert_eq!(config.resolve_dest("util/sub"), PathBuf::from("C:\\base\\util\\sub"));
+    }
+
+    #[test]
+    fn extract_zip_with_path_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mapped_dir = tmp.path().join("mapped_bin");
+        fs::create_dir_all(&mapped_dir).unwrap();
+        let base = tmp.path().join("base");
+        fs::create_dir_all(&base).unwrap();
+
+        create_zip(tmp.path(), &[("tool.exe", b"binary-content")]);
+
+        let manifest = crate::repo::Manifest {
+            name: "mypkg".to_string(),
+            description: "test".to_string(),
+            files: BTreeMap::from([("tool.exe".to_string(), "bin/".to_string())]),
+            dependencies: vec![],
+        };
+
+        let mut config = minimal_config(&base);
+        config.path_map.insert("bin".to_string(), mapped_dir.clone());
+
+        let installed = extract_zip(&tmp.path().join("files.zip"), &manifest, &config, "mypkg").unwrap();
+        let dest = &installed["tool.exe"];
+        assert!(dest.starts_with(&mapped_dir), "expected under mapped dir: {}", dest.display());
+        assert!(dest.is_file());
+        assert_eq!(fs::read(dest).unwrap(), b"binary-content");
+    }
+
+    #[test]
+    fn extract_zip_unmapped_uses_base_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mapped_dir = tmp.path().join("mapped_bin");
+        fs::create_dir_all(&mapped_dir).unwrap();
+        let base = tmp.path().join("base");
+        fs::create_dir_all(&base).unwrap();
+
+        create_zip(tmp.path(), &[("script.py", b"print('hi')")]);
+
+        let manifest = crate::repo::Manifest {
+            name: "mypkg".to_string(),
+            description: "test".to_string(),
+            files: BTreeMap::from([("script.py".to_string(), "scripts/".to_string())]),
+            dependencies: vec![],
+        };
+
+        // bin is mapped, but scripts is not — should go to base_dir/scripts/
+        let mut config = minimal_config(&base);
+        config.path_map.insert("bin".to_string(), mapped_dir);
+
+        let installed = extract_zip(&tmp.path().join("files.zip"), &manifest, &config, "mypkg").unwrap();
+        let dest = &installed["script.py"];
+        assert!(dest.starts_with(&base), "expected under base dir: {}", dest.display());
+        assert!(dest.is_file());
+    }
+
+    #[test]
+    fn path_map_serializes_in_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+
+        let mut config = minimal_config(Path::new("C:\\base"));
+        config.path_map.insert("bin".to_string(), PathBuf::from("D:\\tools\\bin"));
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        fs::write(&path, &json).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let loaded: Config = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.path_map["bin"], PathBuf::from("D:\\tools\\bin"));
     }
 }

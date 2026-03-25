@@ -88,6 +88,11 @@ pub struct Config {
     /// Number of days to keep cached downloads (0 = no cache, default: 1)
     #[serde(default = "default_cache_days")]
     pub cache_days: u32,
+    /// Map manifest `dest_dir` first segments to local absolute paths.
+    /// E.g. `{"bin": "D:\\tools\\bin"}` makes `bin/sub` resolve to `D:\tools\bin\sub`.
+    /// Unmapped segments fall back to `base_dir/<dest_dir>`.
+    #[serde(default)]
+    pub path_map: BTreeMap<String, PathBuf>,
     /// Cache directory override (not serialized; defaults to ~/.blob/cache)
     #[serde(skip)]
     pub cache_dir: Option<PathBuf>,
@@ -100,6 +105,23 @@ impl Config {
         } else {
             default_cache_dir()
         }
+    }
+
+    /// Resolve a manifest `dest_dir` to a local directory path.
+    /// Looks up the first path segment in `path_map`; if found, replaces it with
+    /// the mapped path. Otherwise falls back to `base_dir/dest_dir`.
+    pub(crate) fn resolve_dest(&self, dest_dir: &str) -> PathBuf {
+        let native = crate::platform::to_native_path(dest_dir);
+        let path = std::path::Path::new(&native);
+        let mut components = path.components();
+        if let Some(first) = components.next() {
+            let key = first.as_os_str().to_string_lossy();
+            if let Some(mapped) = self.path_map.get(key.as_ref()) {
+                let rest: PathBuf = components.collect();
+                return if rest.as_os_str().is_empty() { mapped.clone() } else { mapped.join(rest) };
+            }
+        }
+        self.base_dir.join(native)
     }
 }
 
@@ -411,6 +433,7 @@ mod tests {
             password: String::new(),
             server_fingerprint: String::new(),
             cache_days: 1,
+            path_map: BTreeMap::new(),
             cache_dir: None,
         };
 

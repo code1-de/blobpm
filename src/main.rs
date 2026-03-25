@@ -89,7 +89,7 @@ enum Commands {
     Purge,
     /// Clean the download cache (delete cached zip files)
     CleanCache {
-        /// Max age in days (0 = delete all, default: cache_days from config)
+        /// Max age in days (0 = delete all, default: `cache_days` from config)
         days: Option<u32>,
     },
     /// Run the package server
@@ -417,6 +417,7 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
         password: String::new(),
         server_fingerprint: String::new(),
         cache_days: 1,
+        path_map: std::collections::BTreeMap::new(),
         cache_dir: None,
     });
 
@@ -433,6 +434,38 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(base_dir);
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
 
+    // Path mappings
+    let mut path_map = config.path_map.clone();
+    if path_map.is_empty() {
+        println!("\nPath mappings: (none — all files install under base dir)");
+    } else {
+        println!("\nPath mappings:");
+        for (key, target) in &path_map {
+            println!("  {key} -> {}", target.display());
+        }
+    }
+    println!("Enter mappings as 'segment=path' to add, '-segment' to remove, empty to finish.");
+    loop {
+        let line = upload::prompt_line("Path map", "")?;
+        if line.is_empty() {
+            break;
+        }
+        if let Some(key) = line.strip_prefix('-') {
+            if path_map.remove(key.trim()).is_some() {
+                println!("  Removed mapping for '{}'", key.trim());
+            } else {
+                println!("  No mapping for '{}'", key.trim());
+            }
+        } else if let Some((key, path)) = line.split_once('=') {
+            let path = PathBuf::from(path.trim());
+            let path = dunce::canonicalize(&path).unwrap_or(path);
+            path_map.insert(key.trim().to_string(), path.clone());
+            println!("  {} -> {}", key.trim(), path.display());
+        } else {
+            println!("  Format: segment=path or -segment");
+        }
+    }
+
     let new_config = client::Config {
         server_url,
         base_dir,
@@ -440,6 +473,7 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
         password,
         server_fingerprint: config.server_fingerprint.clone(),
         cache_days,
+        path_map,
         cache_dir: None,
     };
 

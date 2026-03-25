@@ -38,11 +38,11 @@ impl AppState {
         let detail_str = detail.map_or_else(String::new, |d| format!("  {d}"));
         let line = format!("{now}  {ip}  {method} {path}  {status}{detail_str}\n");
         print!("{line}");
-        if let Ok(mut guard) = self.log_file.lock() {
-            if let Some(f) = guard.as_mut() {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.flush();
-            }
+        if let Ok(mut guard) = self.log_file.lock()
+            && let Some(f) = guard.as_mut()
+        {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
         }
     }
 }
@@ -388,6 +388,40 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
     Ok(())
 }
 
+/// Validate an uploaded manifest: parse JSON, check name match, validate paths/deps,
+/// and cross-validate against zip if present. Returns `Err((status_code, message))` on failure.
+async fn validate_uploaded_manifest(
+    manifest_path: &std::path::Path,
+    expected_name: &str,
+    package_dir: &std::path::Path,
+) -> Result<(), (u16, String)> {
+    let data = tokio::fs::read(manifest_path)
+        .await
+        .map_err(|e| (500, format!("read manifest: {}", sanitize_io_error(&e))))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&data).map_err(|e| (400, format!("invalid manifest JSON: {e}")))?;
+    if manifest.name != expected_name {
+        return Err((400, format!("manifest name mismatch: URL={expected_name}, manifest={}", manifest.name)));
+    }
+    for (file, dest_dir) in &manifest.files {
+        if crate::client::validate_manifest_path(file, dest_dir, expected_name).is_err() {
+            return Err((400, format!("unsafe path: {file} -> {dest_dir}")));
+        }
+    }
+    for dep in &manifest.dependencies {
+        if crate::client::validate_pkg_spec("dependency", dep).is_err() {
+            return Err((400, format!("invalid dependency name: {dep}")));
+        }
+    }
+    // Cross-validate zip against manifest (manifest is always uploaded second)
+    let zip_path = package_dir.join("files.zip");
+    if zip_path.is_file() {
+        validate_zip_against_manifest(manifest_path, &zip_path)
+            .map_err(|e| (400, format!("zip/manifest mismatch: {e}")))?;
+    }
+    Ok(())
+}
+
 async fn post_upload(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -466,59 +500,12 @@ async fn post_upload(
     }
     drop(tmp_file);
 
-    // Validate manifest content (re-read from temp file; manifests are tiny)
-    if filename == "manifest.json" {
-        let data = match tokio::fs::read(&tmp_path).await {
-            Ok(d) => d,
-            Err(e) => {
-                state.log_entry(ip, "POST", &url_path, 500, Some(&format!("read manifest: {}", sanitize_io_error(&e))));
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
-        let manifest: Manifest = match serde_json::from_slice(&data) {
-            Ok(m) => m,
-            Err(e) => {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid manifest JSON: {e}")));
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        };
-        if manifest.name != name {
-            state.log_entry(
-                ip, "POST", &url_path, 400,
-                Some(&format!("manifest name mismatch: URL={name}, manifest={}", manifest.name)),
-            );
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        for (file, dest_dir) in &manifest.files {
-            if crate::client::validate_manifest_path(file, dest_dir, &name).is_err() {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("unsafe path: {file} -> {dest_dir}")));
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-        for dep in &manifest.dependencies {
-            if crate::client::validate_pkg_spec("dependency", dep).is_err() {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid dependency name: {dep}")));
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-    }
-
-    // Cross-validate zip against manifest when uploading the manifest (always uploaded second).
-    // Skip validation when uploading the zip — the manifest may not exist yet or may be stale.
-    if filename == "manifest.json" {
-        let zip_check = canonical_dir.join("files.zip");
-        if zip_check.is_file() {
-            if let Err(e) = validate_zip_against_manifest(&tmp_path, &zip_check) {
-                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
+    if filename == "manifest.json"
+        && let Err((status, msg)) = validate_uploaded_manifest(&tmp_path, &name, &canonical_dir).await
+    {
+        state.log_entry(ip, "POST", &url_path, status, Some(&msg));
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(if status < 500 { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR });
     }
 
     if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
@@ -574,10 +561,10 @@ async fn delete_version(
 
     // Remove parent package dir if now empty
     let pkg_dir = state.repo_path.join("packages").join(&name);
-    if let Ok(mut entries) = tokio::fs::read_dir(&pkg_dir).await {
-        if entries.next_entry().await.ok().flatten().is_none() {
-            let _ = tokio::fs::remove_dir(&pkg_dir).await;
-        }
+    if let Ok(mut entries) = tokio::fs::read_dir(&pkg_dir).await
+        && entries.next_entry().await.ok().flatten().is_none()
+    {
+        let _ = tokio::fs::remove_dir(&pkg_dir).await;
     }
 
     // Rescan index
