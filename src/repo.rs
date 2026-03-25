@@ -11,9 +11,16 @@ pub struct Manifest {
     pub dependencies: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexEntry {
+    pub latest: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
     pub latest: String,
+    pub description: String,
     pub versions: Vec<String>,
 }
 
@@ -65,16 +72,26 @@ impl RepoIndex {
             let Some(latest) = versions.last().cloned() else {
                 continue;
             };
-            packages.insert(pkg_name, PackageInfo { latest, versions });
+            let description = fs::read(entry.path().join(&latest).join("manifest.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+                .map(|m| m.description)
+                .unwrap_or_default();
+            packages.insert(pkg_name, PackageInfo { latest, description, versions });
         }
 
         Ok(Self { packages })
     }
 
-    /// Build a summary index mapping package names to their latest version.
+    /// Build a summary index mapping package names to their latest version and description.
     #[must_use]
-    pub fn index_summary(&self) -> BTreeMap<String, String> {
-        self.packages.iter().map(|(name, info)| (name.clone(), info.latest.clone())).collect()
+    pub fn index_summary(&self) -> BTreeMap<String, IndexEntry> {
+        self.packages
+            .iter()
+            .map(|(name, info)| {
+                (name.clone(), IndexEntry { latest: info.latest.clone(), description: info.description.clone() })
+            })
+            .collect()
     }
 }
 
@@ -206,8 +223,8 @@ mod tests {
 
         let index = RepoIndex::scan(tmp.path()).unwrap();
         let summary = index.index_summary();
-        assert_eq!(summary["testpkg"], "2.0");
-        assert_eq!(summary["other"], "0.1");
+        assert_eq!(summary["testpkg"].latest, "2.0");
+        assert_eq!(summary["other"].latest, "0.1");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{fs, io};
 
 use crate::client::{validate_pkg_spec, HttpClient};
 use crate::install::{fetch_index, fetch_versions};
+use crate::repo::IndexEntry;
 use crate::repo::Manifest;
 
 /// Extract the non-glob base directory from a glob pattern.
@@ -16,30 +17,43 @@ fn glob_base_dir(pattern: &str) -> PathBuf {
     PathBuf::from(&pattern[..last_sep])
 }
 
-pub fn search(pattern: &str, show_versions: bool, http: &HttpClient) -> io::Result<()> {
+pub fn search(pattern: &str, show_versions: bool, search_desc: bool, http: &HttpClient) -> io::Result<()> {
     if pattern.len() > 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Regex pattern too long (max 1024 bytes)"));
     }
-    let re = regex::Regex::new(pattern)
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex: {e}")))?;
 
     let index = fetch_index(http)?;
-    let mut found = false;
+    let mut rows: Vec<(String, String, String)> = Vec::new();
 
-    for (name, latest) in &index {
-        if re.is_match(name) {
-            if show_versions {
-                let versions = fetch_versions(http, name)?;
-                println!("{name} — {}", versions.join(", "));
+    for (name, IndexEntry { latest, description }) in &index {
+        if re.is_match(name) || (search_desc && re.is_match(description)) {
+            let version_str = if show_versions {
+                fetch_versions(http, name).unwrap_or_default().join(", ")
             } else {
-                println!("{name} {latest}");
-            }
-            found = true;
+                latest.clone()
+            };
+            rows.push((name.clone(), version_str, description.clone()));
         }
     }
 
-    if !found {
+    if rows.is_empty() {
         println!("No packages matching '{pattern}'");
+        return Ok(());
+    }
+
+    let w0 = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let w1 = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
+
+    for (name, version, desc) in &rows {
+        if desc.is_empty() {
+            println!("{name:<w0$}  {version}");
+        } else {
+            println!("{name:<w0$}  {version:<w1$}  {desc}");
+        }
     }
 
     Ok(())
@@ -184,12 +198,10 @@ pub fn upload(
         serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
     let zip_data = create_package_zip(&sources)?;
 
-    println!("Uploading {name}@{version} ({} bytes)...", zip_data.len());
-
     // Upload zip first, then manifest (server updates index on manifest upload,
     // so if zip upload fails, the package won't appear in the index)
     let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
-    let resp = http.post(&url, zip_data)?;
+    let resp = http.post_with_progress(&url, zip_data, &format!("Uploading {name}@{version}"))?;
     if !resp.status().is_success() {
         return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
     }
@@ -305,7 +317,7 @@ mod tests {
             .unwrap();
 
         let index = fetch_index(&http).unwrap();
-        assert_eq!(index["newtool"], "1.0");
+        assert_eq!(index["newtool"].latest, "1.0");
 
         let mut db = Database::load_from(&db_path).unwrap();
         install("newtool", None, false, &http, &mut db).unwrap();

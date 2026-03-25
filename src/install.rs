@@ -4,13 +4,13 @@ use std::{fs, io};
 
 use crate::client::{validate_manifest_path, validate_pkg_spec, Database, HttpClient, InstallReason, InstalledPackage};
 use crate::remove::purge_orphans;
-use crate::repo::Manifest;
+use crate::repo::{IndexEntry, Manifest};
 
 /// Fetch the package index from the server.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the response is not valid JSON.
-pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, String>> {
+pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, IndexEntry>> {
     let url = format!("{}/index", http.config.server_url);
     let resp = http.get(&url)?;
     resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -223,7 +223,7 @@ pub fn resolve_dependencies(
     name: &str,
     target_version: &str,
     http: &HttpClient,
-    index: &BTreeMap<String, String>,
+    index: &BTreeMap<String, IndexEntry>,
     db: &Database,
 ) -> io::Result<Vec<(String, String, Manifest)>> {
     let mut result = Vec::new();
@@ -238,7 +238,7 @@ fn resolve_recursive(
     name: &str,
     version_override: Option<&str>,
     http: &HttpClient,
-    index: &BTreeMap<String, String>,
+    index: &BTreeMap<String, IndexEntry>,
     db: &Database,
     result: &mut Vec<(String, String, Manifest)>,
     visited: &mut HashSet<String>,
@@ -259,6 +259,7 @@ fn resolve_recursive(
         None => index
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index")))?
+            .latest
             .clone(),
     };
     validate_pkg_spec("version", &version)?;
@@ -309,6 +310,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         None => index
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found in index")))?
+            .latest
             .clone(),
     };
 
@@ -378,20 +380,23 @@ pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::R
         if !db.packages.contains_key(n) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("{n} is not installed")));
         }
-        let latest =
-            index.get(n).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index")))?;
-        if *latest == db.packages[n].version {
+        let latest = index
+            .get(n)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index")))?
+            .latest
+            .clone();
+        if latest == db.packages[n].version {
             println!("{n} is already at latest version ({latest}).");
             return Ok(());
         }
-        vec![(n.to_string(), latest.clone())]
+        vec![(n.to_string(), latest)]
     } else {
         let mut list = Vec::new();
         for (n, pkg) in &db.packages {
-            if let Some(latest) = index.get(n)
-                && *latest != pkg.version
+            if let Some(entry) = index.get(n)
+                && entry.latest != pkg.version
             {
-                list.push((n.clone(), latest.clone()));
+                list.push((n.clone(), entry.latest.clone()));
             }
         }
         if list.is_empty() {
@@ -488,8 +493,8 @@ mod tests {
         let config = test_config(port, Path::new(""), &fp);
         let http = HttpClient::new(&config).unwrap();
         let index = fetch_index(&http).unwrap();
-        assert_eq!(index["toolA"], "1.0");
-        assert_eq!(index["toolB"], "2.0");
+        assert_eq!(index["toolA"].latest, "1.0");
+        assert_eq!(index["toolB"].latest, "2.0");
     }
 
     #[test]

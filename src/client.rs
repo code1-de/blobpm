@@ -255,6 +255,29 @@ impl HttpClient {
     pub(crate) fn post(&self, url: &str, body: Vec<u8>) -> io::Result<reqwest::blocking::Response> {
         self.send(self.client.post(url).body(body))
     }
+
+    pub(crate) fn post_with_progress(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        label: &str,
+    ) -> io::Result<reqwest::blocking::Response> {
+        let total = body.len() as u64;
+        let pb = indicatif::ProgressBar::new(total);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.set_message(label.to_string());
+        let reader = pb.wrap_read(std::io::Cursor::new(body));
+        let stream_body = reqwest::blocking::Body::sized(reader, total);
+        let resp = self.send(self.client.post(url).body(stream_body));
+        pb.finish_and_clear();
+        resp
+    }
 }
 
 #[cfg(test)]

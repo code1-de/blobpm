@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use std::collections::HashMap;
+use std::io::{BufWriter, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +28,22 @@ pub struct AppState {
     pub repo_path: PathBuf,
     pub auth_failures: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
     pub global_auth_failures: std::sync::Mutex<(u32, Instant)>,
+    pub log_file: std::sync::Mutex<Option<BufWriter<std::fs::File>>>,
+}
+
+impl AppState {
+    fn log_entry(&self, ip: IpAddr, method: &str, path: &str, status: u16, detail: Option<&str>) {
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let detail_str = detail.map_or_else(String::new, |d| format!("  {d}"));
+        let line = format!("{now}  {ip}  {method} {path}  {status}{detail_str}\n");
+        print!("{line}");
+        if let Ok(mut guard) = self.log_file.lock() {
+            if let Some(f) = guard.as_mut() {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.flush();
+            }
+        }
+    }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -53,12 +70,15 @@ async fn auth_middleware(
 ) -> Response {
     let ip = addr.ip();
 
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+
     // Check global rate limit (all IPs combined)
     if let Ok(global) = state.global_auth_failures.lock()
         && global.0 >= MAX_GLOBAL_AUTH_FAILURES
         && global.1.elapsed().as_secs() < AUTH_LOCKOUT_SECS
     {
-        eprintln!("Auth rate-limited: {ip} (global lockout)");
+        state.log_entry(ip, &method, &path, 429, Some("global auth rate limit"));
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
@@ -73,7 +93,7 @@ async fn auth_middleware(
         && *count >= MAX_AUTH_FAILURES
         && last.elapsed().as_secs() < AUTH_LOCKOUT_SECS
     {
-        eprintln!("Auth rate-limited: {ip} (locked out for {AUTH_LOCKOUT_SECS}s)");
+        state.log_entry(ip, &method, &path, 429, Some("per-IP auth rate limit"));
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
@@ -106,16 +126,17 @@ async fn auth_middleware(
         }
         next.run(req).await
     } else {
-        if let Ok(mut failures) = state.auth_failures.lock() {
+        let count = if let Ok(mut failures) = state.auth_failures.lock() {
             let entry = failures.entry(ip).or_insert((0, Instant::now()));
-            // Reset counter if lockout period has passed
             if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
                 *entry = (0, Instant::now());
             }
             entry.0 += 1;
             entry.1 = Instant::now();
-            eprintln!("Auth failed from {ip} ({}/{MAX_AUTH_FAILURES})", entry.0);
-        }
+            entry.0
+        } else {
+            0
+        };
         if let Ok(mut global) = state.global_auth_failures.lock() {
             if global.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
                 *global = (0, Instant::now());
@@ -123,6 +144,7 @@ async fn auth_middleware(
             global.0 += 1;
             global.1 = Instant::now();
         }
+        state.log_entry(ip, &method, &path, 401, Some(&format!("auth failed ({count}/{MAX_AUTH_FAILURES})")));
         (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
@@ -136,7 +158,13 @@ async fn auth_middleware(
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or run.
-pub async fn run(repo_path: PathBuf, bind: &str, port: u16, auth: (String, String)) -> std::io::Result<()> {
+pub async fn run(
+    repo_path: PathBuf,
+    bind: &str,
+    port: u16,
+    auth: (String, String),
+    log_path: Option<PathBuf>,
+) -> std::io::Result<()> {
     if auth.0.is_empty() || auth.1.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -153,12 +181,25 @@ pub async fn run(repo_path: PathBuf, bind: &str, port: u16, auth: (String, Strin
 
     println!("Serving repo {} on https://{bind}:{port}", repo_path.display());
 
+    let log_file = if let Some(path) = log_path {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("Cannot open log file {}: {e}", path.display())))?;
+        println!("Log file: {}", path.display());
+        std::sync::Mutex::new(Some(BufWriter::new(file)))
+    } else {
+        std::sync::Mutex::new(None)
+    };
+
     let state = Arc::new(AppState {
         index: std::sync::RwLock::new(index),
         auth,
         repo_path,
         auth_failures: std::sync::Mutex::new(HashMap::new()),
         global_auth_failures: std::sync::Mutex::new((0, Instant::now())),
+        log_file,
     });
     let app = build_router(state);
 
@@ -178,27 +219,39 @@ pub async fn run(repo_path: PathBuf, bind: &str, port: u16, auth: (String, Strin
         .map_err(std::io::Error::other)
 }
 
-async fn get_index(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn get_index(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Json<serde_json::Value> {
     let value = {
         let Ok(index) = state.index.read() else {
+            state.log_entry(addr.ip(), "GET", "/index", 500, Some("index lock failed"));
             return Json(serde_json::Value::Object(serde_json::Map::default()));
         };
         serde_json::to_value(index.index_summary()).unwrap_or_default()
     };
     let size = serde_json::to_string(&value).map_or(0, |s| s.len());
-    println!("GET /index ({size} bytes)");
+    state.log_entry(addr.ip(), "GET", "/index", 200, Some(&format!("{size} bytes")));
     Json(value)
 }
 
-async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> impl IntoResponse {
+async fn get_versions(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let path = format!("/packages/{name}");
     if !is_safe_segment(&name) {
+        state.log_entry(addr.ip(), "GET", &path, 400, Some("unsafe segment"));
         return Err(StatusCode::BAD_REQUEST);
     }
     let value = {
         let Ok(index) = state.index.read() else {
+            state.log_entry(addr.ip(), "GET", &path, 500, Some("index lock failed"));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
         let Some(pkg) = index.packages.get(&name) else {
+            state.log_entry(addr.ip(), "GET", &path, 404, None);
             return Err(StatusCode::NOT_FOUND);
         };
         serde_json::json!({
@@ -207,6 +260,7 @@ async fn get_versions(State(state): State<Arc<AppState>>, Path(name): Path<Strin
             "versions": pkg.versions,
         })
     };
+    state.log_entry(addr.ip(), "GET", &path, 200, None);
     Ok(Json(value))
 }
 
@@ -235,41 +289,49 @@ async fn add_security_headers(mut resp: Response) -> Response {
 
 async fn get_file(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((name, version, filename)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    let url_path = format!("/packages/{name}/{version}/{filename}");
     if !is_safe_segment(&name) || !is_safe_segment(&version) || !is_safe_segment(&filename) {
+        state.log_entry(addr.ip(), "GET", &url_path, 400, Some("unsafe segment"));
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Check index (lock scope limited to avoid holding across await)
     {
         let Ok(index) = state.index.read() else {
+            state.log_entry(addr.ip(), "GET", &url_path, 500, Some("index lock failed"));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
         let Some(pkg) = index.packages.get(&name) else {
+            state.log_entry(addr.ip(), "GET", &url_path, 404, Some("package not found"));
             return Err(StatusCode::NOT_FOUND);
         };
         if !pkg.versions.contains(&version) {
+            state.log_entry(addr.ip(), "GET", &url_path, 404, Some("version not found"));
             return Err(StatusCode::NOT_FOUND);
         }
     }
 
-    let path = state.repo_path.join("packages").join(&name).join(&version).join(&filename);
+    let fs_path = state.repo_path.join("packages").join(&name).join(&version).join(&filename);
 
-    // Verify resolved path is inside the repo
-    let Ok(canonical) = tokio::fs::canonicalize(&path).await else {
+    let Ok(canonical) = tokio::fs::canonicalize(&fs_path).await else {
+        state.log_entry(addr.ip(), "GET", &url_path, 404, Some("file not found"));
         return Err(StatusCode::NOT_FOUND);
     };
     let Ok(repo_base) = tokio::fs::canonicalize(state.repo_path.join("packages").join(&name).join(&version)).await
     else {
+        state.log_entry(addr.ip(), "GET", &url_path, 404, Some("version dir not found"));
         return Err(StatusCode::NOT_FOUND);
     };
     if !canonical.starts_with(&repo_base) {
+        state.log_entry(addr.ip(), "GET", &url_path, 400, Some("path traversal attempt"));
         return Err(StatusCode::BAD_REQUEST);
     }
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
-            println!("GET /packages/{name}/{version}/{filename} ({} bytes)", bytes.len());
+            state.log_entry(addr.ip(), "GET", &url_path, 200, Some(&format!("{} bytes", bytes.len())));
             let content_type = if std::path::Path::new(&filename)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
@@ -286,7 +348,10 @@ async fn get_file(
                 bytes,
             ))
         }
-        Err(_) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            state.log_entry(addr.ip(), "GET", &url_path, 404, Some(&format!("read error: {e}")));
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -315,36 +380,47 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
 
 async fn post_upload(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((name, version, filename)): Path<(String, String, String)>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let url_path = format!("/upload/{name}/{version}/{filename}");
+    let ip = addr.ip();
+
     if !is_safe_segment(&name) || !is_safe_segment(&version) || !is_safe_segment(&filename) {
+        state.log_entry(ip, "POST", &url_path, 400, Some("unsafe segment in path"));
         return Err(StatusCode::BAD_REQUEST);
     }
-    // Only allow manifest.json and files.zip
     if filename != "manifest.json" && filename != "files.zip" {
+        state.log_entry(ip, "POST", &url_path, 400, Some("filename must be manifest.json or files.zip"));
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate manifest content before writing to disk
     if filename == "manifest.json" {
-        let manifest: Manifest = serde_json::from_slice(&body).map_err(|e| {
-            eprintln!("Invalid manifest JSON for {name}/{version}: {e}");
-            StatusCode::BAD_REQUEST
-        })?;
+        let manifest: Manifest = match serde_json::from_slice(&body) {
+            Ok(m) => m,
+            Err(e) => {
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid manifest JSON: {e}")));
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
         if manifest.name != name {
-            eprintln!("Manifest name mismatch: URL={name}, manifest={}", manifest.name);
+            state.log_entry(
+                ip, "POST", &url_path, 400,
+                Some(&format!("manifest name mismatch: URL={name}, manifest={}", manifest.name)),
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
         for (file, dest_dir) in &manifest.files {
             if crate::client::validate_manifest_path(file, dest_dir, &name).is_err() {
-                eprintln!("Unsafe path in manifest for {name}/{version}: {file} -> {dest_dir}");
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("unsafe path: {file} -> {dest_dir}")));
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
         for dep in &manifest.dependencies {
             if crate::client::validate_pkg_spec("dependency", dep).is_err() {
-                eprintln!("Invalid dependency name in manifest for {name}/{version}: {dep}");
+                state.log_entry(ip, "POST", &url_path, 400, Some(&format!("invalid dependency name: {dep}")));
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
@@ -352,30 +428,31 @@ async fn post_upload(
 
     let dir = state.repo_path.join("packages").join(&name).join(&version);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        eprintln!("Failed to create dir {}: {e}", dir.display());
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create dir failed: {e}")));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Defense in depth: verify resolved path stays inside repo
     let Ok(canonical_dir) = tokio::fs::canonicalize(&dir).await else {
+        state.log_entry(ip, "POST", &url_path, 500, Some("canonicalize dir failed"));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let Ok(canonical_packages) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
+        state.log_entry(ip, "POST", &url_path, 500, Some("canonicalize packages failed"));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     if !canonical_dir.starts_with(&canonical_packages) {
+        state.log_entry(ip, "POST", &url_path, 400, Some("path traversal attempt"));
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let path = canonical_dir.join(&filename);
+    let final_path = canonical_dir.join(&filename);
     let tmp_path = canonical_dir.join(format!(".{filename}.tmp"));
     if let Err(e) = tokio::fs::write(&tmp_path, &body).await {
-        eprintln!("Failed to write {}: {e}", tmp_path.display());
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write temp file failed: {e}")));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Cross-validate: when both manifest.json and files.zip exist, check zip contains all manifest files
-    // Use the temp file for the just-uploaded one, the final path for the other
+    // Cross-validate zip against manifest when both are present
     let (manifest_check, zip_check) = if filename == "manifest.json" {
         (tmp_path.clone(), canonical_dir.join("files.zip"))
     } else {
@@ -385,19 +462,18 @@ async fn post_upload(
         && zip_check.is_file()
         && let Err(e) = validate_zip_against_manifest(&manifest_check, &zip_check)
     {
-        eprintln!("Zip/manifest mismatch for {name}/{version}: {e}");
+        state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Atomic move: temp file → final path (validated)
-    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
-        eprintln!("Failed to rename {} -> {}: {e}", tmp_path.display(), path.display());
+    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename temp file failed: {e}")));
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    println!("POST /upload/{name}/{version}/{filename} ({} bytes)", body.len());
+    state.log_entry(ip, "POST", &url_path, 201, Some(&format!("{} bytes", body.len())));
 
     // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"
@@ -440,7 +516,7 @@ mod tests {
         let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().unwrap();
-        assert_eq!(json["testpkg"], "1.0");
+        assert_eq!(json["testpkg"]["latest"], "1.0");
     }
 
     #[test]

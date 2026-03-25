@@ -73,6 +73,10 @@ enum Commands {
         /// Show all available versions (sorted, latest last)
         #[arg(long = "available", short = 'a')]
         versions: bool,
+
+        /// Also search in package descriptions
+        #[arg(long, short)]
+        description: bool,
     },
     /// Configure blob settings interactively (server URL, base dir, credentials)
     Config,
@@ -106,6 +110,10 @@ enum Commands {
         /// Password for Basic Auth
         #[arg(long, env = "BLOB_PASSWORD")]
         password: String,
+
+        /// Path to log file (appended to; if omitted, only stdout)
+        #[arg(long)]
+        log: Option<PathBuf>,
     },
     /// Upload a package to the server
     ///
@@ -160,13 +168,13 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Serve { repo, bind, port, username, password } => {
+        Commands::Serve { repo, bind, port, username, password, log } => {
             if std::env::var("BLOB_PASSWORD").is_err() {
                 eprintln!("Warning: password passed via command line — visible in process listings.");
                 eprintln!("         Prefer setting BLOB_PASSWORD environment variable instead.");
             }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone())))?;
+            rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone()), log.clone()))?;
         }
         Commands::Install { name, force } => {
             let config = client::Config::load()?;
@@ -175,10 +183,10 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let (pkg_name, version) = parse_package_spec(name);
             install::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
         }
-        Commands::Search { pattern, versions } => {
+        Commands::Search { pattern, versions, description } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
-            upload::search(pattern, *versions, &http)?;
+            upload::search(pattern, *versions, *description, &http)?;
         }
         Commands::Remove { name, force, transitive, keep } => {
             let mut db = client::Database::load()?;
