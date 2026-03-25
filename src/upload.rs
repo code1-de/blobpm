@@ -17,7 +17,13 @@ fn glob_base_dir(pattern: &str) -> PathBuf {
     PathBuf::from(&pattern[..last_sep])
 }
 
-pub fn search(pattern: &str, show_versions: bool, search_desc: bool, http: &HttpClient) -> io::Result<()> {
+pub fn search(
+    pattern: &str,
+    show_versions: bool,
+    search_desc: bool,
+    show_long: bool,
+    http: &HttpClient,
+) -> io::Result<()> {
     if pattern.len() > 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Regex pattern too long (max 1024 bytes)"));
     }
@@ -50,6 +56,17 @@ pub fn search(pattern: &str, show_versions: bool, search_desc: bool, http: &Http
             println!("{name:<w0$}  {version}");
         } else {
             println!("{name:<w0$}  {version:<w1$}  {desc}");
+        }
+        if show_long
+            && let Ok(manifest) =
+                crate::install::fetch_manifest(http, name, version.split(',').next().unwrap_or(version).trim())
+        {
+            if !manifest.dependencies.is_empty() {
+                println!("  deps: {}", manifest.dependencies.join(", "));
+            }
+            if manifest.files.is_empty() {
+                println!("  (meta-package)");
+            }
         }
     }
 
@@ -189,12 +206,22 @@ pub fn upload(
         }
     }
 
-    let (files, sources) = resolve_mappings(from, mappings, lowercase)?;
+    let (files, sources) = if mappings.is_empty() {
+        (BTreeMap::new(), BTreeMap::new())
+    } else {
+        resolve_mappings(from, mappings, lowercase)?
+    };
 
-    println!("Package: {name}@{version}");
-    println!("Files: {}", files.len());
-    for (file, dest) in &files {
-        println!("  {file} -> {dest}");
+    let is_meta = files.is_empty();
+    println!("Package: {name}@{version}{}", if is_meta { " (meta-package)" } else { "" });
+    if !files.is_empty() {
+        println!("Files: {}", files.len());
+        for (file, dest) in &files {
+            println!("  {file} -> {dest}");
+        }
+    }
+    if !deps.is_empty() {
+        println!("Dependencies: {}", deps.join(", "));
     }
 
     let manifest =
@@ -202,14 +229,15 @@ pub fn upload(
 
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
-    let zip_data = create_package_zip(&sources)?;
 
-    // Upload zip first, then manifest (server updates index on manifest upload,
-    // so if zip upload fails, the package won't appear in the index)
-    let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
-    let resp = http.post_with_progress(&url, zip_data, &format!("Uploading {name}@{version}"))?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
+    // Upload zip first (if any), then manifest (server updates index on manifest upload)
+    if !is_meta {
+        let zip_data = create_package_zip(&sources)?;
+        let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
+        let resp = http.post_with_progress(&url, zip_data, &format!("Uploading {name}@{version}"))?;
+        if !resp.status().is_success() {
+            return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
+        }
     }
 
     let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);

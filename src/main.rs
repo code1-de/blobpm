@@ -89,6 +89,10 @@ enum Commands {
         /// Also search in package descriptions
         #[arg(long, short)]
         description: bool,
+
+        /// Show dependencies for each matching package
+        #[arg(long, short = 'l')]
+        long: bool,
     },
     /// Configure blob settings interactively (server URL, base dir, credentials)
     Config,
@@ -135,7 +139,12 @@ enum Commands {
     /// Maps files to destination dirs using glob:dest patterns.
     /// Multiple files can share a dest with semicolons: "a.exe;b.dll:bin"
     /// Absolute globs use filename only, relative globs preserve path from --from.
-    /// Examples: "*.exe:bin" "a.exe;b.chm:bin" "git/**:bin" --from src "lib/**:lib"
+    /// Meta-packages (no files, only deps): omit mappings, use --dep only.
+    ///
+    /// Examples:
+    ///   blob upload tool@1.0 "*.exe:bin"
+    ///   blob upload tool@1.0 "a.exe;b.chm:bin" "git/**:bin"
+    ///   blob upload devtools@1.0 --dep fd --dep ripgrep -d "Dev bundle"
     Upload {
         /// Package name@version (e.g. helper@3.0)
         package: String,
@@ -218,7 +227,10 @@ fn main() {
         server::MAX_GLOBAL_AUTH_FAILURES,
         server::AUTH_LOCKOUT_SECS,
     );
-    let upload_limits = format!("Limits:\n  Max upload size: {} MB", server::MAX_UPLOAD_SIZE / 1024 / 1024,);
+    let upload_limits = format!(
+        "Limits:\n  Max upload size: {} MB\n\nExit codes:\n  0  Success\n  1  Error\n  2  Version already exists (use --force to overwrite)",
+        server::MAX_UPLOAD_SIZE / 1024 / 1024,
+    );
     let cmd = Cli::command()
         .mut_subcommand("install", |c| c.after_help(install_limits))
         .mut_subcommand("serve", |c| c.after_help(serve_limits))
@@ -227,7 +239,13 @@ fn main() {
 
     if let Err(e) = run_command(&cli.command, cli.yes) {
         eprintln!("Error: {e}");
-        std::process::exit(1);
+        let code =
+            if e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) {
+                2
+            } else {
+                1
+            };
+        std::process::exit(code);
     }
 }
 
@@ -251,10 +269,10 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                 install::install(&pkg_name, version.as_deref(), *force, *no_cache, &http, &mut db)?;
             }
         }
-        Commands::Search { pattern, versions, description } => {
+        Commands::Search { pattern, versions, description, long } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
-            upload::search(pattern, *versions, *description, &http)?;
+            upload::search(pattern, *versions, *description, *long, &http)?;
         }
         Commands::Remove { names, force, transitive, keep } => {
             let mut db = client::Database::load()?;
@@ -380,8 +398,8 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                     *lowercase,
                     &http,
                 )?;
-            } else if mappings.is_empty() {
-                return Err("No file mappings provided. Use glob:dest patterns or -i for interactive mode.".into());
+            } else if mappings.is_empty() && deps.is_empty() {
+                return Err("No file mappings or dependencies provided. Use glob:dest patterns, --dep, or -i for interactive mode.".into());
             } else {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
             }

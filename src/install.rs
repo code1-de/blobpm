@@ -384,11 +384,18 @@ fn download_and_install(
     http: &HttpClient,
     db: &mut Database,
 ) -> io::Result<()> {
-    // Phase 1: download all zips
-    println!("Downloading {} package(s)...", packages.len());
-    let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
+    // Phase 1: download all zips (skip meta-packages with no files)
+    let pkgs_with_files: Vec<_> = packages.iter().filter(|(_, _, m)| !m.files.is_empty()).collect();
+    if !pkgs_with_files.is_empty() {
+        println!("Downloading {} package(s)...", pkgs_with_files.len());
+    }
+    let mut downloads: Vec<(&str, &str, &Manifest, Option<PathBuf>)> = Vec::new();
     for (pkg_name, version, manifest) in packages {
-        let zip_path = download_zip(http, pkg_name, version, manifest, no_cache)?;
+        let zip_path = if manifest.files.is_empty() {
+            None
+        } else {
+            Some(download_zip(http, pkg_name, version, manifest, no_cache)?)
+        };
         downloads.push((pkg_name, version, manifest, zip_path));
     }
 
@@ -396,8 +403,13 @@ fn download_and_install(
     for (pkg_name, version, manifest, zip_path) in &downloads {
         let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
-        println!("Installing {pkg_name} {version}...");
-        let installed_files = extract_zip(zip_path, manifest, &http.config, pkg_name)?;
+        let installed_files = if let Some(zip_path) = zip_path {
+            println!("Installing {pkg_name} {version}...");
+            extract_zip(zip_path, manifest, &http.config, pkg_name)?
+        } else {
+            println!("Installing {pkg_name} {version} (meta-package)...");
+            BTreeMap::new()
+        };
 
         db.packages.insert(
             pkg_name.to_string(),
