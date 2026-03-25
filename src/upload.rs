@@ -117,11 +117,13 @@ fn resolve_mappings(
             let matched = glob::glob(&glob_pattern)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
 
+            let mut match_count = 0u32;
             for entry in matched {
                 let path = entry.map_err(|e| io::Error::other(format!("Glob error: {e}")))?;
                 if !path.is_file() {
                     continue;
                 }
+                match_count += 1;
                 let base =
                     strip_base.as_deref().or(from_cache.as_deref()).ok_or_else(|| io::Error::other("No base path"))?;
                 let mut name = crate::platform::to_manifest_path(
@@ -137,6 +139,9 @@ fn resolve_mappings(
                     files.insert(name.clone(), crate::platform::to_manifest_path(dest));
                     sources.insert(name, path);
                 }
+            }
+            if match_count == 0 {
+                eprintln!("Warning: no files matched pattern '{pattern}'");
             }
         }
     }
