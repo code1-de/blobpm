@@ -121,13 +121,14 @@ enum Commands {
     /// Upload a package to the server
     ///
     /// Maps files to destination dirs using glob:dest patterns.
+    /// Multiple files can share a dest with semicolons: "a.exe;b.dll:bin"
     /// Absolute globs use filename only, relative globs preserve path from --from.
-    /// Examples: "*.exe:bin" "C:\tools\7z*.exe:util" --from src "lib/**:lib"
+    /// Examples: "*.exe:bin" "a.exe;b.chm:bin" "git/**:bin" --from src "lib/**:lib"
     Upload {
         /// Package name@version (e.g. helper@3.0)
         package: String,
 
-        /// File mappings: "glob:dest" (first match wins). Use absolute paths or relative to --from
+        /// File mappings: "glob:dest" or "a;b;c:dest" (first match wins). Relative to --from
         mappings: Vec<String>,
 
         /// Base directory for relative glob patterns

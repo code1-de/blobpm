@@ -71,54 +71,57 @@ fn resolve_mappings(
     let mut from_cache: Option<PathBuf> = None;
 
     for mapping in mappings {
-        let (pattern, dest) = mapping.rsplit_once(':').ok_or_else(|| {
+        let (patterns_str, dest) = mapping.rsplit_once(':').ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid mapping (missing ':'): {mapping}"))
         })?;
 
-        let is_absolute = Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
+        // Support "a.exe;b.dll:bin" — semicolon-separated files sharing the same dest
+        for pattern in patterns_str.split(';') {
+            let is_absolute =
+                Path::new(pattern).is_absolute() || (pattern.len() >= 2 && pattern.as_bytes()[1] == b':');
 
-        let (full_pattern, strip_base) = if is_absolute {
-            // Find the non-glob base: everything before the first wildcard character
-            let glob_base = glob_base_dir(pattern);
-            (pattern.to_string(), Some(glob_base))
-        } else {
-            let base = if let Some(p) = &from_cache {
-                p.clone()
+            let (full_pattern, strip_base) = if is_absolute {
+                let glob_base = glob_base_dir(pattern);
+                (pattern.to_string(), Some(glob_base))
             } else {
-                let p = dunce::canonicalize(from)?;
-                from_cache = Some(p.clone());
-                p
+                let base = if let Some(p) = &from_cache {
+                    p.clone()
+                } else {
+                    let p = dunce::canonicalize(from)?;
+                    from_cache = Some(p.clone());
+                    p
+                };
+                (base.join(pattern).to_string_lossy().to_string(), None)
             };
-            (base.join(pattern).to_string_lossy().to_string(), None)
-        };
 
-        // glob crate treats \ as escape on all platforms — normalize to / for reliable matching.
-        // Also: "dir/**" only matches directories in the glob crate; append "/*" for files.
-        let mut glob_pattern = full_pattern.replace('\\', "/");
-        if glob_pattern.ends_with("/**") || glob_pattern.ends_with("**") && !glob_pattern.ends_with("**/*") {
-            glob_pattern.push_str("/*");
-        }
-        let matched = glob::glob(&glob_pattern)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
-
-        for entry in matched {
-            let path = entry.map_err(|e| io::Error::other(format!("Glob error: {e}")))?;
-            if !path.is_file() {
-                continue;
+            // glob crate treats \ as escape on all platforms — normalize to / for reliable matching.
+            // Also: "dir/**" only matches directories in the glob crate; append "/*" for files.
+            let mut glob_pattern = full_pattern.replace('\\', "/");
+            if glob_pattern.ends_with("/**") || glob_pattern.ends_with("**") && !glob_pattern.ends_with("**/*") {
+                glob_pattern.push_str("/*");
             }
-            let base = strip_base
-                .as_deref()
-                .or(from_cache.as_deref())
-                .ok_or_else(|| io::Error::other("No base path"))?;
-            let name = crate::platform::to_manifest_path(
-                &path
-                    .strip_prefix(base)
-                    .map_err(|e| io::Error::other(format!("Path error: {e}")))?
-                    .to_string_lossy(),
-            );
-            if !files.contains_key(&name) {
-                files.insert(name.clone(), crate::platform::to_manifest_path(dest));
-                sources.insert(name, path);
+            let matched = glob::glob(&glob_pattern)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid glob '{pattern}': {e}")))?;
+
+            for entry in matched {
+                let path = entry.map_err(|e| io::Error::other(format!("Glob error: {e}")))?;
+                if !path.is_file() {
+                    continue;
+                }
+                let base = strip_base
+                    .as_deref()
+                    .or(from_cache.as_deref())
+                    .ok_or_else(|| io::Error::other("No base path"))?;
+                let name = crate::platform::to_manifest_path(
+                    &path
+                        .strip_prefix(base)
+                        .map_err(|e| io::Error::other(format!("Path error: {e}")))?
+                        .to_string_lossy(),
+                );
+                if !files.contains_key(&name) {
+                    files.insert(name.clone(), crate::platform::to_manifest_path(dest));
+                    sources.insert(name, path);
+                }
             }
         }
     }
@@ -324,6 +327,34 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
         install("newtool", None, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("tool.exe").exists());
+    }
+
+    #[test]
+    fn upload_semicolon_grouped_mappings() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        fs::write(src_tmp.path().join("a.exe"), b"aaa").unwrap();
+        fs::write(src_tmp.path().join("b.dll"), b"bbb").unwrap();
+        fs::write(src_tmp.path().join("c.txt"), b"ccc").unwrap();
+
+        // "a.exe;b.dll:bin" means both go to bin/, "c.txt:doc" separately
+        upload(
+            "grouped", "1.0", src_tmp.path(),
+            &["a.exe;b.dll:bin".to_string(), "c.txt:doc".to_string()],
+            &[], "", false, &http,
+        ).unwrap();
+
+        let manifest = crate::install::fetch_manifest(&http, "grouped", "1.0").unwrap();
+        assert_eq!(manifest.files["a.exe"], "bin");
+        assert_eq!(manifest.files["b.dll"], "bin");
+        assert_eq!(manifest.files["c.txt"], "doc");
     }
 
     #[test]
