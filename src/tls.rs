@@ -165,7 +165,7 @@ impl ServerCertVerifier for TofuVerifier {
             return Err(rustls::Error::General("Certificate not trusted by user".to_string()));
         }
 
-        if fingerprint == self.saved_fingerprint {
+        if constant_time_eq::constant_time_eq(fingerprint.as_bytes(), self.saved_fingerprint.as_bytes()) {
             Ok(ServerCertVerified::assertion())
         } else {
             eprintln!("WARNING: Server certificate has changed!");
@@ -236,6 +236,7 @@ pub fn build_client(config: &super::client::Config) -> io::Result<reqwest::block
 
     reqwest::blocking::Client::builder()
         .use_preconfigured_tls(tls_config)
+        .redirect(reqwest::redirect::Policy::none())
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(600))
         .build()

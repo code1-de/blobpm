@@ -35,8 +35,8 @@ pub(crate) fn validate_pkg_spec(label: &str, value: &str) -> io::Result<()> {
 
 /// Windows reserved device names that must not be used as filenames.
 pub(crate) const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
-    "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate that a file path and destination directory from a manifest are safe.
@@ -225,7 +225,11 @@ impl Database {
             fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(path, content)
+        fs::write(path, content)?;
+        if let Err(e) = crate::platform::restrict_to_owner_if_inherited(path) {
+            eprintln!("Warning: could not restrict permissions on {}: {e}", path.display());
+        }
+        Ok(())
     }
 }
 
@@ -293,7 +297,7 @@ impl HttpClient {
             indicatif::ProgressStyle::with_template(
                 "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
             )
-            .unwrap()
+            .expect("hardcoded progress template")
             .progress_chars("=>-"),
         );
         pb.set_message(label.to_string());
@@ -316,7 +320,7 @@ impl HttpClient {
             indicatif::ProgressStyle::with_template(
                 "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
             )
-            .unwrap()
+            .expect("hardcoded progress template")
             .progress_chars("=>-"),
         );
         pb.set_message(label.to_string());
@@ -374,6 +378,12 @@ mod tests {
         assert!(result.is_err());
 
         let result = validate_manifest_path("COM1", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("COM0", "util", "badpkg");
+        assert!(result.is_err());
+
+        let result = validate_manifest_path("LPT0", "util", "badpkg");
         assert!(result.is_err());
     }
 

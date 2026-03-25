@@ -176,6 +176,13 @@ fn extract_zip(
             .by_name(file)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("File {file} not in zip for {name}: {e}")))?;
 
+        if entry.is_dir() || entry.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unexpected entry type for {file} in {name} (expected regular file)"),
+            ));
+        }
+
         if entry.size() > MAX_EXTRACT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -713,6 +720,61 @@ mod tests {
         assert!(result.is_err());
         assert!(db.packages.is_empty());
         assert!(!install_tmp.path().join("util").join("x.exe").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_directory_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a zip where "tool.exe/" is a directory entry, not a file.
+        // zip crate's add_directory appends '/', so the manifest must match.
+        let zip_path = tmp.path().join("files.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_directory("tool.exe", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.finish().unwrap();
+
+        let manifest = crate::repo::Manifest {
+            name: "bad".to_string(),
+            description: "bad".to_string(),
+            files: BTreeMap::from([("tool.exe/".to_string(), "util/".to_string())]),
+            dependencies: vec![],
+        };
+
+        let base = tmp.path().join("install");
+        fs::create_dir_all(&base).unwrap();
+
+        let result = extract_zip(&zip_path, &manifest, &base, "bad");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unexpected entry type"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_zip_rejects_symlink_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a zip where "tool.exe" is a symlink entry
+        let zip_path = tmp.path().join("files.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_symlink("tool.exe", "../../../etc/passwd", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.finish().unwrap();
+
+        let manifest = crate::repo::Manifest {
+            name: "bad".to_string(),
+            description: "bad".to_string(),
+            files: BTreeMap::from([("tool.exe".to_string(), "util/".to_string())]),
+            dependencies: vec![],
+        };
+
+        let base = tmp.path().join("install");
+        fs::create_dir_all(&base).unwrap();
+
+        let result = extract_zip(&zip_path, &manifest, &base, "bad");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unexpected entry type"), "got: {err}");
     }
 
     #[test]

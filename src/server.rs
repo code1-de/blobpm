@@ -47,6 +47,14 @@ impl AppState {
     }
 }
 
+/// Sanitize an IO error for logging: return the OS error description without filesystem paths.
+fn sanitize_io_error(err: &std::io::Error) -> String {
+    match err.raw_os_error() {
+        Some(code) => format!("{} (os error {code})", err.kind()),
+        None => err.kind().to_string(),
+    }
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/index", get(get_index))
@@ -351,7 +359,7 @@ async fn get_file(
             ))
         }
         Err(e) => {
-            state.log_entry(addr.ip(), "GET", &url_path, 404, Some(&format!("read error: {e}")));
+            state.log_entry(addr.ip(), "GET", &url_path, 404, Some(&format!("read error: {}", sanitize_io_error(&e))));
             Err(StatusCode::NOT_FOUND)
         }
     }
@@ -402,7 +410,7 @@ async fn post_upload(
 
     let dir = state.repo_path.join("packages").join(&name).join(&version);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create dir failed: {e}")));
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create dir failed: {}", sanitize_io_error(&e))));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -426,7 +434,7 @@ async fn post_upload(
     let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
         Ok(f) => f,
         Err(e) => {
-            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create temp file: {e}")));
+            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create temp file: {}", sanitize_io_error(&e))));
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -445,14 +453,14 @@ async fn post_upload(
             }
         };
         if let Err(e) = tmp_file.write_all(&chunk).await {
-            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write error: {e}")));
+            state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write error: {}", sanitize_io_error(&e))));
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
         bytes_written += chunk.len() as u64;
     }
     if let Err(e) = tmp_file.flush().await {
-        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("flush error: {e}")));
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("flush error: {}", sanitize_io_error(&e))));
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -463,7 +471,7 @@ async fn post_upload(
         let data = match tokio::fs::read(&tmp_path).await {
             Ok(d) => d,
             Err(e) => {
-                state.log_entry(ip, "POST", &url_path, 500, Some(&format!("read manifest: {e}")));
+                state.log_entry(ip, "POST", &url_path, 500, Some(&format!("read manifest: {}", sanitize_io_error(&e))));
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
@@ -514,7 +522,7 @@ async fn post_upload(
     }
 
     if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
-        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename failed: {e}")));
+        state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename failed: {}", sanitize_io_error(&e))));
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -560,7 +568,7 @@ async fn delete_version(
     }
 
     if let Err(e) = tokio::fs::remove_dir_all(&canonical_dir).await {
-        state.log_entry(ip, "DELETE", &url_path, 500, Some(&format!("delete failed: {e}")));
+        state.log_entry(ip, "DELETE", &url_path, 500, Some(&format!("delete failed: {}", sanitize_io_error(&e))));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -585,6 +593,7 @@ async fn delete_version(
 
 #[cfg(test)]
 mod tests {
+    use super::sanitize_io_error;
     use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server, tls_client_no_auth};
     use std::fs;
 
@@ -893,5 +902,24 @@ mod tests {
         // Windows reserved name
         let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/CON/1.0"));
         assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn sanitize_io_error_strips_os_error_paths() {
+        // OS errors include paths — sanitize should return kind + error code only
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let sanitized = sanitize_io_error(&err);
+        assert!(!sanitized.contains("C:\\"), "should not contain paths: {sanitized}");
+        assert!(sanitized.contains("not found"), "should contain error kind: {sanitized}");
+    }
+
+    #[test]
+    fn sanitize_io_error_with_raw_os_error() {
+        let err = std::io::Error::from_raw_os_error(2); // ENOENT / ERROR_FILE_NOT_FOUND
+        let sanitized = sanitize_io_error(&err);
+        assert!(sanitized.contains("os error 2"), "should contain os error code: {sanitized}");
+        // Must not contain any filesystem path from the error message
+        assert!(!sanitized.contains('\\'), "should not contain backslash paths: {sanitized}");
+        assert!(!sanitized.contains('/'), "should not contain forward slash paths: {sanitized}");
     }
 }
