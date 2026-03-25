@@ -25,19 +25,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Install a package (use name@version for a specific version)
+    /// Install packages (use name@version for a specific version)
     Install {
-        /// Package name, or name@version for a specific version
-        name: String,
+        /// Package names, or name@version for specific versions
+        names: Vec<String>,
 
         /// Reinstall even if already installed (e.g. to change version)
         #[arg(long, short)]
         force: bool,
     },
-    /// Remove a package (auto-removes orphaned auto-installed dependencies)
+    /// Remove packages (auto-removes orphaned auto-installed dependencies)
     Remove {
-        /// Package name
-        name: String,
+        /// Package names
+        names: Vec<String>,
 
         /// Remove even if other packages depend on it (leaves them broken)
         #[arg(long)]
@@ -53,17 +53,17 @@ enum Commands {
     },
     /// Update installed packages to latest versions
     Update {
-        /// Package name (optional, updates all if omitted)
-        name: Option<String>,
+        /// Package names (updates all if omitted)
+        names: Vec<String>,
 
         /// Show what would be updated without actually doing it
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-    /// List installed packages (with package name: show details)
+    /// List installed packages (with package names: show details)
     List {
-        /// Package name (optional, show deps, files, install reason)
-        name: Option<String>,
+        /// Package names (optional, show deps, files, install reason)
+        names: Vec<String>,
 
         /// Show details for all packages (deps, files)
         #[arg(long, short = 'l')]
@@ -84,10 +84,10 @@ enum Commands {
     },
     /// Configure blob settings interactively (server URL, base dir, credentials)
     Config,
-    /// Mark a package as manually installed (prevents auto-removal as orphan)
+    /// Mark packages as manually installed (prevents auto-removal as orphan)
     Manual {
-        /// Package name
-        name: String,
+        /// Package names
+        names: Vec<String>,
     },
     /// Remove all orphaned auto-installed packages (auto deps no longer needed)
     Purge,
@@ -233,37 +233,47 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone()), log.clone()))?;
         }
-        Commands::Install { name, force } => {
+        Commands::Install { names, force } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
-            let (pkg_name, version) = parse_package_spec(name);
-            install::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
+            for name in names {
+                let (pkg_name, version) = parse_package_spec(name);
+                install::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
+            }
         }
         Commands::Search { pattern, versions, description } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             upload::search(pattern, *versions, *description, &http)?;
         }
-        Commands::Remove { name, force, transitive, keep } => {
+        Commands::Remove { names, force, transitive, keep } => {
             let mut db = client::Database::load()?;
-            remove::remove(name, *force, *transitive, *keep, &mut db)?;
+            for name in names {
+                remove::remove(name, *force, *transitive, *keep, &mut db)?;
+            }
         }
-        Commands::Manual { name } => {
+        Commands::Manual { names } => {
             let mut db = client::Database::load()?;
-            match db.packages.get_mut(name.as_str()) {
-                Some(pkg) => {
-                    if pkg.reason == client::InstallReason::Manual {
-                        println!("{name} is already marked as manual");
-                    } else {
-                        pkg.reason = client::InstallReason::Manual;
-                        db.save()?;
-                        println!("{name} marked as manually installed");
+            let mut changed = false;
+            for name in names {
+                match db.packages.get_mut(name.as_str()) {
+                    Some(pkg) => {
+                        if pkg.reason == client::InstallReason::Manual {
+                            println!("{name} is already marked as manual");
+                        } else {
+                            pkg.reason = client::InstallReason::Manual;
+                            changed = true;
+                            println!("{name} marked as manually installed");
+                        }
+                    }
+                    None => {
+                        eprintln!("{name} is not installed");
                     }
                 }
-                None => {
-                    return Err(format!("{name} is not installed").into());
-                }
+            }
+            if changed {
+                db.save()?;
             }
         }
         Commands::Purge => {
@@ -276,35 +286,44 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             println!("Cleaning cache (max age: {max_days} day(s))...");
             install::clean_cache(&config.cache_dir()?, max_days);
         }
-        Commands::Update { name, dry_run } => {
+        Commands::Update { names, dry_run } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
-            install::update(name.as_deref(), *dry_run, &http, &mut db)?;
+            if names.is_empty() {
+                install::update(None, *dry_run, &http, &mut db)?;
+            } else {
+                for name in names {
+                    install::update(Some(name.as_str()), *dry_run, &http, &mut db)?;
+                }
+            }
         }
-        Commands::List { name, long } => {
+        Commands::List { names, long } => {
             let db = client::Database::load()?;
             if db.packages.is_empty() {
                 println!("No packages installed.");
             } else {
-                let packages: Vec<_> = match name {
-                    Some(n) => {
-                        if !db.packages.contains_key(n.as_str()) {
-                            println!("{n} is not installed");
-                            return Ok(());
+                let packages: Vec<_> = if names.is_empty() {
+                    db.packages.keys().map(String::as_str).collect()
+                } else {
+                    let mut list = Vec::new();
+                    for n in names {
+                        if db.packages.contains_key(n.as_str()) {
+                            list.push(n.as_str());
+                        } else {
+                            eprintln!("{n} is not installed");
                         }
-                        vec![n.as_str()]
                     }
-                    None => db.packages.keys().map(String::as_str).collect(),
+                    list
                 };
-                let show_details = *long || name.is_some();
-                for n in &packages {
-                    let pkg = &db.packages[*n];
-                    let reason = match pkg.reason {
-                        client::InstallReason::Manual => "manual",
-                        client::InstallReason::Auto => "auto",
-                    };
-                    if show_details {
+                let show_details = *long || !names.is_empty();
+                if show_details {
+                    for n in &packages {
+                        let pkg = &db.packages[*n];
+                        let reason = match pkg.reason {
+                            client::InstallReason::Manual => "manual",
+                            client::InstallReason::Auto => "auto",
+                        };
                         println!("{n} {} [{reason}]", pkg.version);
                         if !pkg.dependencies.is_empty() {
                             println!("  Dependencies: {}", pkg.dependencies.join(", "));
@@ -312,9 +331,21 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                         for (file, path) in &pkg.files {
                             println!("  {file} -> {}", path.display());
                         }
-                    } else {
-                        let suffix = if pkg.reason == client::InstallReason::Auto { " (auto)" } else { "" };
-                        println!("{n} {}{suffix}", pkg.version);
+                    }
+                } else {
+                    let rows: Vec<_> = packages.iter().map(|n| {
+                        let pkg = &db.packages[*n];
+                        let reason = if pkg.reason == client::InstallReason::Auto { "auto" } else { "" };
+                        (*n, pkg.version.as_str(), reason)
+                    }).collect();
+                    let w0 = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+                    let w1 = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
+                    for (n, version, reason) in &rows {
+                        if reason.is_empty() {
+                            println!("{n:<w0$}  {version}");
+                        } else {
+                            println!("{n:<w0$}  {version:<w1$}  ({reason})");
+                        }
                     }
                 }
             }
