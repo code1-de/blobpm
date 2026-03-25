@@ -141,12 +141,20 @@ fn create_package_zip(sources: &BTreeMap<String, PathBuf>) -> io::Result<Vec<u8>
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
         let options = zip::write::SimpleFileOptions::default();
+        let pb = indicatif::ProgressBar::new(sources.len() as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template("Zipping [{bar:40}] {pos}/{len} files")
+                .expect("hardcoded progress template")
+                .progress_chars("=>-"),
+        );
         for (zip_name, src_path) in sources {
             let content = fs::read(src_path)?;
             zip.start_file(zip_name, options).map_err(|e| io::Error::other(format!("Zip error: {e}")))?;
             io::Write::write_all(&mut zip, &content)?;
+            pb.inc(1);
         }
         zip.finish().map_err(|e| io::Error::other(format!("Zip error: {e}")))?;
+        pb.finish_and_clear();
     }
     Ok(buf.into_inner())
 }
