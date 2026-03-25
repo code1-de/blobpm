@@ -161,6 +161,10 @@ enum Commands {
         #[arg(long, short)]
         all: bool,
 
+        /// Show installed files that are missing from disk (marked with !)
+        #[arg(long, short)]
+        missing: bool,
+
         /// Don't recurse into subdirectories
         #[arg(long, short = 'N')]
         no_recurse: bool,
@@ -301,7 +305,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             }
         }
-        Commands::Status { paths, all, no_recurse, depth } => {
+        Commands::Status { paths, all, missing, no_recurse, depth } => {
             let db = client::Database::load()?;
             let dirs: Vec<PathBuf> = if paths.is_empty() {
                 vec![std::env::current_dir()?]
@@ -313,7 +317,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 if dirs.len() > 1 {
                     println!("{}:", dir.display());
                 }
-                run_status(dir, &db, *all, max_depth)?;
+                run_status(dir, &db, *all, *missing, max_depth)?;
                 if dirs.len() > 1 {
                     println!();
                 }
@@ -353,7 +357,7 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     }
 }
 
-fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, max_depth: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, show_missing: bool, max_depth: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
 
     let dir = dunce::canonicalize(dir).map_err(|e| format!("Cannot access {}: {e}", dir.display()))?;
@@ -372,13 +376,15 @@ fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, max_
     collect_files(&dir, &mut entries, 0, max_depth)?;
     entries.sort();
 
-    if entries.is_empty() {
+    if entries.is_empty() && !show_missing {
         println!("No files in {}", dir.display());
         return Ok(());
     }
 
     let mut managed = 0u32;
     let mut unmanaged = 0u32;
+    let mut missing_count = 0u32;
+    let entries_set: std::collections::HashSet<&PathBuf> = entries.iter().collect();
     for path in &entries {
         let display = path.strip_prefix(&dir).unwrap_or(path);
         if let Some(label) = owned.get(path) {
@@ -391,7 +397,23 @@ fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, max_
             }
         }
     }
-    println!("\n{managed} managed, {unmanaged} unmanaged, {} total", managed + unmanaged);
+
+    // Show files that should be under this dir but are missing from disk
+    if show_missing {
+        for (path, label) in &owned {
+            if path.starts_with(&dir) && !entries_set.contains(path) {
+                let display = path.strip_prefix(&dir).unwrap_or(path);
+                println!("! {:<50} [{label}]", display.display());
+                missing_count += 1;
+            }
+        }
+    }
+
+    if show_missing && missing_count > 0 {
+        println!("\n{managed} managed, {unmanaged} unmanaged, {missing_count} missing, {} on disk", managed + unmanaged);
+    } else {
+        println!("\n{managed} managed, {unmanaged} unmanaged, {} on disk", managed + unmanaged);
+    }
     Ok(())
 }
 
