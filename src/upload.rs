@@ -65,6 +65,7 @@ pub fn search(pattern: &str, show_versions: bool, search_desc: bool, http: &Http
 fn resolve_mappings(
     from: &Path,
     mappings: &[String],
+    lowercase: bool,
 ) -> io::Result<(BTreeMap<String, String>, BTreeMap<String, PathBuf>)> {
     let mut files = BTreeMap::new();
     let mut sources = BTreeMap::new();
@@ -112,12 +113,15 @@ fn resolve_mappings(
                     .as_deref()
                     .or(from_cache.as_deref())
                     .ok_or_else(|| io::Error::other("No base path"))?;
-                let name = crate::platform::to_manifest_path(
+                let mut name = crate::platform::to_manifest_path(
                     &path
                         .strip_prefix(base)
                         .map_err(|e| io::Error::other(format!("Path error: {e}")))?
                         .to_string_lossy(),
                 );
+                if lowercase {
+                    name = name.to_lowercase();
+                }
                 if !files.contains_key(&name) {
                     files.insert(name.clone(), crate::platform::to_manifest_path(dest));
                     sources.insert(name, path);
@@ -172,6 +176,7 @@ pub fn upload(
     deps: &[String],
     description: &str,
     force: bool,
+    lowercase: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
     validate_pkg_spec("package name", name)?;
@@ -190,7 +195,7 @@ pub fn upload(
         }
     }
 
-    let (files, sources) = resolve_mappings(from, mappings)?;
+    let (files, sources) = resolve_mappings(from, mappings, lowercase)?;
 
     println!("Package: {name}@{version}");
     println!("Files: {}", files.len());
@@ -253,6 +258,7 @@ pub fn upload_interactive(
     existing_deps: &[String],
     existing_desc: &str,
     force: bool,
+    lowercase: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
     println!("Upload {name}@{version} from {}", from.display());
@@ -288,7 +294,7 @@ pub fn upload_interactive(
     let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
     let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
 
-    upload(name, version, from, &mappings, &deps, &description, force, http)
+    upload(name, version, from, &mappings, &deps, &description, force, lowercase, http)
 }
 
 #[cfg(test)]
@@ -326,7 +332,7 @@ mod tests {
 
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
-        upload("newtool", "1.0", src_tmp.path(), &["*.exe:util/".to_string()], &[], "A new tool", false, &http)
+        upload("newtool", "1.0", src_tmp.path(), &["*.exe:util/".to_string()], &[], "A new tool", false, false, &http)
             .unwrap();
 
         let index = fetch_index(&http).unwrap();
@@ -356,13 +362,62 @@ mod tests {
         upload(
             "grouped", "1.0", src_tmp.path(),
             &["a.exe;b.dll:bin".to_string(), "c.txt:doc".to_string()],
-            &[], "", false, &http,
+            &[], "", false, false, &http,
         ).unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "grouped", "1.0").unwrap();
         assert_eq!(manifest.files["a.exe"], "bin");
         assert_eq!(manifest.files["b.dll"], "bin");
         assert_eq!(manifest.files["c.txt"], "doc");
+    }
+
+    #[test]
+    fn upload_lowercase_literal_filename() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        fs::write(src_tmp.path().join("MyTool.EXE"), b"binary").unwrap();
+
+        // Literal filename with --lowercase
+        upload(
+            "lc-literal", "1.0", src_tmp.path(),
+            &["MyTool.EXE:bin".to_string()],
+            &[], "", false, true, &http,
+        ).unwrap();
+
+        let manifest = crate::install::fetch_manifest(&http, "lc-literal", "1.0").unwrap();
+        assert!(manifest.files.contains_key("mytool.exe"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
+        assert!(!manifest.files.contains_key("MyTool.EXE"));
+    }
+
+    #[test]
+    fn upload_lowercase_glob_pattern() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config).unwrap();
+
+        fs::write(src_tmp.path().join("Helper.DLL"), b"lib").unwrap();
+        fs::write(src_tmp.path().join("MAIN.EXE"), b"exe").unwrap();
+
+        // Glob pattern with --lowercase
+        upload(
+            "lc-glob", "1.0", src_tmp.path(),
+            &["*.DLL:lib".to_string(), "*.EXE:bin".to_string()],
+            &[], "", false, true, &http,
+        ).unwrap();
+
+        let manifest = crate::install::fetch_manifest(&http, "lc-glob", "1.0").unwrap();
+        assert!(manifest.files.contains_key("helper.dll"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
+        assert!(manifest.files.contains_key("main.exe"), "expected lowercase: {:?}", manifest.files.keys().collect::<Vec<_>>());
     }
 
     #[test]
@@ -385,6 +440,7 @@ mod tests {
             &["*.exe:sub\\dir\\".to_string()],
             &[],
             "",
+            false,
             false,
             &http,
         )
@@ -416,6 +472,7 @@ mod tests {
             &["*.dll:lib/native/".to_string()],
             &[],
             "",
+            false,
             false,
             &http,
         )

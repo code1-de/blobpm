@@ -158,6 +158,10 @@ enum Commands {
         /// Overwrite if version already exists on server
         #[arg(long, short)]
         force: bool,
+
+        /// Lowercase all filenames in the manifest and zip
+        #[arg(long, short = 'L')]
+        lowercase: bool,
     },
     /// Show which files in a directory are managed by blob
     #[command(alias = "st")]
@@ -354,16 +358,16 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Upload { package, mappings, from, deps, description, interactive, force } => {
+        Commands::Upload { package, mappings, from, deps, description, interactive, force, lowercase } => {
             let (pkg_name, version) = parse_package_spec(package);
             let version = version.ok_or("Version required: use name@version")?;
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
 
             if *interactive || mappings.is_empty() {
-                upload::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
+                upload::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
             } else {
-                upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
+                upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
             }
         }
         Commands::Status { paths, all, missing, no_recurse, depth } => {
