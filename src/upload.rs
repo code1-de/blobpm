@@ -296,6 +296,7 @@ mod tests {
             password: TEST_PASS.to_string(),
             server_fingerprint: fingerprint.to_string(),
             cache_days: 0,
+            cache_dir: Some(base_dir.join(".cache")),
         }
     }
 

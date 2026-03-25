@@ -58,12 +58,12 @@ pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Resul
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails or the file cannot be written.
-pub(crate) fn cache_zip_path_in(name: &str, version: &str, base_dir: &Path) -> PathBuf {
-    base_dir.join(".cache").join(name).join(version).join("files.zip")
+fn cache_zip_path_in(name: &str, version: &str, cache_base: &Path) -> PathBuf {
+    cache_base.join(name).join(version).join("files.zip")
 }
 
 fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<PathBuf> {
-    let zip_path = cache_zip_path_in(name, version, &http.config.base_dir);
+    let zip_path = cache_zip_path_in(name, version, &http.config.cache_dir()?);
     // TODO: Security: sign zips on server, verify signature on client before extraction
     if zip_path.is_file() {
         return Ok(zip_path);
@@ -72,18 +72,12 @@ fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<Path
         fs::create_dir_all(parent)?;
     }
     let url = format!("{}/packages/{name}/{version}/files.zip", http.config.server_url);
-    let resp = http.get(&url)?;
-    if !resp.status().is_success() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found on server")));
-    }
-    let bytes = resp.bytes().map_err(io::Error::other)?;
-    fs::write(&zip_path, &bytes)?;
+    http.download_to_file(&url, &zip_path, &format!("Downloading {name} {version}"))?;
     Ok(zip_path)
 }
 
 /// Delete cached files older than `max_age_days` (0 = delete all). Silently skips errors.
-pub fn clean_cache(base_dir: &Path, max_age_days: u32) {
-    let cache_dir = base_dir.join(".cache");
+pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
     if !cache_dir.is_dir() {
         return;
     }
@@ -283,7 +277,9 @@ fn resolve_recursive(
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    clean_cache(&http.config.base_dir, http.config.cache_days);
+    if let Ok(cache_dir) = http.config.cache_dir() {
+        clean_cache(&cache_dir, http.config.cache_days);
+    }
     validate_pkg_spec("package name", name)?;
     if let Some(v) = version {
         validate_pkg_spec("version", v)?;
@@ -342,7 +338,6 @@ fn download_and_install(
     let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
     for (pkg_name, version, manifest) in packages {
         let zip_path = download_zip(http, pkg_name, version)?;
-        println!("  Downloaded {pkg_name} {version}");
         downloads.push((pkg_name, version, manifest, zip_path));
     }
 
@@ -373,7 +368,9 @@ fn download_and_install(
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
 pub fn update(name: Option<&str>, http: &HttpClient, db: &mut Database) -> io::Result<()> {
-    clean_cache(&http.config.base_dir, http.config.cache_days);
+    if let Ok(cache_dir) = http.config.cache_dir() {
+        clean_cache(&cache_dir, http.config.cache_days);
+    }
     let index = fetch_index(http)?;
 
     let packages: Vec<(String, String)> = if let Some(n) = name {
@@ -481,6 +478,7 @@ mod tests {
             password: TEST_PASS.to_string(),
             server_fingerprint: fingerprint.to_string(),
             cache_days: 0,
+            cache_dir: Some(base_dir.join(".cache")),
         }
     }
 
@@ -661,7 +659,7 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolA", None, false, &http, &mut db).unwrap();
-        let cache_path = cache_zip_path_in("toolA", "1.0", install_tmp.path());
+        let cache_path = install_tmp.path().join(".cache").join("toolA").join("1.0").join("files.zip");
         assert!(cache_path.is_file());
 
         remove("toolA", false, false, false, &mut db).unwrap();
@@ -684,8 +682,9 @@ mod tests {
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, &http, &mut db).unwrap();
-        assert!(cache_zip_path_in("toolA", "1.0", install_tmp.path()).is_file());
-        assert!(cache_zip_path_in("toolB", "2.0", install_tmp.path()).is_file());
+        let cache = install_tmp.path().join(".cache");
+        assert!(cache.join("toolA").join("1.0").join("files.zip").is_file());
+        assert!(cache.join("toolB").join("2.0").join("files.zip").is_file());
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
     }

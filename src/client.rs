@@ -88,6 +88,19 @@ pub struct Config {
     /// Number of days to keep cached downloads (0 = no cache, default: 1)
     #[serde(default = "default_cache_days")]
     pub cache_days: u32,
+    /// Cache directory override (not serialized; defaults to ~/.blob/cache)
+    #[serde(skip)]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl Config {
+    pub(crate) fn cache_dir(&self) -> io::Result<PathBuf> {
+        if let Some(dir) = &self.cache_dir {
+            Ok(dir.clone())
+        } else {
+            default_cache_dir()
+        }
+    }
 }
 
 fn default_cache_days() -> u32 {
@@ -120,6 +133,10 @@ pub(crate) fn blob_dir() -> io::Result<PathBuf> {
     dirs::home_dir()
         .map(|p| p.join(".blob"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not determine home directory"))
+}
+
+pub(crate) fn default_cache_dir() -> io::Result<PathBuf> {
+    blob_dir().map(|p| p.join("cache"))
 }
 
 pub fn config_path() -> io::Result<PathBuf> {
@@ -260,6 +277,33 @@ impl HttpClient {
         self.send(self.client.delete(url))
     }
 
+    pub(crate) fn download_to_file(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+        label: &str,
+    ) -> io::Result<()> {
+        let mut resp = self.get(url)?;
+        if !resp.status().is_success() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("GET {url}: {}", resp.status())));
+        }
+        let total = resp.content_length().unwrap_or(0);
+        let pb = indicatif::ProgressBar::new(total);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{msg} [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.set_message(label.to_string());
+        let file = std::fs::File::create(dest)?;
+        let mut writer = io::BufWriter::new(file);
+        io::copy(&mut pb.wrap_read(&mut resp), &mut writer)?;
+        pb.finish_and_clear();
+        Ok(())
+    }
+
     pub(crate) fn post_with_progress(
         &self,
         url: &str,
@@ -357,6 +401,7 @@ mod tests {
             password: String::new(),
             server_fingerprint: String::new(),
             cache_days: 1,
+            cache_dir: None,
         };
 
         fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();

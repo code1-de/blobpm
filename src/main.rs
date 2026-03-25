@@ -88,8 +88,11 @@ enum Commands {
     /// Remove all orphaned auto-installed packages (auto deps no longer needed)
     Purge,
     /// Clean the download cache (delete cached zip files)
-    CleanCache,
-    /// Run the package server (HTTPS with auto-generated TLS cert)
+    CleanCache {
+        /// Max age in days (0 = delete all, default: cache_days from config)
+        days: Option<u32>,
+    },
+    /// Run the package server
     Serve {
         /// Path to the repository directory
         #[arg(long)]
@@ -146,6 +149,24 @@ enum Commands {
         /// Overwrite if version already exists on server
         #[arg(long, short)]
         force: bool,
+    },
+    /// Show which files in a directory are managed by blob
+    #[command(alias = "st")]
+    Status {
+        /// Directories to scan (default: current directory)
+        paths: Vec<PathBuf>,
+
+        /// Show all files including unmanaged ones (marked with ?)
+        #[arg(long, short)]
+        all: bool,
+
+        /// Don't recurse into subdirectories
+        #[arg(long, short = 'N')]
+        no_recurse: bool,
+
+        /// Maximum directory depth (0 = only files in the given directory)
+        #[arg(long)]
+        depth: Option<usize>,
     },
     /// Delete a package version from the server
     Delete {
@@ -218,10 +239,11 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let mut db = client::Database::load()?;
             remove::purge(&mut db)?;
         }
-        Commands::CleanCache => {
+        Commands::CleanCache { days } => {
             let config = client::Config::load()?;
-            println!("Cleaning cache (max age: {} day(s))...", config.cache_days);
-            install::clean_cache(&config.base_dir, config.cache_days);
+            let max_days = days.unwrap_or(config.cache_days);
+            println!("Cleaning cache (max age: {max_days} day(s))...");
+            install::clean_cache(&config.cache_dir()?, max_days);
         }
         Commands::Update { name } => {
             let config = client::Config::load()?;
@@ -278,6 +300,24 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             }
         }
+        Commands::Status { paths, all, no_recurse, depth } => {
+            let db = client::Database::load()?;
+            let dirs: Vec<PathBuf> = if paths.is_empty() {
+                vec![std::env::current_dir()?]
+            } else {
+                paths.clone()
+            };
+            let max_depth = if *no_recurse { Some(0) } else { *depth };
+            for dir in &dirs {
+                if dirs.len() > 1 {
+                    println!("{}:", dir.display());
+                }
+                run_status(dir, &db, *all, max_depth)?;
+                if dirs.len() > 1 {
+                    println!();
+                }
+            }
+        }
         Commands::Delete { package } => {
             let (pkg_name, version) = parse_package_spec(package);
             let version = version.ok_or("Version required: use name@version")?;
@@ -312,6 +352,63 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     }
 }
 
+fn run_status(dir: &std::path::Path, db: &client::Database, show_all: bool, max_depth: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+
+    let dir = dunce::canonicalize(dir).map_err(|e| format!("Cannot access {}: {e}", dir.display()))?;
+
+    // Build reverse map: canonical file path -> "pkg version"
+    let mut owned: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (pkg_name, pkg) in &db.packages {
+        let label = format!("{pkg_name} {}", pkg.version);
+        for dest_path in pkg.files.values() {
+            owned.insert(dest_path.clone(), label.clone());
+        }
+    }
+
+    // Walk directory
+    let mut entries: Vec<PathBuf> = Vec::new();
+    collect_files(&dir, &mut entries, 0, max_depth)?;
+    entries.sort();
+
+    if entries.is_empty() {
+        println!("No files in {}", dir.display());
+        return Ok(());
+    }
+
+    let mut managed = 0u32;
+    let mut unmanaged = 0u32;
+    for path in &entries {
+        let display = path.strip_prefix(&dir).unwrap_or(path);
+        if let Some(label) = owned.get(path) {
+            println!("  {:<50} [{label}]", display.display());
+            managed += 1;
+        } else {
+            unmanaged += 1;
+            if show_all {
+                println!("? {}", display.display());
+            }
+        }
+    }
+    println!("\n{managed} managed, {unmanaged} unmanaged, {} total", managed + unmanaged);
+    Ok(())
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, current_depth: usize, max_depth: Option<usize>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if max_depth.is_none_or(|max| current_depth < max) {
+                collect_files(&path, out, current_depth + 1, max_depth)?;
+            }
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
         server_url: "https://localhost:53777".to_string(),
@@ -320,6 +417,7 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
         password: String::new(),
         server_fingerprint: String::new(),
         cache_days: 1,
+        cache_dir: None,
     });
 
     println!("blob configuration");
@@ -342,6 +440,7 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
         password,
         server_fingerprint: config.server_fingerprint.clone(),
         cache_days,
+        cache_dir: None,
     };
 
     new_config.save()?;
