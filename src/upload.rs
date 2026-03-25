@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(index["newtool"].latest, "1.0");
 
         let mut db = Database::load_from(&db_path).unwrap();
-        install("newtool", None, false, &http, &mut db).unwrap();
+        install("newtool", None, false, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("tool.exe").exists());
     }
 

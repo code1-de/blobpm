@@ -33,6 +33,10 @@ enum Commands {
         /// Reinstall even if already installed (e.g. to change version)
         #[arg(long, short)]
         force: bool,
+
+        /// Ignore cached zip files, always download from server
+        #[arg(long, short = 'C')]
+        no_cache: bool,
     },
     /// Remove packages (auto-removes orphaned auto-installed dependencies)
     Remove {
@@ -233,13 +237,13 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone()), log.clone()))?;
         }
-        Commands::Install { names, force } => {
+        Commands::Install { names, force, no_cache } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config)?;
             let mut db = client::Database::load()?;
             for name in names {
                 let (pkg_name, version) = parse_package_spec(name);
-                install::install(&pkg_name, version.as_deref(), *force, &http, &mut db)?;
+                install::install(&pkg_name, version.as_deref(), *force, *no_cache, &http, &mut db)?;
             }
         }
         Commands::Search { pattern, versions, description } => {

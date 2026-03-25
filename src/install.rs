@@ -62,10 +62,10 @@ fn cache_zip_path_in(name: &str, version: &str, cache_base: &Path) -> PathBuf {
     cache_base.join(name).join(version).join("files.zip")
 }
 
-fn download_zip(http: &HttpClient, name: &str, version: &str) -> io::Result<PathBuf> {
+fn download_zip(http: &HttpClient, name: &str, version: &str, no_cache: bool) -> io::Result<PathBuf> {
     let zip_path = cache_zip_path_in(name, version, &http.config.cache_dir()?);
     // TODO: Security: sign zips on server, verify signature on client before extraction
-    if zip_path.is_file() {
+    if !no_cache && zip_path.is_file() {
         return Ok(zip_path);
     }
     if let Some(parent) = zip_path.parent() {
@@ -299,7 +299,7 @@ fn resolve_recursive(
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+pub fn install(name: &str, version: Option<&str>, force: bool, no_cache: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
     if let Ok(cache_dir) = http.config.cache_dir() {
         clean_cache(&cache_dir, http.config.cache_days);
     }
@@ -340,7 +340,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
         return Ok(());
     }
 
-    download_and_install(&to_install, name, http, db)?;
+    download_and_install(&to_install, name, no_cache, http, db)?;
 
     // Clean up orphaned auto-deps (e.g. after --force changed the dep tree)
     purge_orphans(db)?;
@@ -353,6 +353,7 @@ pub fn install(name: &str, version: Option<&str>, force: bool, http: &HttpClient
 fn download_and_install(
     packages: &[(String, String, Manifest)],
     manual_name: &str,
+    no_cache: bool,
     http: &HttpClient,
     db: &mut Database,
 ) -> io::Result<()> {
@@ -360,7 +361,7 @@ fn download_and_install(
     println!("Downloading {} package(s)...", packages.len());
     let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
     for (pkg_name, version, manifest) in packages {
-        let zip_path = download_zip(http, pkg_name, version)?;
+        let zip_path = download_zip(http, pkg_name, version, no_cache)?;
         downloads.push((pkg_name, version, manifest, zip_path));
     }
 
@@ -462,7 +463,7 @@ pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Dat
         // Use a sentinel — download_and_install marks main as Manual,
         // but for updates we preserve the original reason
         let original_reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
-        download_and_install(&to_install, pkg_name, http, db)?;
+        download_and_install(&to_install, pkg_name, false, http, db)?;
         if let Some(pkg) = db.packages.get_mut(pkg_name) {
             pkg.reason = original_reason;
         }
@@ -555,7 +556,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert_eq!(db.packages["toolA"].version, "1.0");
@@ -573,7 +574,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
@@ -596,10 +597,10 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
     }
 
@@ -637,8 +638,8 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &http, &mut db).unwrap();
-        install("depD", None, false, &http, &mut db).unwrap();
+        install("depC", None, false, false, &http, &mut db).unwrap();
+        install("depD", None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 4);
         assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
         assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
@@ -656,7 +657,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolE", Some("1.0"), false, &http, &mut db).unwrap();
+        install("toolE", Some("1.0"), false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 1);
 
         update(None, false, &http, &mut db).unwrap();
@@ -706,14 +707,14 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
         let cache_path = install_tmp.path().join(".cache").join("toolA").join("1.0").join("files.zip");
         assert!(cache_path.is_file());
 
         remove("toolA", false, false, false, &mut db).unwrap();
         assert!(cache_path.is_file());
 
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
     }
 
@@ -729,7 +730,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
         let cache = install_tmp.path().join(".cache");
         assert!(cache.join("toolA").join("1.0").join("files.zip").is_file());
         assert!(cache.join("toolB").join("2.0").join("files.zip").is_file());
@@ -757,7 +758,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        let result = install("missing_dep", None, false, &http, &mut db);
+        let result = install("missing_dep", None, false, false, &http, &mut db);
         assert!(result.is_err());
         assert!(db.packages.is_empty());
         assert!(!install_tmp.path().join("util").join("x.exe").exists());

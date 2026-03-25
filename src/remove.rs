@@ -175,7 +175,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
 
         remove("toolA", false, false, false, &mut db).unwrap();
@@ -195,7 +195,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
 
         let result = remove("toolA", false, false, false, &mut db);
         assert!(result.is_err());
@@ -214,7 +214,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
 
         remove("toolA", true, false, false, &mut db).unwrap();
         assert!(!db.packages.contains_key("toolA"));
@@ -233,7 +233,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
         remove("toolB", false, false, false, &mut db).unwrap();
@@ -255,8 +255,8 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
-        install("toolA", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
 
         remove("toolB", false, false, false, &mut db).unwrap();
@@ -276,7 +276,7 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, &http, &mut db).unwrap();
 
         remove("toolA", false, true, false, &mut db).unwrap();
         assert!(!db.packages.contains_key("toolA"));
@@ -305,8 +305,8 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &http, &mut db).unwrap();
-        install("depD", None, false, &http, &mut db).unwrap();
+        install("depC", None, false, false, &http, &mut db).unwrap();
+        install("depD", None, false, false, &http, &mut db).unwrap();
 
         remove("depC", false, false, false, &mut db).unwrap();
         assert!(!db.packages.contains_key("depC"));
@@ -326,8 +326,8 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &http, &mut db).unwrap();
-        install("depD", None, false, &http, &mut db).unwrap();
+        install("depC", None, false, false, &http, &mut db).unwrap();
+        install("depD", None, false, false, &http, &mut db).unwrap();
 
         remove("depC", false, false, false, &mut db).unwrap();
         remove("depD", false, false, false, &mut db).unwrap();
@@ -346,8 +346,8 @@ mod tests {
         let http = HttpClient::new(&config).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, &http, &mut db).unwrap();
-        install("depD", None, false, &http, &mut db).unwrap();
+        install("depC", None, false, false, &http, &mut db).unwrap();
+        install("depD", None, false, false, &http, &mut db).unwrap();
 
         remove("depA", false, true, false, &mut db).unwrap();
         assert!(db.packages.is_empty());
