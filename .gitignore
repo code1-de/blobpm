@@ -4,3 +4,5 @@
 /.sem/
 /.claude/
 /repo
+/shim/target/
+/shim/Cargo.lock
