@@ -57,6 +57,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/upload/{name}/{version}/{filename}",
             axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        .route("/packages/{name}/{version}", axum::routing::delete(delete_version))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::map_response(add_security_headers))
         .layer(tower::limit::ConcurrencyLimitLayer::new(5))
@@ -531,6 +532,57 @@ async fn post_upload(
     Ok(StatusCode::CREATED)
 }
 
+async fn delete_version(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((name, version)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let url_path = format!("/packages/{name}/{version}");
+    let ip = addr.ip();
+
+    if !is_safe_segment(&name) || !is_safe_segment(&version) {
+        state.log_entry(ip, "DELETE", &url_path, 400, Some("unsafe segment in path"));
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let dir = state.repo_path.join("packages").join(&name).join(&version);
+    let Ok(canonical_dir) = tokio::fs::canonicalize(&dir).await else {
+        state.log_entry(ip, "DELETE", &url_path, 404, Some("version not found"));
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Ok(canonical_packages) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
+        state.log_entry(ip, "DELETE", &url_path, 500, Some("canonicalize packages failed"));
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    if !canonical_dir.starts_with(&canonical_packages) {
+        state.log_entry(ip, "DELETE", &url_path, 400, Some("path traversal attempt"));
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if let Err(e) = tokio::fs::remove_dir_all(&canonical_dir).await {
+        state.log_entry(ip, "DELETE", &url_path, 500, Some(&format!("delete failed: {e}")));
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Remove parent package dir if now empty
+    let pkg_dir = state.repo_path.join("packages").join(&name);
+    if let Ok(mut entries) = tokio::fs::read_dir(&pkg_dir).await {
+        if entries.next_entry().await.ok().flatten().is_none() {
+            let _ = tokio::fs::remove_dir(&pkg_dir).await;
+        }
+    }
+
+    // Rescan index
+    if let Ok(new_index) = RepoIndex::scan(&state.repo_path)
+        && let Ok(mut index) = state.index.write()
+    {
+        *index = new_index;
+    }
+
+    state.log_entry(ip, "DELETE", &url_path, 200, Some("deleted"));
+    Ok(StatusCode::OK)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server, tls_client_no_auth};
@@ -549,6 +601,10 @@ mod tests {
 
     fn auth_get(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
         client.get(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
+    }
+
+    fn auth_delete(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
+        client.delete(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
     }
 
     #[test]
@@ -720,6 +776,122 @@ mod tests {
             .body("data")
             .send()
             .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn test_delete_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Verify package exists in index
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
+        let json: serde_json::Value = resp.json().unwrap();
+        assert!(json["testpkg"].is_object());
+
+        // Delete it
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/testpkg/1.0"));
+        assert_eq!(resp.status(), 200);
+
+        // Verify gone from index
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
+        let json: serde_json::Value = resp.json().unwrap();
+        assert!(!json["testpkg"].is_object());
+
+        // Verify files gone from disk
+        assert!(!tmp.path().join("packages/testpkg/1.0").exists());
+        // Parent dir should also be cleaned up
+        assert!(!tmp.path().join("packages/testpkg").exists());
+    }
+
+    #[test]
+    fn test_delete_one_of_two_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path()); // creates testpkg/1.0
+
+        // Add a second version
+        let pkg_dir = tmp.path().join("packages").join("testpkg").join("2.0");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("manifest.json"),
+            r#"{"name":"testpkg","description":"A test","files":{"test.exe":"util/"},"dependencies":[]}"#,
+        ).unwrap();
+        create_zip(&pkg_dir, &[("test.exe", b"v2-binary")]);
+
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Delete only 1.0
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/testpkg/1.0"));
+        assert_eq!(resp.status(), 200);
+
+        // 1.0 gone
+        assert!(!tmp.path().join("packages/testpkg/1.0").exists());
+        // 2.0 still exists
+        assert!(tmp.path().join("packages/testpkg/2.0").exists());
+        // Parent dir NOT cleaned up
+        assert!(tmp.path().join("packages/testpkg").exists());
+
+        // Index updated: testpkg still present with latest=2.0
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
+        let json: serde_json::Value = resp.json().unwrap();
+        assert_eq!(json["testpkg"]["latest"], "2.0");
+    }
+
+    #[test]
+    fn test_delete_nonexistent_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/testpkg/9.9"));
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn test_delete_path_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/..%2F..%2F/1.0"));
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn test_delete_without_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        let resp = client.delete(format!("https://localhost:{port}/packages/testpkg/1.0")).send().unwrap();
+        assert_eq!(resp.status(), 401);
+        // Verify package still exists
+        assert!(tmp.path().join("packages/testpkg/1.0").exists());
+    }
+
+    #[test]
+    fn test_delete_unsafe_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Hidden segment (starts with dot)
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/.secret/1.0"));
+        assert_eq!(resp.status(), 400);
+
+        // Hidden version
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/testpkg/.hidden"));
+        assert_eq!(resp.status(), 400);
+
+        // Windows reserved name
+        let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/CON/1.0"));
         assert_eq!(resp.status(), 400);
     }
 }

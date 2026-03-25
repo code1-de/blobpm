@@ -147,6 +147,11 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
+    /// Delete a package version from the server
+    Delete {
+        /// Package name@version (e.g. helper@3.0)
+        package: String,
+    },
     /// Generate or regenerate TLS certificate and key (~/.blob/cert.pem, key.pem)
     GenerateKeys {
         /// Overwrite existing keys without asking
@@ -271,6 +276,21 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 upload::upload_interactive(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
             } else {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, &http)?;
+            }
+        }
+        Commands::Delete { package } => {
+            let (pkg_name, version) = parse_package_spec(package);
+            let version = version.ok_or("Version required: use name@version")?;
+            client::validate_pkg_spec("package name", &pkg_name)?;
+            client::validate_pkg_spec("version", &version)?;
+            let config = client::Config::load()?;
+            let http = client::HttpClient::new(&config)?;
+            let url = format!("{}/packages/{pkg_name}/{version}", config.server_url);
+            let resp = http.delete(&url)?;
+            if resp.status().is_success() {
+                println!("Deleted {pkg_name}@{version}");
+            } else {
+                return Err(format!("Failed to delete {pkg_name}@{version}: {}", resp.status()).into());
             }
         }
         Commands::GenerateKeys { force } => {

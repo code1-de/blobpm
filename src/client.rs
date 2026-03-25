@@ -5,7 +5,7 @@ use std::{fs, io};
 /// Validate that a package name or version contains only safe characters.
 /// Allowed: printable ASCII 33–126, excluding `/\,:;*?'"` and whitespace.
 /// Must not be empty, start with `.`, or end with `.` or space.
-pub(crate) const FORBIDDEN_SPEC_CHARS: &[u8] = b"/\\,:;*?'`\"";
+pub(crate) const FORBIDDEN_SPEC_CHARS: &[u8] = b"/\\,:;*?'`\"@%$[]<>|";
 
 /// Check if a byte is a safe printable ASCII character (33–126, not in `FORBIDDEN_SPEC_CHARS`).
 pub(crate) fn is_safe_spec_char(b: u8) -> bool {
@@ -254,6 +254,10 @@ impl HttpClient {
 
     pub(crate) fn post(&self, url: &str, body: Vec<u8>) -> io::Result<reqwest::blocking::Response> {
         self.send(self.client.post(url).body(body))
+    }
+
+    pub(crate) fn delete(&self, url: &str) -> io::Result<reqwest::blocking::Response> {
+        self.send(self.client.delete(url))
     }
 
     pub(crate) fn post_with_progress(
