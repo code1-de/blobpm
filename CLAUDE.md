@@ -46,3 +46,4 @@ cargo run -- install <pkg>
 - **No big refactors without asking first.** Discuss architectural changes before implementing them.
 - **No automatic commits or pushes.** Only commit or push when the user explicitly asks.
 - **Before committing:** Review and update `PLAN.md` — check off completed items, add new items if needed.
+- **No `cd` or `git -C` when already in the working directory.** The working directory is already set correctly. Only use `git -C` when targeting a *different* repo.

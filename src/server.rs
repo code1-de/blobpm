@@ -215,7 +215,6 @@ pub async fn run(
     println!("Basic Auth: enabled");
 
     axum_server::bind_rustls(addr, tls_config)
-        .http1_only()
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(std::io::Error::other)
