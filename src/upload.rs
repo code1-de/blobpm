@@ -318,7 +318,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
@@ -342,7 +342,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("a.exe"), b"aaa").unwrap();
         fs::write(src_tmp.path().join("b.dll"), b"bbb").unwrap();
@@ -376,7 +376,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, src_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("MyTool.EXE"), b"binary").unwrap();
 
@@ -401,7 +401,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, src_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("Helper.DLL"), b"lib").unwrap();
         fs::write(src_tmp.path().join("MAIN.EXE"), b"exe").unwrap();
@@ -441,7 +441,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, src_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
@@ -464,7 +464,7 @@ mod tests {
         fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, src_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
 
         fs::write(src_tmp.path().join("lib.dll"), b"lib-binary").unwrap();
 

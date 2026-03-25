@@ -122,17 +122,17 @@ pub fn current_fingerprint() -> io::Result<String> {
 pub struct TofuVerifier {
     saved_fingerprint: String,
     config_path: PathBuf,
+    auto_accept: bool,
 }
 
 impl TofuVerifier {
     /// Create a new TOFU verifier with the saved fingerprint from config.
+    /// If `auto_accept` is true, new certificates are accepted without prompting.
     #[must_use]
-    pub fn new(saved_fingerprint: String, config_path: PathBuf) -> Self {
-        Self { saved_fingerprint, config_path }
+    pub fn new(saved_fingerprint: String, config_path: PathBuf, auto_accept: bool) -> Self {
+        Self { saved_fingerprint, config_path, auto_accept }
     }
 }
-
-// TODO: add --accept-fingerprint flag for non-interactive use (scripts, CI), otherwise TLS handshake will hang
 impl ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
@@ -145,13 +145,19 @@ impl ServerCertVerifier for TofuVerifier {
         let fingerprint = cert_fingerprint(end_entity.as_ref());
 
         if self.saved_fingerprint.is_empty() {
-            // First connection — prompt user
             eprintln!("New server certificate:");
             eprintln!("Fingerprint: {fingerprint}");
-            eprint!("Trust this certificate? [y/N] ");
 
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
+            let accepted = if self.auto_accept {
+                eprintln!("Auto-accepted (--yes)");
+                true
+            } else {
+                eprint!("Trust this certificate? [y/N] ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
+            };
+
+            if accepted {
                 // Save fingerprint to config
                 if let Ok(content) = fs::read_to_string(&self.config_path)
                     && let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content)
@@ -225,12 +231,16 @@ impl ServerCertVerifier for TofuVerifier {
 ///
 /// # Errors
 /// Returns an error if the TLS config or client build fails.
-pub fn build_client(config: &super::client::Config) -> io::Result<reqwest::blocking::Client> {
+pub fn build_client(config: &super::client::Config, auto_accept: bool) -> io::Result<reqwest::blocking::Client> {
     let config_path = super::client::config_path().unwrap_or_default();
 
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuVerifier::new(config.server_fingerprint.clone(), config_path)))
+        .with_custom_certificate_verifier(Arc::new(TofuVerifier::new(
+            config.server_fingerprint.clone(),
+            config_path,
+            auto_accept,
+        )))
         .with_no_client_auth();
 
     reqwest::blocking::Client::builder()

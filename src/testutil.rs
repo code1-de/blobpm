@@ -81,6 +81,7 @@ pub mod helpers {
             .with_custom_certificate_verifier(Arc::new(crate::tls::TofuVerifier::new(
                 fingerprint.to_string(),
                 std::path::PathBuf::new(),
+                false,
             )))
             .with_no_client_auth();
 

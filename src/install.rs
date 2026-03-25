@@ -563,7 +563,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(tmp.path());
 
         let config = test_config(port, Path::new(""), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let index = fetch_index(&http).unwrap();
         assert_eq!(index["toolA"].latest, "1.0");
         assert_eq!(index["toolB"].latest, "2.0");
@@ -578,7 +578,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolA", None, false, false, &http, &mut db).unwrap();
@@ -596,7 +596,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -619,7 +619,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -660,7 +660,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("depC", None, false, false, &http, &mut db).unwrap();
@@ -679,7 +679,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolE", Some("1.0"), false, false, &http, &mut db).unwrap();
@@ -713,7 +713,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(tmp.path());
 
         let config = test_config(port, Path::new(""), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let index = fetch_index(&http).unwrap();
         let db = Database::load_from(Path::new("")).unwrap();
         let result = resolve_dependencies("cycleA", "1.0", &http, &index, &db);
@@ -729,7 +729,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolA", None, false, false, &http, &mut db).unwrap();
@@ -752,7 +752,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -780,7 +780,7 @@ mod tests {
 
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         let result = install("missing_dep", None, false, false, &http, &mut db);

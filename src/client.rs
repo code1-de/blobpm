@@ -262,14 +262,14 @@ impl HttpClient {
     ///
     /// # Errors
     /// Returns an error if the TLS config or client build fails.
-    pub fn new(config: &Config) -> io::Result<Self> {
+    pub fn new(config: &Config, auto_accept_cert: bool) -> io::Result<Self> {
         if !config.server_url.starts_with("https://") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Server URL must use https://. Plaintext HTTP would expose credentials on the wire.",
             ));
         }
-        let client = crate::tls::build_client(config)?;
+        let client = crate::tls::build_client(config, auto_accept_cert)?;
         Ok(Self { client, config: config.clone() })
     }
 

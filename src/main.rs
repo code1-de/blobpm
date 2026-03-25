@@ -19,6 +19,10 @@ mod upload;
     version,
 )]
 struct Cli {
+    /// Non-interactive mode: answer yes to prompts, never enter interactive input
+    #[arg(long, short, global = true)]
+    yes: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -221,14 +225,14 @@ fn main() {
         .mut_subcommand("upload", |c| c.after_help(upload_limits));
     let cli = Cli::from_arg_matches(&cmd.get_matches()).expect("cli parse");
 
-    if let Err(e) = run_command(&cli.command) {
+    if let Err(e) = run_command(&cli.command, cli.yes) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
+fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Serve { repo, bind, port, username, password, log } => {
             if std::env::var("BLOB_PASSWORD").is_err() {
@@ -240,7 +244,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Install { names, force, no_cache } => {
             let config = client::Config::load()?;
-            let http = client::HttpClient::new(&config)?;
+            let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
             for name in names {
                 let (pkg_name, version) = parse_package_spec(name);
@@ -249,7 +253,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Search { pattern, versions, description } => {
             let config = client::Config::load()?;
-            let http = client::HttpClient::new(&config)?;
+            let http = client::HttpClient::new(&config, yes)?;
             upload::search(pattern, *versions, *description, &http)?;
         }
         Commands::Remove { names, force, transitive, keep } => {
@@ -293,7 +297,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Update { names, dry_run } => {
             let config = client::Config::load()?;
-            let http = client::HttpClient::new(&config)?;
+            let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
             if names.is_empty() {
                 install::update(None, *dry_run, &http, &mut db)?;
@@ -362,9 +366,9 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             let (pkg_name, version) = parse_package_spec(package);
             let version = version.ok_or("Version required: use name@version")?;
             let config = client::Config::load()?;
-            let http = client::HttpClient::new(&config)?;
+            let http = client::HttpClient::new(&config, yes)?;
 
-            if *interactive || mappings.is_empty() {
+            if *interactive && !yes {
                 upload::upload_interactive(
                     &pkg_name,
                     &version,
@@ -376,6 +380,8 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                     *lowercase,
                     &http,
                 )?;
+            } else if mappings.is_empty() {
+                return Err("No file mappings provided. Use glob:dest patterns or -i for interactive mode.".into());
             } else {
                 upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
             }
@@ -400,7 +406,7 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             client::validate_pkg_spec("package name", &pkg_name)?;
             client::validate_pkg_spec("version", &version)?;
             let config = client::Config::load()?;
-            let http = client::HttpClient::new(&config)?;
+            let http = client::HttpClient::new(&config, yes)?;
             let url = format!("{}/packages/{pkg_name}/{version}", config.server_url);
             let resp = http.delete(&url)?;
             if resp.status().is_success() {
@@ -410,9 +416,12 @@ fn run_command(command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::GenerateKeys { force } => {
-            tls::generate_keys(*force)?;
+            tls::generate_keys(*force || yes)?;
         }
         Commands::Config => {
+            if yes {
+                return Err("config is interactive — cannot be used with --yes".into());
+            }
             run_config()?;
         }
     }

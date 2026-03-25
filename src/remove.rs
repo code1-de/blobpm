@@ -168,7 +168,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolA", None, false, false, &http, &mut db).unwrap();
@@ -188,7 +188,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -207,7 +207,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -226,7 +226,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -248,7 +248,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -269,7 +269,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("toolB", None, false, false, &http, &mut db).unwrap();
@@ -298,7 +298,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("depC", None, false, false, &http, &mut db).unwrap();
@@ -319,7 +319,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("depC", None, false, false, &http, &mut db).unwrap();
@@ -339,7 +339,7 @@ mod tests {
         let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
         let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config).unwrap();
+        let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
         install("depC", None, false, false, &http, &mut db).unwrap();
