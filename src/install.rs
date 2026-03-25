@@ -62,17 +62,41 @@ fn cache_zip_path_in(name: &str, version: &str, cache_base: &Path) -> PathBuf {
     cache_base.join(name).join(version).join("files.zip")
 }
 
-fn download_zip(http: &HttpClient, name: &str, version: &str, no_cache: bool) -> io::Result<PathBuf> {
-    let zip_path = cache_zip_path_in(name, version, &http.config.cache_dir()?);
-    // TODO: Security: sign zips on server, verify signature on client before extraction
+fn download_zip(
+    http: &HttpClient,
+    name: &str,
+    version: &str,
+    manifest: &Manifest,
+    no_cache: bool,
+) -> io::Result<PathBuf> {
+    let cache_dir = http.config.cache_dir()?;
+    let zip_path = cache_zip_path_in(name, version, &cache_dir);
+    let manifest_path = cache_dir.join(name).join(version).join("manifest.json");
+
     if !no_cache && zip_path.is_file() {
-        return Ok(zip_path);
+        // Verify cached manifest matches the freshly fetched one.
+        // If someone force-re-uploaded the same version, the manifest will differ.
+        let cache_valid = manifest_path.is_file()
+            && fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Manifest>(&s).ok())
+                .is_some_and(|cached| cached == *manifest);
+        if cache_valid {
+            return Ok(zip_path);
+        }
     }
+
     if let Some(parent) = zip_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let url = format!("{}/packages/{name}/{version}/files.zip", http.config.server_url);
     http.download_to_file(&url, &zip_path, &format!("Downloading {name} {version}"))?;
+
+    // Save manifest alongside zip for future cache validation
+    let manifest_json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&manifest_path, manifest_json)?;
+
     Ok(zip_path)
 }
 
@@ -361,7 +385,7 @@ fn download_and_install(
     println!("Downloading {} package(s)...", packages.len());
     let mut downloads: Vec<(&str, &str, &Manifest, PathBuf)> = Vec::new();
     for (pkg_name, version, manifest) in packages {
-        let zip_path = download_zip(http, pkg_name, version, no_cache)?;
+        let zip_path = download_zip(http, pkg_name, version, manifest, no_cache)?;
         downloads.push((pkg_name, version, manifest, zip_path));
     }
 
