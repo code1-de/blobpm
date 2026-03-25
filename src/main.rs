@@ -76,6 +76,10 @@ enum Commands {
         /// Show details for all packages (deps, files)
         #[arg(long, short = 'l')]
         long: bool,
+
+        /// Show only manually installed packages
+        #[arg(long, short)]
+        manual: bool,
     },
     /// Search for packages on the server (regex pattern, use ".*" for all)
     Search {
@@ -325,13 +329,17 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                 }
             }
         }
-        Commands::List { names, long } => {
+        Commands::List { names, long, manual } => {
             let db = client::Database::load()?;
             if db.packages.is_empty() {
                 println!("No packages installed.");
             } else {
                 let packages: Vec<_> = if names.is_empty() {
-                    db.packages.keys().map(String::as_str).collect()
+                    db.packages
+                        .iter()
+                        .filter(|(_, pkg)| !manual || pkg.reason == client::InstallReason::Manual)
+                        .map(|(n, _)| n.as_str())
+                        .collect()
                 } else {
                     let mut list = Vec::new();
                     for n in names {
