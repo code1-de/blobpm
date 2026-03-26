@@ -13,6 +13,7 @@ mod shim;
 mod testutil;
 mod tls;
 mod upload;
+mod util;
 
 #[derive(Parser)]
 #[command(
@@ -329,7 +330,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                 // Self-update mode: retry cleanup in a specific directory
                 let count = platform::cleanup_with_retry(dir);
                 if count > 0 {
-                    println!("Cleaned {count} leftover file(s).");
+                    println!("Cleaned {count} leftover file{}.", util::plural(count as usize));
                 }
             } else {
                 // Derive roots from config (base_dir + path_map values + own exe dir)
@@ -346,7 +347,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                 }
                 let count = platform::cleanup_blob_renames(&roots);
                 if count > 0 {
-                    println!("Cleaned {count} leftover file(s).");
+                    println!("Cleaned {count} leftover file{}.", util::plural(count as usize));
                 } else {
                     println!("Nothing to clean up.");
                 }
@@ -355,7 +356,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
         Commands::CleanCache { days } => {
             let config = client::Config::load()?;
             let max_days = days.unwrap_or(config.cache_days);
-            println!("Cleaning cache (max age: {max_days} day(s))...");
+            println!("Cleaning cache (max age: {max_days} day{})...", util::plural(max_days as usize));
             install::clean_cache(&config.cache_dir()?, max_days);
         }
         Commands::Update { names, dry_run } => {

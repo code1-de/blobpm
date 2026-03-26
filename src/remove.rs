@@ -36,7 +36,7 @@ pub fn purge(db: &mut Database) -> io::Result<()> {
     if removed == 0 {
         println!("No orphaned packages found.");
     } else {
-        println!("Purged {removed} orphaned package(s).");
+        println!("Purged {removed} orphaned package{}.", crate::util::plural(removed));
     }
     db.save()
 }

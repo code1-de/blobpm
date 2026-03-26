@@ -5,6 +5,7 @@ use std::{fs, io};
 use crate::client::{Database, HttpClient, InstallReason, InstalledPackage, validate_manifest_path, validate_pkg_spec};
 use crate::remove::purge_orphans;
 use crate::repo::{IndexEntry, Manifest};
+use crate::util::{plural, pluralize};
 
 /// Fetch the package index from the server.
 ///
@@ -128,7 +129,11 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
         }
     }
     if removed > 0 {
-        println!("Cleaned {removed} stale cache entries (older than {max_age_days} day(s))");
+        println!(
+            "Cleaned {removed} stale cache {} (older than {max_age_days} day{})",
+            pluralize(removed as usize, "entry", "entries"),
+            plural(max_age_days as usize)
+        );
     }
 }
 
@@ -247,7 +252,7 @@ fn extract_zip(
         if let Some(old_path) = crate::platform::write_or_rename(&dest, &buf)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dest.display())))?
         {
-            eprintln!("    (renamed {} — run `blob cleanup` after restart)", old_path.display());
+            eprintln!("  (renamed old binary to {}; run `blob cleanup` later)", old_path.display());
         }
 
         println!("  {} -> {}", file, dest.display());
@@ -395,7 +400,7 @@ fn download_and_install(
     // Phase 1: download all zips (skip meta-packages with no files)
     let pkgs_with_files: Vec<_> = packages.iter().filter(|(_, _, m)| !m.files.is_empty()).collect();
     if !pkgs_with_files.is_empty() {
-        println!("Downloading {} package(s)...", pkgs_with_files.len());
+        println!("Downloading {} package{}...", pkgs_with_files.len(), plural(pkgs_with_files.len()));
     }
     let mut downloads: Vec<(&str, &str, &Manifest, Option<PathBuf>)> = Vec::new();
     for (pkg_name, version, manifest) in packages {
@@ -482,7 +487,7 @@ pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Dat
     };
 
     if dry_run {
-        println!("Would update {} package(s):", packages.len());
+        println!("Would update {} package{}:", packages.len(), plural(packages.len()));
         for (pkg_name, new_version) in &packages {
             let old_version = &db.packages[pkg_name].version;
             println!("  {pkg_name} {old_version} -> {new_version}");
@@ -524,7 +529,7 @@ pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Dat
     purge_orphans(db)?;
     db.save()?;
 
-    println!("Updated {} package(s).", packages.len());
+    println!("Updated {} package{}.", packages.len(), plural(packages.len()));
 
     check_self_update()?;
     Ok(())
