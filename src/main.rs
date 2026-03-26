@@ -109,6 +109,12 @@ enum Commands {
     },
     /// Remove all orphaned auto-installed packages (auto deps no longer needed)
     Purge,
+    /// Delete leftover .__blob_* files from in-use renames during updates
+    Cleanup {
+        /// Internal: called by self-update to retry cleanup in a specific directory
+        #[arg(long, hide = true)]
+        self_update: Option<PathBuf>,
+    },
     /// Clean the download cache (delete cached zip files)
     CleanCache {
         /// Max age in days (0 = delete all, default: `cache_days` from config)
@@ -317,6 +323,38 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
         Commands::Purge => {
             let mut db = client::Database::load()?;
             remove::purge(&mut db)?;
+        }
+        Commands::Cleanup { self_update } => {
+            if let Some(dir) = self_update {
+                // Self-update mode: retry cleanup in a specific directory
+                let count = platform::cleanup_with_retry(dir);
+                if count > 0 {
+                    println!("Cleaned {count} leftover file(s).");
+                }
+            } else {
+                // Normal mode: collect all dirs from db.json and clean
+                let db = client::Database::load()?;
+                let mut dirs = std::collections::HashSet::new();
+                for pkg in db.packages.values() {
+                    for path in pkg.files.values() {
+                        if let Some(parent) = path.parent() {
+                            dirs.insert(parent.to_path_buf());
+                        }
+                    }
+                }
+                // Also add blob's own directory
+                if let Ok(exe) = std::env::current_exe()
+                    && let Some(dir) = exe.parent()
+                {
+                    dirs.insert(dir.to_path_buf());
+                }
+                let count = platform::cleanup_blob_renames(&dirs);
+                if count > 0 {
+                    println!("Cleaned {count} leftover file(s).");
+                } else {
+                    println!("Nothing to clean up.");
+                }
+            }
         }
         Commands::CleanCache { days } => {
             let config = client::Config::load()?;

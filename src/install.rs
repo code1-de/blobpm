@@ -226,23 +226,28 @@ fn extract_zip(
             ));
         }
 
-        let mut out = fs::File::create(&dest)?;
-        let written = io::copy(&mut entry, &mut out)?;
-        if written > MAX_EXTRACT_SIZE {
-            fs::remove_file(&dest)?;
+        // Read entry into buffer (size already validated from zip header above)
+        let mut buf = Vec::new();
+        io::copy(&mut entry, &mut buf)?;
+        if buf.len() as u64 > MAX_EXTRACT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("File {file} in {name} exceeded max size during extraction"),
             ));
         }
 
-        total_written = total_written.saturating_add(written);
+        total_written = total_written.saturating_add(buf.len() as u64);
         if total_written > MAX_TOTAL_EXTRACT_SIZE {
-            fs::remove_file(&dest)?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Total extraction size exceeds 2 GB limit for {name}"),
             ));
+        }
+
+        if let Some(old_path) = crate::platform::write_or_rename(&dest, &buf)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dest.display())))?
+        {
+            eprintln!("    (renamed {} — run `blob cleanup` after restart)", old_path.display());
         }
 
         println!("  {} -> {}", file, dest.display());
@@ -373,6 +378,9 @@ pub fn install(
     purge_orphans(db)?;
 
     db.save()?;
+
+    // If we renamed our own exe (self-update), spawn cleanup and exit
+    check_self_update()?;
     Ok(())
 }
 
@@ -517,6 +525,28 @@ pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Dat
     db.save()?;
 
     println!("Updated {} package(s).", packages.len());
+
+    check_self_update()?;
+    Ok(())
+}
+
+/// If our own exe was renamed during install (self-update), spawn a cleanup process and exit.
+fn check_self_update() -> io::Result<()> {
+    let Some(old_exe) = crate::platform::take_self_renamed_exe() else {
+        return Ok(());
+    };
+    let Some(exe_dir) = old_exe.parent() else {
+        return Ok(());
+    };
+
+    #[cfg(windows)]
+    {
+        println!("\nSelf-update detected — spawning cleanup...");
+        crate::platform::spawn_self_cleanup(exe_dir, &old_exe)?;
+        std::process::exit(0);
+    }
+
+    #[cfg(not(windows))]
     Ok(())
 }
 
