@@ -118,7 +118,10 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
                 let pkg_name = pkg_entry.file_name();
                 let ver_name = ver_entry.file_name();
                 if fs::remove_dir_all(ver_entry.path()).is_ok() {
-                    println!("  Removed {}/{}", pkg_name.to_string_lossy(), ver_name.to_string_lossy());
+                    if removed == 0 {
+                        println!("Cleaning cached files...");
+                    }
+                    println!("  Removed {}@{}", pkg_name.to_string_lossy(), ver_name.to_string_lossy());
                     removed += 1;
                 }
             }
