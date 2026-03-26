@@ -332,23 +332,19 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                     println!("Cleaned {count} leftover file(s).");
                 }
             } else {
-                // Normal mode: collect all dirs from db.json and clean
-                let db = client::Database::load()?;
-                let mut dirs = std::collections::HashSet::new();
-                for pkg in db.packages.values() {
-                    for path in pkg.files.values() {
-                        if let Some(parent) = path.parent() {
-                            dirs.insert(parent.to_path_buf());
-                        }
-                    }
+                // Derive roots from config (base_dir + path_map values + own exe dir)
+                let config = client::Config::load()?;
+                let mut roots = std::collections::HashSet::new();
+                roots.insert(config.base_dir.clone());
+                for mapped in config.path_map.values() {
+                    roots.insert(mapped.clone());
                 }
-                // Also add blob's own directory
                 if let Ok(exe) = std::env::current_exe()
                     && let Some(dir) = exe.parent()
                 {
-                    dirs.insert(dir.to_path_buf());
+                    roots.insert(dir.to_path_buf());
                 }
-                let count = platform::cleanup_blob_renames(&dirs);
+                let count = platform::cleanup_blob_renames(&roots);
                 if count > 0 {
                     println!("Cleaned {count} leftover file(s).");
                 } else {

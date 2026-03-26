@@ -137,8 +137,8 @@ pub fn restrict_to_owner_if_inherited(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Blob cleanup suffix for renamed-in-use files.
-pub(crate) const BLOB_RENAME_SUFFIX: &str = ".__blob_";
+/// Blob cleanup marker for renamed-in-use files.
+pub(crate) const BLOB_RENAME_MARKER: &str = ".__blob__";
 
 /// Tracks the path of a self-renamed exe (set during install if the running blob.exe was renamed).
 static SELF_RENAMED_EXE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
@@ -178,7 +178,7 @@ pub(crate) fn write_or_rename(dest: &Path, data: &[u8]) -> io::Result<Option<std
 fn rename_with_blob_suffix(path: &Path) -> io::Result<std::path::PathBuf> {
     let name = path.to_string_lossy();
     for i in 0u32..1000 {
-        let renamed = std::path::PathBuf::from(format!("{name}{BLOB_RENAME_SUFFIX}{i}"));
+        let renamed = std::path::PathBuf::from(format!("{name}.{i}{BLOB_RENAME_MARKER}"));
         if !renamed.exists() {
             std::fs::rename(path, &renamed).map_err(|e| {
                 io::Error::new(e.kind(), format!("rename {} -> {}: {e}", path.display(), renamed.display()))
@@ -209,21 +209,71 @@ pub(crate) fn take_self_renamed_exe() -> Option<std::path::PathBuf> {
     SELF_RENAMED_EXE.lock().ok()?.take()
 }
 
-/// Delete all `*.__blob_*` files in the given directories. Returns count of deleted files.
+/// Reduce a set of directories to the minimal roots (remove any dir that's a child of another).
+/// Lexicographic sort ensures parents come before children, so a single-pass check
+/// against the last accepted root suffices. O(n log n) total.
+fn minimal_roots(dirs: &std::collections::HashSet<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut sorted: Vec<std::path::PathBuf> = dirs.iter().filter_map(|d| dunce::canonicalize(d).ok()).collect();
+    sorted.sort_by_key(|a| normalize_for_compare(a));
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for dir in sorted {
+        if roots.last().is_some_and(|root| path_starts_with(&dir, root)) {
+            continue;
+        }
+        roots.push(dir);
+    }
+    roots
+}
+
+/// Case-insensitive path comparison on Windows, case-sensitive elsewhere.
+#[cfg(windows)]
+fn normalize_for_compare(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn normalize_for_compare(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Case-insensitive `starts_with` on Windows, case-sensitive elsewhere.
+#[cfg(windows)]
+fn path_starts_with(child: &Path, parent: &Path) -> bool {
+    let c = child.to_string_lossy().to_lowercase();
+    let p = parent.to_string_lossy().to_lowercase();
+    c.starts_with(&p) && (c.len() == p.len() || c.as_bytes().get(p.len()) == Some(&b'\\'))
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(child: &Path, parent: &Path) -> bool {
+    child.starts_with(parent)
+}
+
+/// Recursively delete all `*.__blob_*` files under the given directories. Returns count of deleted files.
 pub(crate) fn cleanup_blob_renames(dirs: &std::collections::HashSet<std::path::PathBuf>) -> u32 {
+    let roots = minimal_roots(dirs);
     let mut count = 0u32;
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
-        for entry in entries.flatten() {
+    for root in &roots {
+        cleanup_recurse(root, &mut count);
+    }
+    count
+}
+
+fn cleanup_recurse(dir: &Path, count: &mut u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_recurse(&path, count);
+        } else {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.contains(BLOB_RENAME_SUFFIX) && std::fs::remove_file(entry.path()).is_ok() {
-                println!("  Deleted {}", entry.path().display());
-                count += 1;
+            if name_str.contains(BLOB_RENAME_MARKER) && std::fs::remove_file(&path).is_ok() {
+                println!("  Deleted {}", path.display());
+                *count += 1;
             }
         }
     }
-    count
 }
 
 /// Run cleanup with retry loop for self-update scenario.
@@ -396,5 +446,84 @@ mod tests {
         let native = to_native_path(original);
         let back = to_manifest_path(&native);
         assert_eq!(back, original, "roundtrip must preserve manifest path");
+    }
+
+    // --- Minimal roots tests ---
+
+    #[test]
+    fn minimal_roots_removes_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let ab = tmp.path().join("a").join("b");
+        let c = tmp.path().join("c");
+        std::fs::create_dir_all(&ab).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+
+        let mut dirs = std::collections::HashSet::new();
+        dirs.insert(a.clone());
+        dirs.insert(ab);
+        dirs.insert(c.clone());
+
+        let roots = minimal_roots(&dirs);
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&dunce::canonicalize(&a).unwrap()));
+        assert!(roots.contains(&dunce::canonicalize(&c).unwrap()));
+    }
+
+    #[test]
+    fn minimal_roots_keeps_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let mut dirs = std::collections::HashSet::new();
+        dirs.insert(a.clone());
+        dirs.insert(b.clone());
+
+        let roots = minimal_roots(&dirs);
+        assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn minimal_roots_case_insensitive_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("MyDir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut dirs = std::collections::HashSet::new();
+        // Same dir, different case — should deduplicate
+        dirs.insert(tmp.path().join("MyDir"));
+        dirs.insert(tmp.path().join("mydir"));
+
+        let roots = minimal_roots(&dirs);
+        // canonicalize resolves both to the same path on Windows
+        assert_eq!(roots.len(), 1);
+    }
+
+    // --- Recursive cleanup tests ---
+
+    #[test]
+    fn cleanup_recursive_finds_nested_blob_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Create blob rename files at various depths
+        std::fs::write(tmp.path().join("tool.exe.0.__blob__"), b"old").unwrap();
+        std::fs::write(sub.join("lib.dll.1.__blob__"), b"old").unwrap();
+        // Normal file should not be deleted
+        std::fs::write(sub.join("keep.txt"), b"keep").unwrap();
+
+        let mut dirs = std::collections::HashSet::new();
+        dirs.insert(tmp.path().to_path_buf());
+
+        let count = cleanup_blob_renames(&dirs);
+        assert_eq!(count, 2);
+        assert!(!tmp.path().join("tool.exe.0.__blob__").exists());
+        assert!(!sub.join("lib.dll.1.__blob__").exists());
+        assert!(sub.join("keep.txt").exists());
     }
 }
