@@ -190,6 +190,7 @@ pub fn upload(
     from: &Path,
     mappings: &[String],
     deps: &[String],
+    links: &[String],
     description: &str,
     force: bool,
     lowercase: bool,
@@ -229,8 +230,29 @@ pub fn upload(
         println!("Dependencies: {}", deps.join(", "));
     }
 
-    let manifest =
-        Manifest { name: name.to_string(), description: description.to_string(), files, dependencies: deps.to_vec() };
+    // Parse --link args: "dest:target"
+    let mut link_map = BTreeMap::new();
+    for l in links {
+        let (dest, target) = l
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid link (missing ':'): {l}")))?;
+        link_map
+            .insert(crate::platform::to_manifest_path(dest.trim()), crate::platform::to_manifest_path(target.trim()));
+    }
+    if !link_map.is_empty() {
+        println!("Links: {}", link_map.len());
+        for (dest, target) in &link_map {
+            println!("  {dest} -> {target}");
+        }
+    }
+
+    let manifest = Manifest {
+        name: name.to_string(),
+        description: description.to_string(),
+        files,
+        dependencies: deps.to_vec(),
+        links: link_map,
+    };
 
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
@@ -279,6 +301,7 @@ pub fn upload_interactive(
     from: &Path,
     existing_mappings: &[String],
     existing_deps: &[String],
+    existing_links: &[String],
     existing_desc: &str,
     force: bool,
     lowercase: bool,
@@ -317,7 +340,7 @@ pub fn upload_interactive(
     let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
     let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
 
-    upload(name, version, from, &mappings, &deps, &description, force, lowercase, http)
+    upload(name, version, from, &mappings, &deps, existing_links, &description, force, lowercase, http)
 }
 
 #[cfg(test)]
@@ -355,8 +378,19 @@ mod tests {
 
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
-        upload("newtool", "1.0", src_tmp.path(), &["*.exe:util/".to_string()], &[], "A new tool", false, false, &http)
-            .unwrap();
+        upload(
+            "newtool",
+            "1.0",
+            src_tmp.path(),
+            &["*.exe:util/".to_string()],
+            &[],
+            &[],
+            "A new tool",
+            false,
+            false,
+            &http,
+        )
+        .unwrap();
 
         let index = fetch_index(&http).unwrap();
         assert_eq!(index["newtool"].latest, "1.0");
@@ -388,6 +422,7 @@ mod tests {
             src_tmp.path(),
             &["a.exe;b.dll:bin".to_string(), "c.txt:doc".to_string()],
             &[],
+            &[],
             "",
             false,
             false,
@@ -414,7 +449,7 @@ mod tests {
         fs::write(src_tmp.path().join("MyTool.EXE"), b"binary").unwrap();
 
         // Literal filename with --lowercase
-        upload("lc-literal", "1.0", src_tmp.path(), &["MyTool.EXE:bin".to_string()], &[], "", false, true, &http)
+        upload("lc-literal", "1.0", src_tmp.path(), &["MyTool.EXE:bin".to_string()], &[], &[], "", false, true, &http)
             .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "lc-literal", "1.0").unwrap();
@@ -445,6 +480,7 @@ mod tests {
             "1.0",
             src_tmp.path(),
             &["*.DLL:lib".to_string(), "*.EXE:bin".to_string()],
+            &[],
             &[],
             "",
             false,
@@ -479,8 +515,19 @@ mod tests {
         fs::write(src_tmp.path().join("tool.exe"), b"tool-binary").unwrap();
 
         // Upload with backslash dest — manifest should store forward slashes
-        upload("slashtest", "1.0", src_tmp.path(), &["*.exe:sub\\dir\\".to_string()], &[], "", false, false, &http)
-            .unwrap();
+        upload(
+            "slashtest",
+            "1.0",
+            src_tmp.path(),
+            &["*.exe:sub\\dir\\".to_string()],
+            &[],
+            &[],
+            "",
+            false,
+            false,
+            &http,
+        )
+        .unwrap();
 
         // Read the manifest back and verify forward slashes
         let manifest = crate::install::fetch_manifest(&http, "slashtest", "1.0").unwrap();
@@ -501,7 +548,7 @@ mod tests {
 
         fs::write(src_tmp.path().join("lib.dll"), b"lib-binary").unwrap();
 
-        upload("fwdtest", "1.0", src_tmp.path(), &["*.dll:lib/native/".to_string()], &[], "", false, false, &http)
+        upload("fwdtest", "1.0", src_tmp.path(), &["*.dll:lib/native/".to_string()], &[], &[], "", false, false, &http)
             .unwrap();
 
         let manifest = crate::install::fetch_manifest(&http, "fwdtest", "1.0").unwrap();

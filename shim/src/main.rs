@@ -1,7 +1,10 @@
-//! Blob shim — tiny no_std launcher that reads a target exe path appended to itself,
-//! then launches it with the original arguments, waits, and propagates the exit code.
+//! Blob shim — tiny no_std launcher that reads a relative target exe path appended
+//! to itself, resolves it against its own directory, launches it with the original
+//! arguments, waits, and propagates the exit code.
 //!
-//! Binary format: [PE image][target path as UTF-8][u32 LE: path length]
+//! Binary format: [PE image][relative target path as UTF-8][u32 LE: path length]
+//!
+//! The path is relative to the shim's own directory, making the install tree relocatable.
 
 #![no_std]
 #![no_main]
@@ -142,31 +145,55 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
     ReadFile(file, target_utf8.as_mut_ptr(), path_len as u32, &mut read, 0);
     CloseHandle(file);
 
-    // 5. Convert target path UTF-8 → UTF-16
-    let mut target_wide = [0u16; 1024];
-    let wide_len = MultiByteToWideChar(
-        CP_UTF8, 0, target_utf8.as_ptr(), path_len as i32, target_wide.as_mut_ptr(), target_wide.len() as i32,
+    // 5. Convert relative target path UTF-8 → UTF-16
+    let mut rel_wide = [0u16; 1024];
+    let rel_len = MultiByteToWideChar(
+        CP_UTF8, 0, target_utf8.as_ptr(), path_len as i32, rel_wide.as_mut_ptr(), rel_wide.len() as i32,
     );
-    if wide_len <= 0 {
+    if rel_len <= 0 {
         die(b"blob-shim: invalid target path\r\n");
     }
 
-    // 6. Build command line: "target_path" + rest of original args
+    // 6. Resolve relative path against shim's own directory
+    //    Find last backslash in exe_path to get the directory
+    let mut full_target = [0u16; 2048];
+    let mut dir_end = 0usize;
+    for i in 0..len as usize {
+        if exe_path[i] == b'\\' as u16 || exe_path[i] == b'/' as u16 {
+            dir_end = i + 1;
+        }
+    }
+    // Copy directory prefix
+    let mut pos = 0usize;
+    for i in 0..dir_end {
+        full_target[pos] = exe_path[i];
+        pos += 1;
+    }
+    // Append relative target path
+    for i in 0..rel_len as usize {
+        // Normalize forward slashes to backslashes
+        full_target[pos] = if rel_wide[i] == b'/' as u16 { b'\\' as u16 } else { rel_wide[i] };
+        pos += 1;
+    }
+    full_target[pos] = 0;
+    let target_len = pos;
+
+    // 7. Build command line: "full_target" + rest of original args
     let orig_cmd = GetCommandLineW();
     let rest = skip_argv0(orig_cmd);
 
     let mut cmdline = [0u16; 32768];
-    let mut pos = 0usize;
+    pos = 0;
 
     // Opening quote
     cmdline[pos] = b'"' as u16;
     pos += 1;
-    // Target path
-    for i in 0..wide_len as usize {
+    // Full target path
+    for i in 0..target_len {
         if pos >= cmdline.len() - 2 {
             break;
         }
-        cmdline[pos] = target_wide[i];
+        cmdline[pos] = full_target[i];
         pos += 1;
     }
     // Closing quote
@@ -186,7 +213,7 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
     }
     cmdline[pos] = 0; // null-terminate
 
-    // 7. Launch process
+    // 8. Launch process
     let mut si: StartupInfoW = core::mem::zeroed();
     si.cb = core::mem::size_of::<StartupInfoW>() as u32;
     let mut pi: ProcessInformation = core::mem::zeroed();
@@ -200,7 +227,7 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
         die(b"blob-shim: cannot launch target\r\n");
     }
 
-    // 8. Wait and propagate exit code
+    // 9. Wait and propagate exit code
     WaitForSingleObject(pi.process, INFINITE);
     let mut exit_code = 1u32;
     GetExitCodeProcess(pi.process, &mut exit_code);

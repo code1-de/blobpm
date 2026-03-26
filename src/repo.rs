@@ -9,6 +9,10 @@ pub struct Manifest {
     pub description: String,
     pub files: BTreeMap<String, String>,
     pub dependencies: Vec<String>,
+    /// Shim links: dest path → target path (both relative to `base_dir`/`path_map`).
+    /// E.g. `{"bin/git.exe": "git/mingw64/bin/git.exe"}` creates a shim launcher.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

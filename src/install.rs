@@ -403,13 +403,20 @@ fn download_and_install(
     for (pkg_name, version, manifest, zip_path) in &downloads {
         let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
-        let installed_files = if let Some(zip_path) = zip_path {
+        let mut installed_files = if let Some(zip_path) = zip_path {
             println!("Installing {pkg_name} {version}...");
             extract_zip(zip_path, manifest, &http.config, pkg_name)?
         } else {
             println!("Installing {pkg_name} {version} (meta-package)...");
             BTreeMap::new()
         };
+
+        // Create shim links (64-bit Windows only)
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        if !manifest.links.is_empty() {
+            let shim_files = crate::shim::create_shims(&manifest.links, &http.config)?;
+            installed_files.extend(shim_files);
+        }
 
         db.packages.insert(
             pkg_name.to_string(),
@@ -818,6 +825,7 @@ mod tests {
             description: "bad".to_string(),
             files: BTreeMap::from([("tool.exe/".to_string(), "util/".to_string())]),
             dependencies: vec![],
+            links: BTreeMap::new(),
         };
 
         let base = tmp.path().join("install");
@@ -845,6 +853,7 @@ mod tests {
             description: "bad".to_string(),
             files: BTreeMap::from([("tool.exe".to_string(), "util/".to_string())]),
             dependencies: vec![],
+            links: BTreeMap::new(),
         };
 
         let base = tmp.path().join("install");
@@ -867,6 +876,7 @@ mod tests {
             description: "bad".to_string(),
             files: BTreeMap::from([("b.exe".to_string(), "util/".to_string())]),
             dependencies: vec![],
+            links: BTreeMap::new(),
         };
 
         let base = tmp.path().join("install");
@@ -907,6 +917,7 @@ mod tests {
             description: "test".to_string(),
             files: BTreeMap::from([("tool.exe".to_string(), "bin/".to_string())]),
             dependencies: vec![],
+            links: BTreeMap::new(),
         };
 
         let mut config = minimal_config(&base);
@@ -934,6 +945,7 @@ mod tests {
             description: "test".to_string(),
             files: BTreeMap::from([("script.py".to_string(), "scripts/".to_string())]),
             dependencies: vec![],
+            links: BTreeMap::new(),
         };
 
         // bin is mapped, but scripts is not — should go to base_dir/scripts/

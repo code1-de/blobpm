@@ -7,6 +7,8 @@ mod platform;
 mod remove;
 mod repo;
 mod server;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod shim;
 #[cfg(test)]
 mod testutil;
 mod tls;
@@ -163,6 +165,11 @@ enum Commands {
         /// Package dependency (can be repeated: --dep zip --dep helper)
         #[arg(long = "dep", short = 'D')]
         deps: Vec<String>,
+
+        /// Shim link: "dest:target" — create a shim exe at dest that launches target
+        /// (both relative paths). Example: --link "bin/git.exe:git/mingw64/bin/git.exe"
+        #[arg(long)]
+        link: Vec<String>,
 
         /// Package description
         #[arg(long, short, default_value = "")]
@@ -388,7 +395,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                 }
             }
         }
-        Commands::Upload { package, mappings, from, deps, description, interactive, force, lowercase } => {
+        Commands::Upload { package, mappings, from, deps, link, description, interactive, force, lowercase } => {
             let (pkg_name, version) = parse_package_spec(package);
             let version = version.ok_or("Version required: use name@version")?;
             let config = client::Config::load()?;
@@ -401,6 +408,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                     from,
                     mappings,
                     deps,
+                    link,
                     description,
                     *force,
                     *lowercase,
@@ -409,7 +417,18 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             } else if mappings.is_empty() && deps.is_empty() {
                 return Err("No file mappings or dependencies provided. Use glob:dest patterns, --dep, or -i for interactive mode.".into());
             } else {
-                upload::upload(&pkg_name, &version, from, mappings, deps, description, *force, *lowercase, &http)?;
+                upload::upload(
+                    &pkg_name,
+                    &version,
+                    from,
+                    mappings,
+                    deps,
+                    link,
+                    description,
+                    *force,
+                    *lowercase,
+                    &http,
+                )?;
             }
         }
         Commands::Status { paths, all, missing, no_recurse, depth } => {
