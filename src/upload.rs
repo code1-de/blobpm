@@ -22,6 +22,7 @@ pub fn search(
     show_versions: bool,
     search_desc: bool,
     show_long: bool,
+    pin_version: Option<&str>,
     http: &HttpClient,
 ) -> io::Result<()> {
     if pattern.len() > 1024 {
@@ -51,21 +52,39 @@ pub fn search(
     let w0 = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
     let w1 = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
 
+    let config = if show_long { Some(crate::client::Config::load()?) } else { None };
+
     for (name, version, desc) in &rows {
         if desc.is_empty() {
             println!("{name:<w0$}  {version}");
         } else {
             println!("{name:<w0$}  {version:<w1$}  {desc}");
         }
-        if show_long
-            && let Ok(manifest) =
-                crate::install::fetch_manifest(http, name, version.split(',').next().unwrap_or(version).trim())
-        {
-            if !manifest.dependencies.is_empty() {
-                println!("  deps: {}", manifest.dependencies.join(", "));
-            }
-            if manifest.files.is_empty() {
-                println!("  (meta-package)");
+        if show_long {
+            let lookup_ver = pin_version.unwrap_or_else(|| version.split(',').next().unwrap_or(version).trim());
+            if let Ok(manifest) = crate::install::fetch_manifest(http, name, lookup_ver) {
+                if !manifest.dependencies.is_empty() {
+                    println!("  deps: {}", manifest.dependencies.join(", "));
+                }
+                if manifest.files.is_empty() {
+                    println!("  (meta-package)");
+                } else if let Some(cfg) = &config {
+                    for (file, dest_dir) in &manifest.files {
+                        let dest = cfg.resolve_dest(dest_dir).join(file);
+                        println!("  {} -> {}", file, dest.display());
+                    }
+                }
+                if !manifest.links.is_empty()
+                    && let Some(cfg) = &config
+                {
+                    for (dest, target) in &manifest.links {
+                        println!(
+                            "  link: {} -> {}",
+                            cfg.resolve_dest(dest).display(),
+                            cfg.resolve_dest(target).display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -396,7 +415,7 @@ mod tests {
         assert_eq!(index["newtool"].latest, "1.0");
 
         let mut db = Database::load_from(&db_path).unwrap();
-        install("newtool", None, false, false, &http, &mut db).unwrap();
+        install("newtool", None, false, false, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("tool.exe").exists());
     }
 

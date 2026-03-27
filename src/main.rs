@@ -44,6 +44,10 @@ enum Commands {
         /// Ignore cached zip files, always download from server
         #[arg(long, short = 'C')]
         no_cache: bool,
+
+        /// Install even if files conflict with other packages
+        #[arg(long, short = 'o')]
+        overwrite: bool,
     },
     /// Remove packages (auto-removes orphaned auto-installed dependencies)
     Remove {
@@ -70,6 +74,10 @@ enum Commands {
         /// Show what would be updated without actually doing it
         #[arg(long, short = 'n')]
         dry_run: bool,
+
+        /// Install even if files conflict with other packages
+        #[arg(long, short = 'o')]
+        overwrite: bool,
     },
     /// List installed packages (with package names: show details)
     List {
@@ -97,9 +105,14 @@ enum Commands {
         #[arg(long, short)]
         description: bool,
 
-        /// Show dependencies for each matching package
+        /// Show details: all versions, deps, files (use pattern@version to inspect a specific version)
         #[arg(long, short = 'l')]
         long: bool,
+    },
+    /// Show details of a remote package (files, deps, description)
+    Info {
+        /// Package name, or name@version for a specific version
+        package: String,
     },
     /// Configure blob settings interactively (server URL, base dir, credentials)
     Config,
@@ -256,7 +269,12 @@ fn main() {
     let cli = Cli::from_arg_matches(&cmd.get_matches()).expect("cli parse");
 
     if let Err(e) = run_command(&cli.command, cli.yes) {
-        eprintln!("Error: {e}");
+        let msg = e.to_string();
+        if let Some((first, rest)) = msg.split_once('\n') {
+            eprintln!("{}\n{rest}", util::red(&format!("Error: {first}")));
+        } else {
+            eprintln!("{}", util::red(&format!("Error: {msg}")));
+        }
         let code =
             if e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) {
                 2
@@ -278,19 +296,30 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone()), log.clone()))?;
         }
-        Commands::Install { names, force, no_cache } => {
+        Commands::Install { names, force, no_cache, overwrite } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
             for name in names {
                 let (pkg_name, version) = parse_package_spec(name);
-                install::install(&pkg_name, version.as_deref(), *force, *no_cache, &http, &mut db)?;
+                install::install(&pkg_name, version.as_deref(), *force, *no_cache, *overwrite, &http, &mut db)?;
             }
         }
         Commands::Search { pattern, versions, description, long } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
-            upload::search(pattern, *versions, *description, *long, &http)?;
+            let (search_pattern, pin_version) = if let Some((p, v)) = pattern.split_once('@') {
+                (p.to_string(), Some(v.to_string()))
+            } else {
+                (pattern.clone(), None)
+            };
+            upload::search(&search_pattern, *versions || *long, *description, *long, pin_version.as_deref(), &http)?;
+        }
+        Commands::Info { package } => {
+            let (pkg_name, version) = parse_package_spec(package);
+            let config = client::Config::load()?;
+            let http = client::HttpClient::new(&config, yes)?;
+            run_info(&pkg_name, version.as_deref(), &http)?;
         }
         Commands::Remove { names, force, transitive, keep } => {
             let mut db = client::Database::load()?;
@@ -357,17 +386,17 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             let config = client::Config::load()?;
             let max_days = days.unwrap_or(config.cache_days);
             println!("Cleaning cache (max age: {max_days} day{})...", util::plural(max_days as usize));
-            install::clean_cache(&config.cache_dir()?, max_days);
+            install::clean_cache(&config.cache_dir()?, max_days, true);
         }
-        Commands::Update { names, dry_run } => {
+        Commands::Update { names, dry_run, overwrite } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
             if names.is_empty() {
-                install::update(None, *dry_run, &http, &mut db)?;
+                install::update(None, *dry_run, *overwrite, &http, &mut db)?;
             } else {
                 for name in names {
-                    install::update(Some(name.as_str()), *dry_run, &http, &mut db)?;
+                    install::update(Some(name.as_str()), *dry_run, *overwrite, &http, &mut db)?;
                 }
             }
         }
@@ -515,6 +544,46 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     } else {
         (spec.to_string(), None)
     }
+}
+
+fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Result<(), Box<dyn std::error::Error>> {
+    client::validate_pkg_spec("package name", name)?;
+
+    let version = if let Some(v) = version {
+        v.to_string()
+    } else {
+        let index = install::fetch_index(http)?;
+        index.get(name).ok_or_else(|| format!("Package {name} not found in index"))?.latest.clone()
+    };
+
+    let manifest = install::fetch_manifest(http, name, &version)?;
+    let config = client::Config::load()?;
+
+    println!("{name} {version}");
+    if !manifest.description.is_empty() {
+        println!("  {}", manifest.description);
+    }
+    if !manifest.dependencies.is_empty() {
+        println!("  Dependencies: {}", manifest.dependencies.join(", "));
+    }
+    if manifest.files.is_empty() {
+        println!("  (meta-package, no files)");
+    } else {
+        println!("  Files:");
+        for (file, dest_dir) in &manifest.files {
+            let dest = config.resolve_dest(dest_dir).join(file);
+            println!("    {file} -> {}", dest.display());
+        }
+    }
+    if !manifest.links.is_empty() {
+        println!("  Links:");
+        for (dest, target) in &manifest.links {
+            let dest_path = config.resolve_dest(dest);
+            let target_path = config.resolve_dest(target);
+            println!("    {} -> {}", dest_path.display(), target_path.display());
+        }
+    }
+    Ok(())
 }
 
 fn run_status(

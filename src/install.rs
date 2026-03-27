@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -102,7 +103,7 @@ fn download_zip(
 }
 
 /// Delete cached files older than `max_age_days` (0 = delete all). Silently skips errors.
-pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
+pub fn clean_cache(cache_dir: &Path, max_age_days: u32, verbose: bool) {
     if !cache_dir.is_dir() {
         return;
     }
@@ -118,10 +119,12 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
                 let pkg_name = pkg_entry.file_name();
                 let ver_name = ver_entry.file_name();
                 if fs::remove_dir_all(ver_entry.path()).is_ok() {
-                    if removed == 0 {
+                    if verbose && removed == 0 {
                         println!("Cleaning cached files...");
                     }
-                    println!("  Removed {}@{}", pkg_name.to_string_lossy(), ver_name.to_string_lossy());
+                    if verbose {
+                        println!("  Removed {}@{}", pkg_name.to_string_lossy(), ver_name.to_string_lossy());
+                    }
                     removed += 1;
                 }
             }
@@ -131,7 +134,7 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32) {
             let _ = fs::remove_dir(pkg_entry.path());
         }
     }
-    if removed > 0 {
+    if verbose && removed > 0 {
         println!(
             "Cleaned {removed} stale cache {} (older than {max_age_days} day{})",
             pluralize(removed as usize, "entry", "entries"),
@@ -255,7 +258,7 @@ fn extract_zip(
         if let Some(old_path) = crate::platform::write_or_rename(&dest, &buf)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dest.display())))?
         {
-            eprintln!("  (renamed old binary to {}; run `blob cleanup` later)", old_path.display());
+            eprintln!("  Renamed old binary to {}; run `blob cleanup` later.", old_path.display());
         }
 
         println!("  {} -> {}", file, dest.display());
@@ -328,6 +331,65 @@ fn resolve_recursive(
     Ok(())
 }
 
+/// Check for file conflicts between packages to be installed and already-installed packages.
+///
+/// Builds a path→owner map from the DB (O(existing files)), then checks each file in the
+/// transaction (O(new files)). Also detects within-transaction conflicts.
+/// Returns `Ok(())` if no conflicts, or an error describing all conflicts.
+fn check_conflicts(
+    to_install: &[(String, String, Manifest)],
+    config: &crate::client::Config,
+    db: &Database,
+) -> io::Result<()> {
+    // Build path → owner from already-installed packages (skip packages being reinstalled)
+    let transaction_names: HashSet<&str> = to_install.iter().map(|(n, _, _)| n.as_str()).collect();
+    let mut owned: HashMap<PathBuf, &str> = HashMap::new();
+    for (pkg_name, pkg) in &db.packages {
+        if transaction_names.contains(pkg_name.as_str()) {
+            continue; // will be replaced by this transaction
+        }
+        for dest in pkg.files.values() {
+            owned.insert(dest.clone(), pkg_name.as_str());
+        }
+    }
+
+    // Check each file in the transaction; also detect within-transaction conflicts
+    let mut conflicts: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
+    for (pkg_name, _, manifest) in to_install {
+        for (file, dest_dir) in &manifest.files {
+            let dest = config.resolve_dest(dest_dir).join(file);
+            if let Some(&other) = owned.get(&dest) {
+                conflicts.entry(other.to_string()).or_default().push((pkg_name.clone(), dest.clone()));
+            } else {
+                // Register so later packages in the transaction can conflict with this one
+                owned.insert(dest, pkg_name.as_str());
+            }
+        }
+        // Also check shim links
+        for dest_key in manifest.links.keys() {
+            let dest = config.resolve_dest(dest_key);
+            if let Some(&other) = owned.get(&dest) {
+                conflicts.entry(other.to_string()).or_default().push((pkg_name.clone(), dest.clone()));
+            } else {
+                owned.insert(dest, pkg_name.as_str());
+            }
+        }
+    }
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = String::from("File conflicts detected:\n");
+    for (owner, files) in &conflicts {
+        for (wanting, path) in files {
+            let _ = writeln!(msg, "  {} wants {} (owned by {owner})", wanting, path.display());
+        }
+    }
+    msg.push_str("Use --overwrite to install anyway.");
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, msg))
+}
+
 /// Install a package and its dependencies.
 ///
 /// # Errors
@@ -337,11 +399,12 @@ pub fn install(
     version: Option<&str>,
     force: bool,
     no_cache: bool,
+    overwrite: bool,
     http: &HttpClient,
     db: &mut Database,
 ) -> io::Result<()> {
     if let Ok(cache_dir) = http.config.cache_dir() {
-        clean_cache(&cache_dir, http.config.cache_days);
+        clean_cache(&cache_dir, http.config.cache_days, false);
     }
     validate_pkg_spec("package name", name)?;
     if let Some(v) = version {
@@ -378,6 +441,10 @@ pub fn install(
     if to_install.is_empty() {
         println!("{name} is already installed");
         return Ok(());
+    }
+
+    if !overwrite {
+        check_conflicts(&to_install, &http.config, db)?;
     }
 
     download_and_install(&to_install, name, no_cache, http, db)?;
@@ -453,9 +520,15 @@ fn download_and_install(
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
-pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Database) -> io::Result<()> {
+pub fn update(
+    name: Option<&str>,
+    dry_run: bool,
+    overwrite: bool,
+    http: &HttpClient,
+    db: &mut Database,
+) -> io::Result<()> {
     if !dry_run && let Ok(cache_dir) = http.config.cache_dir() {
-        clean_cache(&cache_dir, http.config.cache_days);
+        clean_cache(&cache_dir, http.config.cache_days, false);
     }
     let index = fetch_index(http)?;
 
@@ -503,6 +576,10 @@ pub fn update(name: Option<&str>, dry_run: bool, http: &HttpClient, db: &mut Dat
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
         let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
+
+        if !overwrite {
+            check_conflicts(&resolved, &http.config, db)?;
+        }
 
         // Remove old files that are no longer in the new manifest
         if let Some(new_manifest) = resolved.iter().find(|(n, _, _)| n == pkg_name).map(|(_, _, m)| m)
@@ -638,7 +715,7 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert_eq!(db.packages["toolA"].version, "1.0");
@@ -656,7 +733,7 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, false, &http, &mut db).unwrap();
 
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
         assert!(install_tmp.path().join("util").join("toolB.exe").exists());
@@ -679,10 +756,10 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
-        install("toolA", None, false, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
     }
 
@@ -720,8 +797,8 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, false, &http, &mut db).unwrap();
-        install("depD", None, false, false, &http, &mut db).unwrap();
+        install("depC", None, false, false, false, &http, &mut db).unwrap();
+        install("depD", None, false, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 4);
         assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
         assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
@@ -739,10 +816,10 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolE", Some("1.0"), false, false, &http, &mut db).unwrap();
+        install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages.len(), 1);
 
-        update(None, false, &http, &mut db).unwrap();
+        update(None, false, false, &http, &mut db).unwrap();
         assert_eq!(db.packages["toolE"].version, "2.0");
         assert!(db.packages.contains_key("depA"));
     }
@@ -789,14 +866,14 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
         let cache_path = install_tmp.path().join(".cache").join("toolA").join("1.0").join("files.zip");
         assert!(cache_path.is_file());
 
         remove("toolA", false, false, false, &mut db).unwrap();
         assert!(cache_path.is_file());
 
-        install("toolA", None, false, false, &http, &mut db).unwrap();
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
         assert!(install_tmp.path().join("util").join("toolA.exe").exists());
     }
 
@@ -812,7 +889,7 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolB", None, false, false, &http, &mut db).unwrap();
+        install("toolB", None, false, false, false, &http, &mut db).unwrap();
         let cache = install_tmp.path().join(".cache");
         assert!(cache.join("toolA").join("1.0").join("files.zip").is_file());
         assert!(cache.join("toolB").join("2.0").join("files.zip").is_file());
@@ -840,7 +917,7 @@ mod tests {
         let http = HttpClient::new(&config, false).unwrap();
         let mut db = Database::load_from(&db_path).unwrap();
 
-        let result = install("missing_dep", None, false, false, &http, &mut db);
+        let result = install("missing_dep", None, false, false, false, &http, &mut db);
         assert!(result.is_err());
         assert!(db.packages.is_empty());
         assert!(!install_tmp.path().join("util").join("x.exe").exists());
@@ -1010,5 +1087,143 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let loaded: Config = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.path_map["bin"], PathBuf::from("D:\\tools\\bin"));
+    }
+
+    fn make_manifest(name: &str, files: &[(&str, &str)]) -> Manifest {
+        Manifest {
+            name: name.to_string(),
+            description: String::new(),
+            files: files.iter().map(|(f, d)| (f.to_string(), d.to_string())).collect(),
+            dependencies: vec![],
+            links: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn conflict_with_installed_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+        db.packages.insert(
+            "existing".to_string(),
+            InstalledPackage {
+                version: "1.0".to_string(),
+                reason: InstallReason::Manual,
+                files: BTreeMap::from([("shared.dll".to_string(), PathBuf::from("C:\\base\\util\\shared.dll"))]),
+                dependencies: vec![],
+            },
+        );
+
+        let to_install =
+            vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("shared.dll", "util/")]))];
+
+        let result = check_conflicts(&to_install, &config, &db);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("existing"), "should name the owning package: {err}");
+        assert!(err.contains("newpkg"), "should name the wanting package: {err}");
+        assert!(err.contains("--overwrite"), "should suggest --overwrite: {err}");
+    }
+
+    #[test]
+    fn conflict_within_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+
+        // Two packages in the same transaction both want util/shared.dll
+        let to_install = vec![
+            ("pkgA".to_string(), "1.0".to_string(), make_manifest("pkgA", &[("shared.dll", "util/")])),
+            ("pkgB".to_string(), "1.0".to_string(), make_manifest("pkgB", &[("shared.dll", "util/")])),
+        ];
+
+        let result = check_conflicts(&to_install, &config, &db);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("pkgA"), "should name first package: {err}");
+        assert!(err.contains("pkgB"), "should name second package: {err}");
+    }
+
+    #[test]
+    fn no_conflict_different_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+        db.packages.insert(
+            "existing".to_string(),
+            InstalledPackage {
+                version: "1.0".to_string(),
+                reason: InstallReason::Manual,
+                files: BTreeMap::from([("other.dll".to_string(), PathBuf::from("C:\\base\\util\\other.dll"))]),
+                dependencies: vec![],
+            },
+        );
+
+        let to_install =
+            vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("tool.exe", "util/")]))];
+
+        assert!(check_conflicts(&to_install, &config, &db).is_ok());
+    }
+
+    #[test]
+    fn no_conflict_when_reinstalling_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+        // "mypkg" is already installed with this file
+        db.packages.insert(
+            "mypkg".to_string(),
+            InstalledPackage {
+                version: "1.0".to_string(),
+                reason: InstallReason::Manual,
+                files: BTreeMap::from([("tool.exe".to_string(), PathBuf::from("C:\\base\\util\\tool.exe"))]),
+                dependencies: vec![],
+            },
+        );
+
+        // Reinstalling mypkg with the same file — not a conflict
+        let to_install =
+            vec![("mypkg".to_string(), "2.0".to_string(), make_manifest("mypkg", &[("tool.exe", "util/")]))];
+
+        assert!(check_conflicts(&to_install, &config, &db).is_ok());
+    }
+
+    /// Create repo with toolA and a "conflict" package that places the same file (toolA.exe -> util/).
+    fn create_conflict_repo(base: &Path) {
+        create_test_repo(base);
+        let pkg_dir = base.join("packages").join("conflict").join("1.0");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("manifest.json"),
+            r#"{"name":"conflict","description":"","files":{"toolA.exe":"util/"},"dependencies":[]}"#,
+        )
+        .unwrap();
+        create_zip(&pkg_dir, &[("toolA.exe", b"conflict-binary")]);
+    }
+
+    #[test]
+    fn overwrite_bypasses_conflict() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_conflict_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install toolA first
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
+
+        // Without --overwrite: should fail
+        let result = install("conflict", None, false, false, false, &http, &mut db);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("toolA"), "should mention owning package: {err}");
+
+        // With --overwrite: should succeed
+        install("conflict", None, false, false, true, &http, &mut db).unwrap();
+        assert!(db.packages.contains_key("conflict"));
     }
 }
