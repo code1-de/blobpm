@@ -357,7 +357,8 @@ fn check_conflicts(
     let mut conflicts: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
     for (pkg_name, _, manifest) in to_install {
         for (file, dest_dir) in &manifest.files {
-            let dest = config.resolve_dest(dest_dir).join(file);
+            let native_file = crate::platform::to_native_path(file);
+            let dest = config.resolve_dest(dest_dir).join(native_file);
             if let Some(&other) = owned.get(&dest) {
                 conflicts.entry(other.to_string()).or_default().push((pkg_name.clone(), dest.clone()));
             } else {
