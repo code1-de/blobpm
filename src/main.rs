@@ -123,7 +123,7 @@ enum Commands {
     },
     /// Remove all orphaned auto-installed packages (auto deps no longer needed)
     Purge,
-    /// Delete leftover .__blob_* files from in-use renames during updates
+    /// Delete leftover *.__blob__ files from in-use renames during updates
     Cleanup {
         /// Internal: called by self-update to retry cleanup in a specific directory
         #[arg(long, hide = true)]

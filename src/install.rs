@@ -487,6 +487,7 @@ fn download_and_install(
     for (pkg_name, version, manifest, zip_path) in &downloads {
         let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
+        #[allow(unused_mut)]
         let mut installed_files = if let Some(zip_path) = zip_path {
             println!("Installing {pkg_name} {version}...");
             extract_zip(zip_path, manifest, &http.config, pkg_name)?
@@ -621,6 +622,7 @@ fn check_self_update() -> io::Result<()> {
     let Some(old_exe) = crate::platform::take_self_renamed_exe() else {
         return Ok(());
     };
+    #[allow(unused_variables)]
     let Some(exe_dir) = old_exe.parent() else {
         return Ok(());
     };

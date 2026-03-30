@@ -175,6 +175,7 @@ pub(crate) fn write_or_rename(dest: &Path, data: &[u8]) -> io::Result<Option<std
 }
 
 /// Rename a file by appending `.__blob_N` where N is the first free number.
+#[cfg(windows)]
 fn rename_with_blob_suffix(path: &Path) -> io::Result<std::path::PathBuf> {
     let name = path.to_string_lossy();
     for i in 0u32..1000 {
