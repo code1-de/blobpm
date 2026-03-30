@@ -145,17 +145,17 @@ impl ServerCertVerifier for TofuVerifier {
         let fingerprint = cert_fingerprint(end_entity.as_ref());
 
         if self.saved_fingerprint.is_empty() {
+            if self.auto_accept {
+                return Err(rustls::Error::General(
+                    "No server fingerprint configured. Run 'blob config' interactively first to trust the server certificate.".to_string(),
+                ));
+            }
             eprintln!("New server certificate:");
             eprintln!("Fingerprint: {fingerprint}");
 
-            let accepted = if self.auto_accept {
-                eprintln!("Auto-accepted (--yes)");
-                true
-            } else {
-                eprint!("Trust this certificate? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
-            };
+            eprint!("Trust this certificate? [y/N] ");
+            let mut input = String::new();
+            let accepted = std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y");
 
             if accepted {
                 // Save fingerprint to config

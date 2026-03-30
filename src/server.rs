@@ -16,16 +16,22 @@ use std::time::Instant;
 
 use crate::repo::{Manifest, RepoIndex};
 
-/// Maximum failed auth attempts per IP before lockout.
+/// Maximum failed auth attempts per IP before first lockout.
 pub(crate) const MAX_AUTH_FAILURES: u32 = 5;
-/// Lockout duration after exceeding `MAX_AUTH_FAILURES`.
-pub(crate) const AUTH_LOCKOUT_SECS: u64 = 30;
-/// Maximum failed auth attempts across all IPs before global lockout.
-pub(crate) const MAX_GLOBAL_AUTH_FAILURES: u32 = 20;
+/// Base lockout duration in seconds (doubles on each subsequent violation tier).
+pub(crate) const BASE_LOCKOUT_SECS: u64 = 30;
+/// Maximum lockout duration in seconds (1 hour cap). Also the inactivity reset threshold.
+pub(crate) const MAX_LOCKOUT_SECS: u64 = 3600;
 /// Maximum upload body size (512 MB).
 pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 /// Maximum concurrent connections.
-pub(crate) const MAX_CONCURRENT: usize = 5;
+pub(crate) const MAX_CONCURRENT: usize = 20;
+/// Maximum concurrent connections per IP.
+pub(crate) const MAX_CONNECTIONS_PER_IP: u32 = 10;
+/// Prune auth failure map when it exceeds this many entries.
+const AUTH_MAP_MAX: usize = 128;
+/// Server-side request timeout in seconds (covers entire request lifecycle).
+pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,12 +67,18 @@ const fn default_port() -> u16 {
     53777
 }
 
+/// Per-IP auth failure tracking for exponential backoff.
+pub(crate) struct AuthFailure {
+    count: u32,
+    last_attempt: Instant,
+}
+
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
     pub users: Vec<UserEntry>,
     pub repo_path: PathBuf,
-    pub auth_failures: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
-    pub global_auth_failures: std::sync::Mutex<(u32, Instant)>,
+    pub auth_failures: std::sync::Mutex<HashMap<IpAddr, AuthFailure>>,
+    pub active_connections: std::sync::Mutex<HashMap<IpAddr, u32>>,
     pub log_file: std::sync::Mutex<Option<BufWriter<std::fs::File>>>,
 }
 
@@ -93,12 +105,21 @@ fn sanitize_io_error(err: &std::io::Error) -> String {
     }
 }
 
+/// Calculate lockout duration in seconds based on failure count.
+/// Doubles for each batch of `MAX_AUTH_FAILURES`: 30s, 60s, 120s, … capped at `MAX_LOCKOUT_SECS`.
+fn lockout_secs(count: u32) -> u64 {
+    if count < MAX_AUTH_FAILURES {
+        return 0;
+    }
+    let level = u64::from((count / MAX_AUTH_FAILURES) - 1);
+    (BASE_LOCKOUT_SECS << level.min(20)).min(MAX_LOCKOUT_SECS)
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/index", get(get_index))
         .route("/packages/{name}", get(get_versions))
         .route("/packages/{name}/{version}/{filename}", get(get_file))
-        // TODO: Security: consider per-IP rate limiting on uploads to prevent disk exhaustion
         .route(
             "/upload/{name}/{version}/{filename}",
             axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_SIZE)),
@@ -106,6 +127,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/packages/{name}/{version}", axum::routing::delete(delete_version))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::map_response(add_security_headers))
+        .layer(middleware::from_fn(request_timeout_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), per_ip_limit_middleware))
         .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT))
         .with_state(state)
 }
@@ -121,33 +144,26 @@ async fn auth_middleware(
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
 
-    // Check global rate limit (all IPs combined)
-    if let Ok(global) = state.global_auth_failures.lock()
-        && global.0 >= MAX_GLOBAL_AUTH_FAILURES
-        && global.1.elapsed().as_secs() < AUTH_LOCKOUT_SECS
-    {
-        state.log_entry(ip, &method, &path, 429, Some("global auth rate limit"));
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
-            "Too many failed attempts. Try again later.",
-        )
-            .into_response();
-    }
-
-    // Check per-IP rate limit
+    // Check per-IP rate limit with exponential backoff
     if let Ok(failures) = state.auth_failures.lock()
-        && let Some((count, last)) = failures.get(&ip)
-        && *count >= MAX_AUTH_FAILURES
-        && last.elapsed().as_secs() < AUTH_LOCKOUT_SECS
+        && let Some(entry) = failures.get(&ip)
     {
-        state.log_entry(ip, &method, &path, 429, Some("per-IP auth rate limit"));
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
-            "Too many failed attempts. Try again later.",
-        )
-            .into_response();
+        let lockout = lockout_secs(entry.count);
+        if lockout > 0 && entry.last_attempt.elapsed().as_secs() < lockout {
+            state.log_entry(
+                ip,
+                &method,
+                &path,
+                429,
+                Some(&format!("per-IP auth lockout ({lockout}s, {} failures)", entry.count)),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")],
+                "Too many failed attempts. Try again later.",
+            )
+                .into_response();
+        }
     }
 
     // Match credentials against users list
@@ -182,29 +198,80 @@ async fn auth_middleware(
         next.run(req).await
     } else {
         let count = if let Ok(mut failures) = state.auth_failures.lock() {
-            // Prune stale entries to prevent unbounded HashMap growth
-            if failures.len() > 1000 {
-                failures.retain(|_, (_, last)| last.elapsed().as_secs() < AUTH_LOCKOUT_SECS);
+            // Prune stale entries to bound HashMap size
+            if failures.len() > AUTH_MAP_MAX {
+                failures.retain(|_, entry| {
+                    let expiry = lockout_secs(entry.count).max(BASE_LOCKOUT_SECS);
+                    entry.last_attempt.elapsed().as_secs() < expiry
+                });
             }
-            let entry = failures.entry(ip).or_insert((0, Instant::now()));
-            if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
-                *entry = (0, Instant::now());
+            let entry = failures.entry(ip).or_insert(AuthFailure { count: 0, last_attempt: Instant::now() });
+            // Full reset after long inactivity
+            if entry.last_attempt.elapsed().as_secs() >= MAX_LOCKOUT_SECS {
+                entry.count = 0;
             }
-            entry.0 += 1;
-            entry.1 = Instant::now();
-            entry.0
+            entry.count += 1;
+            entry.last_attempt = Instant::now();
+            entry.count
         } else {
             0
         };
-        if let Ok(mut global) = state.global_auth_failures.lock() {
-            if global.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
-                *global = (0, Instant::now());
-            }
-            global.0 += 1;
-            global.1 = Instant::now();
-        }
-        state.log_entry(ip, &method, &path, 401, Some(&format!("auth failed ({count}/{MAX_AUTH_FAILURES})")));
+        let lockout = lockout_secs(count);
+        state.log_entry(
+            ip,
+            &method,
+            &path,
+            401,
+            Some(&format!("auth failed ({count}/{MAX_AUTH_FAILURES}, next lockout {lockout}s)")),
+        );
         (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"blob\"")], "Unauthorized").into_response()
+    }
+}
+
+/// Drop guard that decrements the per-IP connection counter on request completion or cancellation.
+struct IpConnectionGuard {
+    state: Arc<AppState>,
+    ip: IpAddr,
+}
+
+impl Drop for IpConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_connections.lock()
+            && let Some(count) = active.get_mut(&self.ip)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.ip);
+            }
+        }
+    }
+}
+
+async fn per_ip_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+
+    let _guard = {
+        let mut active = state.active_connections.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = active.entry(ip).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_IP {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many connections from this IP").into_response();
+        }
+        *count += 1;
+        IpConnectionGuard { state: Arc::clone(&state), ip }
+    };
+
+    next.run(req).await
+}
+
+async fn request_timeout_middleware(req: Request, next: Next) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response(),
     }
 }
 
@@ -258,7 +325,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         users: config.users,
         repo_path: config.repo,
         auth_failures: std::sync::Mutex::new(HashMap::new()),
-        global_auth_failures: std::sync::Mutex::new((0, Instant::now())),
+        active_connections: std::sync::Mutex::new(HashMap::new()),
         log_file,
     });
     let app = build_router(state);
@@ -428,11 +495,7 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
 
 /// Validate an uploaded manifest: parse JSON, check name match, validate paths/deps,
 /// and cross-validate against zip if present. Returns `Err((status_code, message))` on failure.
-async fn validate_uploaded_manifest(
-    manifest_path: &std::path::Path,
-    expected_name: &str,
-    package_dir: &std::path::Path,
-) -> Result<(), (u16, String)> {
+async fn validate_uploaded_manifest(manifest_path: &std::path::Path, expected_name: &str) -> Result<(), (u16, String)> {
     let data =
         tokio::fs::read(manifest_path).await.map_err(|e| (500, format!("read manifest: {}", sanitize_io_error(&e))))?;
     let manifest: Manifest = serde_json::from_slice(&data).map_err(|e| (400, format!("invalid manifest JSON: {e}")))?;
@@ -449,15 +512,27 @@ async fn validate_uploaded_manifest(
             return Err((400, format!("invalid dependency name: {dep}")));
         }
     }
-    // Cross-validate zip against manifest (manifest is always uploaded second)
-    let zip_path = package_dir.join("files.zip");
-    if zip_path.is_file() {
-        validate_zip_against_manifest(manifest_path, &zip_path)
-            .map_err(|e| (400, format!("zip/manifest mismatch: {e}")))?;
-    }
     Ok(())
 }
 
+/// Remove empty version and package directories after a failed upload.
+async fn cleanup_empty_package_dirs(version_dir: &std::path::Path, packages_root: &std::path::Path) {
+    if let Ok(mut entries) = tokio::fs::read_dir(version_dir).await
+        && entries.next_entry().await.ok().flatten().is_some()
+    {
+        return; // Not empty
+    }
+    let _ = tokio::fs::remove_dir(version_dir).await;
+    if let Some(parent) = version_dir.parent()
+        && parent != packages_root
+        && let Ok(mut entries) = tokio::fs::read_dir(parent).await
+        && entries.next_entry().await.ok().flatten().is_none()
+    {
+        let _ = tokio::fs::remove_dir(parent).await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn post_upload(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -488,6 +563,13 @@ async fn post_upload(
         state.log_entry(ip, "POST", &url_path, 400, Some("path traversal attempt"));
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    // For zip uploads, require manifest to be uploaded first
+    if filename == "files.zip" && !dir.join("manifest.json").is_file() {
+        state.log_entry(ip, "POST", &url_path, 400, Some("manifest.json must be uploaded before files.zip"));
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create dir failed: {}", sanitize_io_error(&e))));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -501,6 +583,7 @@ async fn post_upload(
         Ok(f) => f,
         Err(e) => {
             state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create temp file: {}", sanitize_io_error(&e))));
+            cleanup_empty_package_dirs(&dir, &canonical_packages).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -518,40 +601,60 @@ async fn post_upload(
                     Some(&format!("stream error after {bytes_written} bytes: {e}")),
                 );
                 let _ = tokio::fs::remove_file(&tmp_path).await;
+                cleanup_empty_package_dirs(&dir, &canonical_packages).await;
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
+        bytes_written += chunk.len() as u64;
+        if bytes_written > MAX_UPLOAD_SIZE as u64 {
+            state.log_entry(ip, "POST", &url_path, 413, Some(&format!("upload exceeds {MAX_UPLOAD_SIZE} byte limit")));
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            cleanup_empty_package_dirs(&dir, &canonical_packages).await;
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         if let Err(e) = tmp_file.write_all(&chunk).await {
             state.log_entry(ip, "POST", &url_path, 500, Some(&format!("write error: {}", sanitize_io_error(&e))));
             let _ = tokio::fs::remove_file(&tmp_path).await;
+            cleanup_empty_package_dirs(&dir, &canonical_packages).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-        bytes_written += chunk.len() as u64;
     }
     if let Err(e) = tmp_file.flush().await {
         state.log_entry(ip, "POST", &url_path, 500, Some(&format!("flush error: {}", sanitize_io_error(&e))));
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        cleanup_empty_package_dirs(&dir, &canonical_packages).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     drop(tmp_file);
 
     if filename == "manifest.json"
-        && let Err((status, msg)) = validate_uploaded_manifest(&tmp_path, &name, &dir).await
+        && let Err((status, msg)) = validate_uploaded_manifest(&tmp_path, &name).await
     {
         state.log_entry(ip, "POST", &url_path, status, Some(&msg));
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        cleanup_empty_package_dirs(&dir, &canonical_packages).await;
         return Err(if status < 500 { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR });
     }
 
     if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
         state.log_entry(ip, "POST", &url_path, 500, Some(&format!("rename failed: {}", sanitize_io_error(&e))));
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        cleanup_empty_package_dirs(&dir, &canonical_packages).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Cross-validate zip against manifest (zip is always uploaded after manifest)
+    if filename == "files.zip" {
+        let manifest_path = dir.join("manifest.json");
+        if let Err(e) = validate_zip_against_manifest(&manifest_path, &final_path) {
+            state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
     }
 
     state.log_entry(ip, "POST", &url_path, 201, Some(&format!("{bytes_written} bytes")));
 
-    // TODO: incremental index update instead of full rescan (scales poorly for large repos)
     if filename == "manifest.json"
         && let Ok(new_index) = RepoIndex::scan(&state.repo_path)
         && let Ok(mut index) = state.index.write()

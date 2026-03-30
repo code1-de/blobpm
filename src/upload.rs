@@ -276,7 +276,14 @@ pub fn upload(
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| io::Error::other(format!("JSON error: {e}")))?;
 
-    // Upload zip first (if any), then manifest (server updates index on manifest upload)
+    // Upload manifest first (server requires it before zip for cross-validation),
+    // then zip (server validates zip against manifest on upload).
+    let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);
+    let resp = http.post(&url, manifest_json.into_bytes())?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("Failed to upload manifest: {}", resp.status())));
+    }
+
     if !is_meta {
         let zip_data = create_package_zip(&sources)?;
         let url = format!("{}/upload/{name}/{version}/files.zip", http.config.server_url);
@@ -284,12 +291,6 @@ pub fn upload(
         if !resp.status().is_success() {
             return Err(io::Error::other(format!("Failed to upload zip: {}", resp.status())));
         }
-    }
-
-    let url = format!("{}/upload/{name}/{version}/manifest.json", http.config.server_url);
-    let resp = http.post(&url, manifest_json.into_bytes())?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!("Failed to upload manifest: {}", resp.status())));
     }
 
     println!("Uploaded {name}@{version}");

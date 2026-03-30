@@ -230,12 +230,14 @@ fn main() {
         install::MAX_ZIP_ENTRIES,
     );
     let serve_limits = format!(
-        "Limits:\n  Max upload size: {} MB\n  Max concurrent connections: {}\n  Auth lockout: {} failures per IP / {} global in {} seconds",
+        "Limits:\n  Max upload size: {} MB\n  Max concurrent connections: {} ({} per IP)\n  Auth lockout: {} failures per IP, exponential backoff {}s–{}s\n  Request timeout: {}s",
         server::MAX_UPLOAD_SIZE / 1024 / 1024,
         server::MAX_CONCURRENT,
+        server::MAX_CONNECTIONS_PER_IP,
         server::MAX_AUTH_FAILURES,
-        server::MAX_GLOBAL_AUTH_FAILURES,
-        server::AUTH_LOCKOUT_SECS,
+        server::BASE_LOCKOUT_SECS,
+        server::MAX_LOCKOUT_SECS,
+        server::REQUEST_TIMEOUT_SECS,
     );
     let upload_limits = format!(
         "Limits:\n  Max upload size: {} MB\n\nExit codes:\n  0  Success\n  1  Error\n  2  Version already exists (use --force to overwrite)",
