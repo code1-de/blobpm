@@ -3,7 +3,7 @@
 #[cfg(test)]
 pub mod helpers {
     use crate::repo::RepoIndex;
-    use crate::server::{self, AppState};
+    use crate::server::{self, AppState, UserEntry, UserRole};
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -14,22 +14,25 @@ pub mod helpers {
     pub const TEST_USER: &str = "test";
     pub const TEST_PASS: &str = "test";
 
-    /// Start a TLS test server with default test credentials.
+    /// Start a TLS test server with default test credentials (admin).
     pub fn start_tls_server(repo_path: &Path) -> (tokio::runtime::Runtime, u16, String) {
-        start_tls_server_with_auth(repo_path, (TEST_USER.to_string(), TEST_PASS.to_string()))
+        start_tls_server_with_users(
+            repo_path,
+            vec![UserEntry { username: TEST_USER.to_string(), password: TEST_PASS.to_string(), role: UserRole::Admin }],
+        )
     }
 
-    /// Start a TLS test server with specific auth credentials.
-    pub fn start_tls_server_with_auth(
+    /// Start a TLS test server with a specific users list.
+    pub fn start_tls_server_with_users(
         repo_path: &Path,
-        auth: (String, String),
+        users: Vec<UserEntry>,
     ) -> (tokio::runtime::Runtime, u16, String) {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let index = RepoIndex::scan(repo_path).unwrap();
         let state = Arc::new(AppState {
             index: std::sync::RwLock::new(index),
-            auth,
+            users,
             repo_path: repo_path.to_path_buf(),
             auth_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             global_auth_failures: std::sync::Mutex::new((0, std::time::Instant::now())),

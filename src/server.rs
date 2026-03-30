@@ -27,9 +27,43 @@ pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 /// Maximum concurrent connections.
 pub(crate) const MAX_CONCURRENT: usize = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    Reader,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct UserEntry {
+    pub username: String,
+    pub password: String,
+    pub role: UserRole,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServerConfig {
+    pub repo: PathBuf,
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
+    pub users: Vec<UserEntry>,
+}
+
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+const fn default_port() -> u16 {
+    53777
+}
+
 pub struct AppState {
     pub index: std::sync::RwLock<RepoIndex>,
-    pub auth: (String, String),
+    pub users: Vec<UserEntry>,
     pub repo_path: PathBuf,
     pub auth_failures: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
     pub global_auth_failures: std::sync::Mutex<(u32, Instant)>,
@@ -116,27 +150,34 @@ async fn auth_middleware(
             .into_response();
     }
 
-    let (expected_user, expected_pass) = &state.auth;
-
-    let authorized = req
+    // Match credentials against users list
+    let matched_role = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic "))
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .is_some_and(|creds| {
-            creds.split_once(':').is_some_and(|(u, p)| {
-                let u_ok = constant_time_eq::constant_time_eq(u.as_bytes(), expected_user.as_bytes());
-                let p_ok = constant_time_eq::constant_time_eq(p.as_bytes(), expected_pass.as_bytes());
-                u_ok & p_ok
+        .and_then(|creds| {
+            creds.split_once(':').and_then(|(u, p)| {
+                state.users.iter().find_map(|entry| {
+                    let u_ok = constant_time_eq::constant_time_eq(u.as_bytes(), entry.username.as_bytes());
+                    let p_ok = constant_time_eq::constant_time_eq(p.as_bytes(), entry.password.as_bytes());
+                    if u_ok & p_ok { Some(entry.role) } else { None }
+                })
             })
         });
 
-    if authorized {
+    if let Some(role) = matched_role {
         // Clear failures on successful auth
         if let Ok(mut failures) = state.auth_failures.lock() {
             failures.remove(&ip);
+        }
+        // Readers can only GET
+        let is_write = method != "GET";
+        if is_write && role == UserRole::Reader {
+            state.log_entry(ip, &method, &path, 403, Some("reader attempted write"));
+            return (StatusCode::FORBIDDEN, "Forbidden: read-only access").into_response();
         }
         next.run(req).await
     } else {
@@ -163,38 +204,41 @@ async fn auth_middleware(
     }
 }
 
-/// Start the server on the given port.
+/// Start the server from a config file.
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or run.
-pub async fn run(
-    repo_path: PathBuf,
-    bind: &str,
-    port: u16,
-    auth: (String, String),
-    log_path: Option<PathBuf>,
-) -> std::io::Result<()> {
-    if auth.0.is_empty() || auth.1.is_empty() {
+pub async fn run(config: ServerConfig) -> std::io::Result<()> {
+    if config.users.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Username and password must not be empty. Set via --username/--password or BLOB_USERNAME/BLOB_PASSWORD.",
+            "No users configured. Add at least one user to the config file.",
         ));
     }
+    for user in &config.users {
+        if user.username.is_empty() || user.password.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Username and password must not be empty (user: {:?}).", user.username),
+            ));
+        }
+    }
 
-    let index = RepoIndex::scan(&repo_path)?;
+    let index = RepoIndex::scan(&config.repo)?;
     let pkg_count = index.packages.len();
 
-    let bind_addr: std::net::IpAddr = bind
+    let bind_addr: std::net::IpAddr = config
+        .bind
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address: {e}")))?;
 
-    println!("Serving repo {} on https://{bind}:{port}", repo_path.display());
+    println!("Serving repo {} on https://{}:{}", config.repo.display(), config.bind, config.port);
 
-    let log_file = if let Some(path) = log_path {
+    let log_file = if let Some(path) = &config.log {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("Cannot open log file {}: {e}", path.display())))?;
         println!("Log file: {}", path.display());
         std::sync::Mutex::new(Some(BufWriter::new(file)))
@@ -202,10 +246,13 @@ pub async fn run(
         std::sync::Mutex::new(None)
     };
 
+    let admin_count = config.users.iter().filter(|u| u.role == UserRole::Admin).count();
+    let reader_count = config.users.len() - admin_count;
+
     let state = Arc::new(AppState {
         index: std::sync::RwLock::new(index),
-        auth,
-        repo_path,
+        users: config.users,
+        repo_path: config.repo,
         auth_failures: std::sync::Mutex::new(HashMap::new()),
         global_auth_failures: std::sync::Mutex::new((0, Instant::now())),
         log_file,
@@ -216,11 +263,10 @@ pub async fn run(
     let fingerprint = crate::tls::current_fingerprint()?;
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
-    let addr = SocketAddr::from((bind_addr, port));
+    let addr = SocketAddr::from((bind_addr, config.port));
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
-    // TODO: add structured logging with timestamps and audit trail for uploads/downloads
-    println!("Basic Auth: enabled");
+    println!("Users: {admin_count} admin, {reader_count} reader");
 
     axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
@@ -570,7 +616,10 @@ async fn delete_version(
 #[cfg(test)]
 mod tests {
     use super::sanitize_io_error;
-    use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server, tls_client_no_auth};
+    use crate::server::{UserEntry, UserRole};
+    use crate::testutil::helpers::{
+        TEST_PASS, TEST_USER, create_zip, start_tls_server, start_tls_server_with_users, tls_client_no_auth,
+    };
     use std::fs;
 
     fn create_test_repo(base: &std::path::Path) {
@@ -879,6 +928,63 @@ mod tests {
         // Windows reserved name
         let resp = auth_delete(&client, &format!("https://localhost:{port}/packages/CON/1.0"));
         assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn test_reader_can_get_but_not_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let users = vec![
+            UserEntry { username: "admin".to_string(), password: "adminpass".to_string(), role: UserRole::Admin },
+            UserEntry { username: "reader".to_string(), password: "readpass".to_string(), role: UserRole::Reader },
+        ];
+        let (_rt, port, fp) = start_tls_server_with_users(tmp.path(), users);
+        let client = tls_client_no_auth(&fp);
+
+        // Reader can GET
+        let resp = client
+            .get(format!("https://localhost:{port}/index"))
+            .basic_auth("reader", Some("readpass"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Reader cannot POST (upload)
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/pkg/1.0/manifest.json"))
+            .basic_auth("reader", Some("readpass"))
+            .body("{}")
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // Reader cannot DELETE
+        let resp = client
+            .delete(format!("https://localhost:{port}/packages/testpkg/1.0"))
+            .basic_auth("reader", Some("readpass"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+
+    #[test]
+    fn test_admin_can_post_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_repo(tmp.path());
+        let users = vec![
+            UserEntry { username: "admin".to_string(), password: "adminpass".to_string(), role: UserRole::Admin },
+            UserEntry { username: "reader".to_string(), password: "readpass".to_string(), role: UserRole::Reader },
+        ];
+        let (_rt, port, fp) = start_tls_server_with_users(tmp.path(), users);
+        let client = tls_client_no_auth(&fp);
+
+        // Admin can DELETE
+        let resp = client
+            .delete(format!("https://localhost:{port}/packages/testpkg/1.0"))
+            .basic_auth("admin", Some("adminpass"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[test]

@@ -136,29 +136,8 @@ enum Commands {
     },
     /// Run the package server
     Serve {
-        /// Path to the repository directory
-        #[arg(long)]
-        repo: PathBuf,
-
-        /// Address to bind to (default: 127.0.0.1, use 0.0.0.0 to expose to network)
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-
-        /// Port to listen on
-        #[arg(long, default_value = "53777")]
-        port: u16,
-
-        /// Username for Basic Auth
-        #[arg(long, env = "BLOB_USERNAME")]
-        username: String,
-
-        /// Password for Basic Auth
-        #[arg(long, env = "BLOB_PASSWORD")]
-        password: String,
-
-        /// Path to log file (appended to; if omitted, only stdout)
-        #[arg(long)]
-        log: Option<PathBuf>,
+        /// Path to server config file (JSON with repo, bind, port, log, users)
+        config: PathBuf,
     },
     /// Upload a package to the server
     ///
@@ -288,13 +267,13 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Serve { repo, bind, port, username, password, log } => {
-            if std::env::var("BLOB_PASSWORD").is_err() {
-                eprintln!("Warning: password passed via command line — visible in process listings.");
-                eprintln!("         Prefer setting BLOB_PASSWORD environment variable instead.");
-            }
+        Commands::Serve { config } => {
+            let content = std::fs::read_to_string(config)
+                .map_err(|e| format!("Cannot read server config {}: {e}", config.display()))?;
+            let server_config: server::ServerConfig = serde_json::from_str(&content)
+                .map_err(|e| format!("Invalid server config {}: {e}", config.display()))?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(repo.clone(), bind, *port, (username.clone(), password.clone()), log.clone()))?;
+            rt.block_on(server::run(server_config))?;
         }
         Commands::Install { names, force, no_cache, overwrite } => {
             let config = client::Config::load()?;
