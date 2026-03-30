@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -219,7 +220,7 @@ fn extract_zip(
             }
         }
 
-        let mut entry = archive
+        let entry = archive
             .by_name(file)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("File {file} not in zip for {name}: {e}")))?;
 
@@ -237,9 +238,11 @@ fn extract_zip(
             ));
         }
 
-        // Read entry into buffer (size already validated from zip header above)
-        let mut buf = Vec::new();
-        io::copy(&mut entry, &mut buf)?;
+        // Read entry with a size-limiting reader to prevent decompression bombs
+        let declared_size = entry.size();
+        let mut limited = entry.take(MAX_EXTRACT_SIZE + 1);
+        let mut buf = Vec::with_capacity(declared_size.min(MAX_EXTRACT_SIZE) as usize);
+        io::copy(&mut limited, &mut buf)?;
         if buf.len() as u64 > MAX_EXTRACT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

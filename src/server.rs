@@ -182,6 +182,10 @@ async fn auth_middleware(
         next.run(req).await
     } else {
         let count = if let Ok(mut failures) = state.auth_failures.lock() {
+            // Prune stale entries to prevent unbounded HashMap growth
+            if failures.len() > 1000 {
+                failures.retain(|_, (_, last)| last.elapsed().as_secs() < AUTH_LOCKOUT_SECS);
+            }
             let entry = failures.entry(ip).or_insert((0, Instant::now()));
             if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
                 *entry = (0, Instant::now());
@@ -474,27 +478,23 @@ async fn post_upload(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let dir = state.repo_path.join("packages").join(&name).join(&version);
+    // Canonicalize packages root first, then validate the target stays inside it
+    let Ok(canonical_packages) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
+        state.log_entry(ip, "POST", &url_path, 500, Some("canonicalize packages failed"));
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let dir = canonical_packages.join(&name).join(&version);
+    if !dir.starts_with(&canonical_packages) {
+        state.log_entry(ip, "POST", &url_path, 400, Some("path traversal attempt"));
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         state.log_entry(ip, "POST", &url_path, 500, Some(&format!("create dir failed: {}", sanitize_io_error(&e))));
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let Ok(canonical_dir) = tokio::fs::canonicalize(&dir).await else {
-        state.log_entry(ip, "POST", &url_path, 500, Some("canonicalize dir failed"));
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    let Ok(canonical_packages) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
-        state.log_entry(ip, "POST", &url_path, 500, Some("canonicalize packages failed"));
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    if !canonical_dir.starts_with(&canonical_packages) {
-        state.log_entry(ip, "POST", &url_path, 400, Some("path traversal attempt"));
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let final_path = canonical_dir.join(&filename);
-    let tmp_path = canonical_dir.join(format!(".{filename}.tmp"));
+    let final_path = dir.join(&filename);
+    let tmp_path = dir.join(format!(".{filename}.tmp"));
 
     // Stream body directly to temp file — avoids buffering large uploads in RAM
     let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
@@ -536,7 +536,7 @@ async fn post_upload(
     drop(tmp_file);
 
     if filename == "manifest.json"
-        && let Err((status, msg)) = validate_uploaded_manifest(&tmp_path, &name, &canonical_dir).await
+        && let Err((status, msg)) = validate_uploaded_manifest(&tmp_path, &name, &dir).await
     {
         state.log_entry(ip, "POST", &url_path, status, Some(&msg));
         let _ = tokio::fs::remove_file(&tmp_path).await;
