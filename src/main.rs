@@ -677,7 +677,7 @@ fn collect_files(
 
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
-        server_url: "https://localhost:53777".to_string(),
+        server_url: "https://lueders.io:53777".to_string(),
         base_dir: PathBuf::from("C:/"),
         username: String::new(),
         password: String::new(),
@@ -697,7 +697,10 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let cache_days_str = upload::prompt_line("Cache max age (days, 0=no cache)", &config.cache_days.to_string())?;
     let cache_days: u32 = cache_days_str.parse().unwrap_or(config.cache_days);
 
-    let base_dir = PathBuf::from(base_dir);
+    let base_dir = PathBuf::from(&base_dir);
+    if !base_dir.is_absolute() {
+        return Err(format!("Base directory must be an absolute path: {}", base_dir.display()).into());
+    }
     let base_dir = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
 
     // Path mappings
@@ -724,6 +727,10 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else if let Some((key, path)) = line.split_once('=') {
             let path = PathBuf::from(path.trim());
+            if !path.is_absolute() {
+                println!("  Path must be absolute: {}", path.display());
+                continue;
+            }
             let path = dunce::canonicalize(&path).unwrap_or(path);
             path_map.insert(key.trim().to_string(), path.clone());
             println!("  {} -> {}", key.trim(), path.display());
@@ -745,6 +752,21 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
 
     new_config.save()?;
     println!("\nConfig saved.");
+
+    // Offer to install blob itself from the server
+    let answer = upload::prompt_line("Install blob from the server?", "Y")?;
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        match client::HttpClient::new(&new_config, false) {
+            Ok(http) => {
+                let mut db = client::Database::load()?;
+                if let Err(e) = install::install("blob", None, false, false, false, &http, &mut db) {
+                    eprintln!("Could not install blob: {e}");
+                }
+            }
+            Err(e) => eprintln!("Could not connect to server: {e}"),
+        }
+    }
+
     Ok(())
 }
 
