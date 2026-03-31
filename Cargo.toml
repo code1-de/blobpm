@@ -2,6 +2,7 @@
 name = "blob"
 version = "1.7.5"
 edition = "2024"
+license = "MIT"
 publish = false
 
 [features]
