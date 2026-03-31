@@ -80,6 +80,7 @@ pub fn generate_keys(force: bool) -> io::Result<String> {
 ///
 /// # Errors
 /// Returns an error if cert generation or path resolution fails.
+#[cfg(feature = "server")]
 pub fn ensure_certs() -> io::Result<(PathBuf, PathBuf)> {
     let cert = cert_path()?;
     let key = key_path()?;
@@ -105,6 +106,7 @@ pub fn cert_fingerprint(der_bytes: &[u8]) -> String {
 ///
 /// # Errors
 /// Returns an error if the cert file cannot be read.
+#[cfg(feature = "server")]
 pub fn current_fingerprint() -> io::Result<String> {
     let cert = cert_path()?;
     let pem_data = fs::read(&cert)?;

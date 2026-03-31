@@ -22,8 +22,6 @@ pub(crate) const MAX_AUTH_FAILURES: u32 = 5;
 pub(crate) const BASE_LOCKOUT_SECS: u64 = 30;
 /// Maximum lockout duration in seconds (1 hour cap). Also the inactivity reset threshold.
 pub(crate) const MAX_LOCKOUT_SECS: u64 = 3600;
-/// Maximum upload body size (512 MB).
-pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 /// Maximum concurrent connections.
 pub(crate) const MAX_CONCURRENT: usize = 20;
 /// Maximum concurrent connections per IP.
@@ -122,7 +120,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/packages/{name}/{version}/{filename}", get(get_file))
         .route(
             "/upload/{name}/{version}/{filename}",
-            axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_SIZE)),
+            axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(crate::MAX_UPLOAD_SIZE)),
         )
         .route("/packages/{name}/{version}", axum::routing::delete(delete_version))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -606,8 +604,9 @@ async fn post_upload(
             }
         };
         bytes_written += chunk.len() as u64;
-        if bytes_written > MAX_UPLOAD_SIZE as u64 {
-            state.log_entry(ip, "POST", &url_path, 413, Some(&format!("upload exceeds {MAX_UPLOAD_SIZE} byte limit")));
+        if bytes_written > crate::MAX_UPLOAD_SIZE as u64 {
+            let max = crate::MAX_UPLOAD_SIZE;
+            state.log_entry(ip, "POST", &url_path, 413, Some(&format!("upload exceeds {max} byte limit")));
             let _ = tokio::fs::remove_file(&tmp_path).await;
             cleanup_empty_package_dirs(&dir, &canonical_packages).await;
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -720,8 +719,9 @@ async fn delete_version(
 mod tests {
     use super::sanitize_io_error;
     use crate::server::{UserEntry, UserRole};
-    use crate::testutil::helpers::{
-        TEST_PASS, TEST_USER, create_zip, start_tls_server, start_tls_server_with_users, tls_client_no_auth,
+    use crate::testutil::helpers::create_zip;
+    use crate::testutil::server_helpers::{
+        TEST_PASS, TEST_USER, start_tls_server, start_tls_server_with_users, tls_client_no_auth,
     };
     use std::fs;
 

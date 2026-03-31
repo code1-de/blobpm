@@ -1,18 +1,22 @@
 [package]
 name = "blob"
-version = "1.7.3"
+version = "1.7.4"
 edition = "2024"
 
+[features]
+default = ["server"]
+server = ["dep:axum", "dep:axum-server", "dep:tokio", "dep:tower", "dep:futures-util", "dep:chrono"]
+
 [dependencies]
-axum = { version = "0.8.8", features = ["tokio"] }
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum = { version = "0.8.8", features = ["tokio"], optional = true }
+axum-server = { version = "0.8.0", features = ["tls-rustls"], optional = true }
 base64 = "0.22.1"
+chrono = { version = "0.4", features = ["clock"], optional = true }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 constant_time_eq = "0.4.2"
 dirs = "6.0.0"
 dunce = "1.0.5"
-chrono = { version = "0.4", features = ["clock"] }
-futures-util = "0.3"
+futures-util = { version = "0.3", optional = true }
 glob = "0.3.3"
 indicatif = "0.17"
 pem = "3.0.6"
@@ -23,9 +27,9 @@ rustls = { version = "0.23.37", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
-tokio = { version = "1.50.0", features = ["full"] }
-tower = { version = "0.5", features = ["limit"] }
-zip = "8.3.1"
+tokio = { version = "1.50.0", features = ["full"], optional = true }
+tower = { version = "0.5", features = ["limit"], optional = true }
+zip = { version = "8.3.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

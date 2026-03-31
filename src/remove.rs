@@ -100,12 +100,13 @@ pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mu
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use crate::client::{Config, HttpClient};
     use crate::install::install;
-    use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server};
+    use crate::testutil::helpers::create_zip;
+    use crate::testutil::server_helpers::{TEST_PASS, TEST_USER, start_tls_server};
     use std::path::Path;
 
     fn create_test_repo(base: &Path) {

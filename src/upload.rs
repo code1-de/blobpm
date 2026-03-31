@@ -363,12 +363,12 @@ pub fn upload_interactive(
     upload(name, version, from, &mappings, &deps, existing_links, &description, force, lowercase, http)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use crate::client::{Config, Database};
     use crate::install::{fetch_index, install};
-    use crate::testutil::helpers::{TEST_PASS, TEST_USER, start_tls_server};
+    use crate::testutil::server_helpers::{TEST_PASS, TEST_USER, start_tls_server};
     use std::path::Path;
 
     fn test_config(port: u16, base_dir: &Path, fingerprint: &str) -> Config {

@@ -6,6 +6,7 @@ mod install;
 mod platform;
 mod remove;
 mod repo;
+#[cfg(feature = "server")]
 mod server;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod shim;
@@ -14,6 +15,9 @@ mod testutil;
 mod tls;
 mod upload;
 mod util;
+
+/// Maximum upload body size (512 MB). Shared between server enforcement and client help text.
+pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -135,6 +139,7 @@ enum Commands {
         days: Option<u32>,
     },
     /// Run the package server
+    #[cfg(feature = "server")]
     Serve {
         /// Path to server config file (JSON with repo, bind, port, log, users)
         config: PathBuf,
@@ -229,24 +234,27 @@ fn main() {
         install::MAX_TOTAL_EXTRACT_SIZE / 1024 / 1024 / 1024,
         install::MAX_ZIP_ENTRIES,
     );
-    let serve_limits = format!(
-        "Limits:\n  Max upload size: {} MB\n  Max concurrent connections: {} ({} per IP)\n  Auth lockout: {} failures per IP, exponential backoff {}s–{}s\n  Request timeout: {}s",
-        server::MAX_UPLOAD_SIZE / 1024 / 1024,
-        server::MAX_CONCURRENT,
-        server::MAX_CONNECTIONS_PER_IP,
-        server::MAX_AUTH_FAILURES,
-        server::BASE_LOCKOUT_SECS,
-        server::MAX_LOCKOUT_SECS,
-        server::REQUEST_TIMEOUT_SECS,
-    );
     let upload_limits = format!(
         "Limits:\n  Max upload size: {} MB\n\nExit codes:\n  0  Success\n  1  Error\n  2  Version already exists (use --force to overwrite)",
-        server::MAX_UPLOAD_SIZE / 1024 / 1024,
+        MAX_UPLOAD_SIZE / 1024 / 1024,
     );
     let cmd = Cli::command()
         .mut_subcommand("install", |c| c.after_help(install_limits))
-        .mut_subcommand("serve", |c| c.after_help(serve_limits))
         .mut_subcommand("upload", |c| c.after_help(upload_limits));
+    #[cfg(feature = "server")]
+    let cmd = {
+        let serve_limits = format!(
+            "Limits:\n  Max upload size: {} MB\n  Max concurrent connections: {} ({} per IP)\n  Auth lockout: {} failures per IP, exponential backoff {}s–{}s\n  Request timeout: {}s",
+            MAX_UPLOAD_SIZE / 1024 / 1024,
+            server::MAX_CONCURRENT,
+            server::MAX_CONNECTIONS_PER_IP,
+            server::MAX_AUTH_FAILURES,
+            server::BASE_LOCKOUT_SECS,
+            server::MAX_LOCKOUT_SECS,
+            server::REQUEST_TIMEOUT_SECS,
+        );
+        cmd.mut_subcommand("serve", |c| c.after_help(serve_limits))
+    };
     let cli = Cli::from_arg_matches(&cmd.get_matches()).expect("cli parse");
 
     if let Err(e) = run_command(&cli.command, cli.yes) {
@@ -269,6 +277,7 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        #[cfg(feature = "server")]
         Commands::Serve { config } => {
             let content = std::fs::read_to_string(config)
                 .map_err(|e| format!("Cannot read server config {}: {e}", config.display()))?;

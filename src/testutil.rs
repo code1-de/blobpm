@@ -1,10 +1,30 @@
-//! Shared test utilities for TLS server setup.
+//! Shared test utilities.
 
+/// Generic test helpers (always available).
 #[cfg(test)]
 pub mod helpers {
+    use std::fs;
+    use std::path::Path;
+
+    /// Create a files.zip in `dir` containing the given files.
+    pub fn create_zip(dir: &Path, files: &[(&str, &[u8])]) {
+        let zip_path = dir.join("files.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, content) in files {
+            zip.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut zip, content).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+}
+
+/// Server-dependent test helpers (TLS test server, auth constants).
+#[cfg(all(test, feature = "server"))]
+pub mod server_helpers {
     use crate::repo::RepoIndex;
     use crate::server::{self, AppState, UserEntry, UserRole};
-    use std::fs;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU16, Ordering};
@@ -89,18 +109,5 @@ pub mod helpers {
             .with_no_client_auth();
 
         reqwest::blocking::Client::builder().use_preconfigured_tls(tls_config).build().unwrap()
-    }
-
-    /// Create a files.zip in `dir` containing the given files.
-    pub fn create_zip(dir: &Path, files: &[(&str, &[u8])]) {
-        let zip_path = dir.join("files.zip");
-        let file = fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, content) in files {
-            zip.start_file(*name, options).unwrap();
-            std::io::Write::write_all(&mut zip, content).unwrap();
-        }
-        zip.finish().unwrap();
     }
 }

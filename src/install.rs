@@ -645,11 +645,16 @@ fn check_self_update() -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::client::{Config, Database, InstallReason};
-    use crate::remove::remove;
-    use crate::testutil::helpers::{TEST_PASS, TEST_USER, create_zip, start_tls_server};
+    use crate::testutil::helpers::create_zip;
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    #[cfg(feature = "server")]
+    use crate::remove::remove;
+    #[cfg(feature = "server")]
+    use crate::testutil::server_helpers::{TEST_PASS, TEST_USER, start_tls_server};
+
+    #[cfg(feature = "server")]
     fn create_test_repo(base: &Path) {
         let pkg_dir = base.join("packages").join("toolA").join("1.0");
         fs::create_dir_all(&pkg_dir).unwrap();
@@ -670,6 +675,7 @@ mod tests {
         create_zip(&pkg_dir2, &[("toolB.exe", b"toolB-binary")]);
     }
 
+    #[cfg(feature = "server")]
     fn test_config(port: u16, base_dir: &Path, fingerprint: &str) -> Config {
         Config {
             server_url: format!("https://localhost:{port}"),
@@ -696,238 +702,248 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fetch_index_from_server() {
-        let tmp = tempfile::tempdir().unwrap();
-        create_test_repo(tmp.path());
-        let (_rt, port, fp) = start_tls_server(tmp.path());
+    // --- Integration tests (require a running TLS server) ---
+    #[cfg(feature = "server")]
+    mod integration {
+        use super::*;
 
-        let config = test_config(port, Path::new(""), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let index = fetch_index(&http).unwrap();
-        assert_eq!(index["toolA"].latest, "1.0");
-        assert_eq!(index["toolB"].latest, "2.0");
-    }
+        #[test]
+        fn fetch_index_from_server() {
+            let tmp = tempfile::tempdir().unwrap();
+            create_test_repo(tmp.path());
+            let (_rt, port, fp) = start_tls_server(tmp.path());
 
-    #[test]
-    fn install_single_package() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            let config = test_config(port, Path::new(""), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let index = fetch_index(&http).unwrap();
+            assert_eq!(index["toolA"].latest, "1.0");
+            assert_eq!(index["toolB"].latest, "2.0");
+        }
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+        #[test]
+        fn install_single_package() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        install("toolA", None, false, false, false, &http, &mut db).unwrap();
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
-        assert_eq!(db.packages["toolA"].version, "1.0");
-    }
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
 
-    #[test]
-    fn install_with_dependency() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+            assert_eq!(db.packages["toolA"].version, "1.0");
+        }
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+        #[test]
+        fn install_with_dependency() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        install("toolB", None, false, false, false, &http, &mut db).unwrap();
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
-        assert!(install_tmp.path().join("util").join("toolB.exe").exists());
-        assert_eq!(db.packages.len(), 2);
-        assert_eq!(db.packages["toolA"].version, "1.0");
-        assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
-        assert_eq!(db.packages["toolB"].version, "2.0");
-        assert_eq!(db.packages["toolB"].reason, InstallReason::Manual);
-    }
+            install("toolB", None, false, false, false, &http, &mut db).unwrap();
 
-    #[test]
-    fn install_flips_auto_to_manual() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+            assert!(install_tmp.path().join("util").join("toolB.exe").exists());
+            assert_eq!(db.packages.len(), 2);
+            assert_eq!(db.packages["toolA"].version, "1.0");
+            assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
+            assert_eq!(db.packages["toolB"].version, "2.0");
+            assert_eq!(db.packages["toolB"].reason, InstallReason::Manual);
+        }
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+        #[test]
+        fn install_flips_auto_to_manual() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        install("toolB", None, false, false, false, &http, &mut db).unwrap();
-        assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        install("toolA", None, false, false, false, &http, &mut db).unwrap();
-        assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
-    }
+            install("toolB", None, false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolA"].reason, InstallReason::Auto);
 
-    /// Create a diamond-shaped dep tree: C and D both depend on B, B depends on A.
-    /// Also toolE v1.0 and v2.0 (v2 adds dep on A).
-    fn create_diamond_repo(base: &Path) {
-        for (name, ver, deps, file) in [
-            ("depA", "1.0", "[]", "depA.exe"),
-            ("depB", "1.0", r#"["depA"]"#, "depB.exe"),
-            ("depC", "1.0", r#"["depB"]"#, "depC.exe"),
-            ("depD", "1.0", r#"["depB"]"#, "depD.exe"),
-            ("toolE", "1.0", "[]", "toolE.exe"),
-            ("toolE", "2.0", r#"["depA"]"#, "toolE.exe"),
-        ] {
-            let dir = base.join("packages").join(name).join(ver);
-            fs::create_dir_all(&dir).unwrap();
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolA"].reason, InstallReason::Manual);
+        }
+
+        /// Create a diamond-shaped dep tree: C and D both depend on B, B depends on A.
+        /// Also toolE v1.0 and v2.0 (v2 adds dep on A).
+        fn create_diamond_repo(base: &Path) {
+            for (name, ver, deps, file) in [
+                ("depA", "1.0", "[]", "depA.exe"),
+                ("depB", "1.0", r#"["depA"]"#, "depB.exe"),
+                ("depC", "1.0", r#"["depB"]"#, "depC.exe"),
+                ("depD", "1.0", r#"["depB"]"#, "depD.exe"),
+                ("toolE", "1.0", "[]", "toolE.exe"),
+                ("toolE", "2.0", r#"["depA"]"#, "toolE.exe"),
+            ] {
+                let dir = base.join("packages").join(name).join(ver);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("manifest.json"),
+                    format!(
+                        r#"{{"name":"{name}","description":"","files":{{"{file}":"util/"}},"dependencies":{deps}}}"#
+                    ),
+                )
+                .unwrap();
+                create_zip(&dir, &[(file, format!("{name}-{ver}-binary").as_bytes())]);
+            }
+        }
+
+        #[test]
+        fn diamond_deps_installed_once() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_diamond_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            install("depC", None, false, false, false, &http, &mut db).unwrap();
+            install("depD", None, false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages.len(), 4);
+            assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
+            assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
+        }
+
+        #[test]
+        fn update_installs_new_deps() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_diamond_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages.len(), 1);
+
+            update(None, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolE"].version, "2.0");
+            assert!(db.packages.contains_key("depA"));
+        }
+
+        #[test]
+        fn dependency_cycle_detection() {
+            let tmp = tempfile::tempdir().unwrap();
+
+            let pkg_a = tmp.path().join("packages").join("cycleA").join("1.0");
+            fs::create_dir_all(&pkg_a).unwrap();
             fs::write(
-                dir.join("manifest.json"),
-                format!(r#"{{"name":"{name}","description":"","files":{{"{file}":"util/"}},"dependencies":{deps}}}"#),
+                pkg_a.join("manifest.json"),
+                r#"{"name":"cycleA","description":"A","files":{},"dependencies":["cycleB"]}"#,
             )
             .unwrap();
-            create_zip(&dir, &[(file, format!("{name}-{ver}-binary").as_bytes())]);
+
+            let pkg_b = tmp.path().join("packages").join("cycleB").join("1.0");
+            fs::create_dir_all(&pkg_b).unwrap();
+            fs::write(
+                pkg_b.join("manifest.json"),
+                r#"{"name":"cycleB","description":"B","files":{},"dependencies":["cycleA"]}"#,
+            )
+            .unwrap();
+
+            let (_rt, port, fp) = start_tls_server(tmp.path());
+
+            let config = test_config(port, Path::new(""), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let index = fetch_index(&http).unwrap();
+            let db = Database::load_from(Path::new("")).unwrap();
+            let result = resolve_dependencies("cycleA", "1.0", &http, &index, &db);
+            assert!(result.is_err());
         }
-    }
 
-    #[test]
-    fn diamond_deps_installed_once() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        #[test]
+        fn cache_reuse_skips_download() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        install("depC", None, false, false, false, &http, &mut db).unwrap();
-        install("depD", None, false, false, false, &http, &mut db).unwrap();
-        assert_eq!(db.packages.len(), 4);
-        assert_eq!(db.packages["depA"].reason, InstallReason::Auto);
-        assert_eq!(db.packages["depB"].reason, InstallReason::Auto);
-    }
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
+            let cache_path = install_tmp.path().join(".cache").join("toolA").join("1.0").join("files.zip");
+            assert!(cache_path.is_file());
 
-    #[test]
-    fn update_installs_new_deps() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_diamond_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            remove("toolA", false, false, false, &mut db).unwrap();
+            assert!(cache_path.is_file());
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
+            assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+        }
 
-        install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
-        assert_eq!(db.packages.len(), 1);
+        #[test]
+        fn download_all_before_install() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        update(None, false, false, &http, &mut db).unwrap();
-        assert_eq!(db.packages["toolE"].version, "2.0");
-        assert!(db.packages.contains_key("depA"));
-    }
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-    #[test]
-    fn dependency_cycle_detection() {
-        let tmp = tempfile::tempdir().unwrap();
+            install("toolB", None, false, false, false, &http, &mut db).unwrap();
+            let cache = install_tmp.path().join(".cache");
+            assert!(cache.join("toolA").join("1.0").join("files.zip").is_file());
+            assert!(cache.join("toolB").join("2.0").join("files.zip").is_file());
+            assert!(install_tmp.path().join("util").join("toolA.exe").exists());
+            assert!(install_tmp.path().join("util").join("toolB.exe").exists());
+        }
 
-        let pkg_a = tmp.path().join("packages").join("cycleA").join("1.0");
-        fs::create_dir_all(&pkg_a).unwrap();
-        fs::write(
-            pkg_a.join("manifest.json"),
-            r#"{"name":"cycleA","description":"A","files":{},"dependencies":["cycleB"]}"#,
-        )
-        .unwrap();
+        #[test]
+        fn failed_download_leaves_nothing_installed() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
 
-        let pkg_b = tmp.path().join("packages").join("cycleB").join("1.0");
-        fs::create_dir_all(&pkg_b).unwrap();
-        fs::write(
-            pkg_b.join("manifest.json"),
-            r#"{"name":"cycleB","description":"B","files":{},"dependencies":["cycleA"]}"#,
-        )
-        .unwrap();
+            let pkg_dir = repo_tmp.path().join("packages").join("missing_dep").join("1.0");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(
+                pkg_dir.join("manifest.json"),
+                r#"{"name":"missing_dep","description":"","files":{"x.exe":"util/"},"dependencies":["nonexistent"]}"#,
+            )
+            .unwrap();
+            create_zip(&pkg_dir, &[("x.exe", b"binary")]);
 
-        let (_rt, port, fp) = start_tls_server(tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        let config = test_config(port, Path::new(""), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let index = fetch_index(&http).unwrap();
-        let db = Database::load_from(Path::new("")).unwrap();
-        let result = resolve_dependencies("cycleA", "1.0", &http, &index, &db);
-        assert!(result.is_err());
-    }
+            let result = install("missing_dep", None, false, false, false, &http, &mut db);
+            assert!(result.is_err());
+            assert!(db.packages.is_empty());
+            assert!(!install_tmp.path().join("util").join("x.exe").exists());
+        }
+    } // mod integration
 
-    #[test]
-    fn cache_reuse_skips_download() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
-
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
-
-        install("toolA", None, false, false, false, &http, &mut db).unwrap();
-        let cache_path = install_tmp.path().join(".cache").join("toolA").join("1.0").join("files.zip");
-        assert!(cache_path.is_file());
-
-        remove("toolA", false, false, false, &mut db).unwrap();
-        assert!(cache_path.is_file());
-
-        install("toolA", None, false, false, false, &http, &mut db).unwrap();
-        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
-    }
-
-    #[test]
-    fn download_all_before_install() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_test_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
-
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
-
-        install("toolB", None, false, false, false, &http, &mut db).unwrap();
-        let cache = install_tmp.path().join(".cache");
-        assert!(cache.join("toolA").join("1.0").join("files.zip").is_file());
-        assert!(cache.join("toolB").join("2.0").join("files.zip").is_file());
-        assert!(install_tmp.path().join("util").join("toolA.exe").exists());
-        assert!(install_tmp.path().join("util").join("toolB.exe").exists());
-    }
-
-    #[test]
-    fn failed_download_leaves_nothing_installed() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-
-        let pkg_dir = repo_tmp.path().join("packages").join("missing_dep").join("1.0");
-        fs::create_dir_all(&pkg_dir).unwrap();
-        fs::write(
-            pkg_dir.join("manifest.json"),
-            r#"{"name":"missing_dep","description":"","files":{"x.exe":"util/"},"dependencies":["nonexistent"]}"#,
-        )
-        .unwrap();
-        create_zip(&pkg_dir, &[("x.exe", b"binary")]);
-
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
-
-        let result = install("missing_dep", None, false, false, false, &http, &mut db);
-        assert!(result.is_err());
-        assert!(db.packages.is_empty());
-        assert!(!install_tmp.path().join("util").join("x.exe").exists());
-    }
+    // --- Unit tests (no server needed) ---
 
     #[test]
     fn extract_zip_rejects_directory_entry() {
@@ -1194,42 +1210,47 @@ mod tests {
         assert!(check_conflicts(&to_install, &config, &db).is_ok());
     }
 
-    /// Create repo with toolA and a "conflict" package that places the same file (toolA.exe -> util/).
-    fn create_conflict_repo(base: &Path) {
-        create_test_repo(base);
-        let pkg_dir = base.join("packages").join("conflict").join("1.0");
-        fs::create_dir_all(&pkg_dir).unwrap();
-        fs::write(
-            pkg_dir.join("manifest.json"),
-            r#"{"name":"conflict","description":"","files":{"toolA.exe":"util/"},"dependencies":[]}"#,
-        )
-        .unwrap();
-        create_zip(&pkg_dir, &[("toolA.exe", b"conflict-binary")]);
-    }
+    #[cfg(feature = "server")]
+    mod integration_conflicts {
+        use super::*;
 
-    #[test]
-    fn overwrite_bypasses_conflict() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let install_tmp = tempfile::tempdir().unwrap();
-        let db_path = install_tmp.path().join("db.json");
-        create_conflict_repo(repo_tmp.path());
-        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        /// Create repo with toolA and a "conflict" package that places the same file (toolA.exe -> util/).
+        fn create_conflict_repo(base: &Path) {
+            create_test_repo(base);
+            let pkg_dir = base.join("packages").join("conflict").join("1.0");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(
+                pkg_dir.join("manifest.json"),
+                r#"{"name":"conflict","description":"","files":{"toolA.exe":"util/"},"dependencies":[]}"#,
+            )
+            .unwrap();
+            create_zip(&pkg_dir, &[("toolA.exe", b"conflict-binary")]);
+        }
 
-        let config = test_config(port, install_tmp.path(), &fp);
-        let http = HttpClient::new(&config, false).unwrap();
-        let mut db = Database::load_from(&db_path).unwrap();
+        #[test]
+        fn overwrite_bypasses_conflict() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_conflict_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
 
-        // Install toolA first
-        install("toolA", None, false, false, false, &http, &mut db).unwrap();
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
 
-        // Without --overwrite: should fail
-        let result = install("conflict", None, false, false, false, &http, &mut db);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("toolA"), "should mention owning package: {err}");
+            // Install toolA first
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
 
-        // With --overwrite: should succeed
-        install("conflict", None, false, false, true, &http, &mut db).unwrap();
-        assert!(db.packages.contains_key("conflict"));
+            // Without --overwrite: should fail
+            let result = install("conflict", None, false, false, false, &http, &mut db);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("toolA"), "should mention owning package: {err}");
+
+            // With --overwrite: should succeed
+            install("conflict", None, false, false, true, &http, &mut db).unwrap();
+            assert!(db.packages.contains_key("conflict"));
+        }
     }
 }
