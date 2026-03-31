@@ -561,7 +561,7 @@ fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Res
     } else {
         println!("  Files:");
         for (file, dest_dir) in &manifest.files {
-            let dest = config.resolve_dest(dest_dir).join(file);
+            let dest = config.resolve_dest(dest_dir).join(platform::to_native_path(file));
             println!("    {file} -> {}", dest.display());
         }
     }

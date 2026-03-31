@@ -70,8 +70,8 @@ pub fn search(
                     println!("  (meta-package)");
                 } else if let Some(cfg) = &config {
                     for (file, dest_dir) in &manifest.files {
-                        let dest = cfg.resolve_dest(dest_dir).join(file);
-                        println!("  {} -> {}", file, dest.display());
+                        let dest = cfg.resolve_dest(dest_dir).join(crate::platform::to_native_path(file));
+                        println!("  {file} -> {}", dest.display());
                     }
                 }
                 if !manifest.links.is_empty()

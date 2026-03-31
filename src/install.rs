@@ -181,7 +181,8 @@ fn extract_zip(
         validate_manifest_path(file, dest_dir, name)?;
 
         let resolved_dir = config.resolve_dest(dest_dir);
-        let dest = resolved_dir.join(file);
+        let native_file = crate::platform::to_native_path(file);
+        let dest = resolved_dir.join(&native_file);
 
         // Confinement check: the resolved root is either a mapped path or base_dir.
         // Ensure the final destination stays inside that root.
@@ -264,7 +265,7 @@ fn extract_zip(
             eprintln!("  Renamed old binary to {}; run `blob cleanup` later.", old_path.display());
         }
 
-        println!("  {} -> {}", file, dest.display());
+        println!("  {file} -> {}", dest.display());
         installed_files.insert(file.clone(), dest);
     }
 
