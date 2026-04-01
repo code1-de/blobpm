@@ -1,4 +1,4 @@
-# Blob
+# Blob Package Manager
 
 A user-mode package manager for Windows. One Rust binary that acts as both server and client. Manages portable tools (executables, libraries, scripts) across multiple machines without requiring admin privileges. Packages are zip files with a JSON manifest, uploaded to and downloaded from a self-hosted HTTPS server.
 
@@ -257,13 +257,19 @@ blob upload tool@1.0 "*.exe:bin" "*.dll:lib" "*.chm:doc"
 
 ### Version ordering
 
-Versions are compared segment by segment (split on `.`). Each segment: numeric part first, then suffix. Ordering for a given numeric value:
+Versions are dot-separated numeric segments with an optional qualifier (letter suffix or pre-release tag) that applies to the whole version. Trailing `.0` segments are ignored (`1.0` == `1.0.0`). Comparison is case-insensitive (`-BETA` == `-beta`).
+
+Ordering for a given base version:
 
 ```
-pre-release < letter suffix < no suffix < more segments
+pre-release (-alpha, -beta, -rc) < plain < letter suffix (a, b, c)
 
-Example: 1.9 < 1.10-beta < 1.10a < 1.10b < 1.10 < 1.10.1
+1.9 < 1.10-alpha < 1.10-beta < 1.10-beta2 < 1.10-beta12 < 1.10 < 1.10a < 1.10b < 1.10.1
 ```
+
+Pre-release numbers are compared numerically (`-beta2 < -beta12`), not lexicographically. Letter suffixes denote post-release patches (like OpenSSL's `1.0.1a`).
+
+On upload, versions are canonicalized: trailing `.0` segments are stripped and suffixes lowercased (`1.0.0-BETA` → `1-beta`). A warning is shown if the uploaded version is older than the existing latest.
 
 ### Module structure
 

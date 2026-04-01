@@ -19,14 +19,144 @@ pub struct IndexEntry {
     pub description: String,
 }
 
-// --- Server-only: repo scanning and version comparison ---
+// --- Version parsing and comparison (used by both client and server) ---
+
+/// A parsed version: numeric dot-separated segments plus a qualifier for the whole version.
+/// Trailing zeros are ignored: 1.0 == 1.0.0.
+/// The qualifier (letter suffix or pre-release tag) applies to the entire version, not per segment.
+///
+/// Examples:
+/// - "1.10"       -> segments [1, 10], Plain
+/// - "1.10a"      -> segments [1, 10], LetterSuffix("a")
+/// - "1.10-beta2" -> segments [1, 10], PreRelease("beta", 2)
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedVersion {
+    segments: Vec<u64>,
+    qualifier: VersionQualifier,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum VersionQualifier {
+    PreRelease { tag: String, num: u64 },
+    Plain,
+    LetterSuffix(String),
+}
+
+impl ParsedVersion {
+    fn parse(s: &str) -> Self {
+        // Split on '-' to detect pre-release (e.g. "1.10-beta2")
+        let (main, prerelease) = if let Some((m, p)) = s.split_once('-') { (m, Some(p)) } else { (s, None) };
+
+        let parts: Vec<&str> = main.split('.').collect();
+
+        if let Some(pre) = prerelease {
+            let segments = parts.iter().map(|p| p.parse().unwrap_or(0)).collect();
+            // Split tag into text + trailing number: "beta12" -> ("beta", 12)
+            let num_start = pre.find(|c: char| c.is_ascii_digit()).unwrap_or(pre.len());
+            let tag = pre[..num_start].to_lowercase();
+            let num = pre[num_start..].parse().unwrap_or(0);
+            Self { segments, qualifier: VersionQualifier::PreRelease { tag, num } }
+        } else {
+            // Check last part for trailing letter suffix (e.g. "1a" in "1.0.1a")
+            let last = parts.last().copied().unwrap_or("");
+            let num_end = last.find(|c: char| !c.is_ascii_digit()).unwrap_or(last.len());
+            let suffix = &last[num_end..];
+
+            let mut segments: Vec<u64> = parts[..parts.len() - 1].iter().map(|p| p.parse().unwrap_or(0)).collect();
+            segments.push(last[..num_end].parse().unwrap_or(0));
+
+            if suffix.is_empty() {
+                Self { segments, qualifier: VersionQualifier::Plain }
+            } else {
+                Self { segments, qualifier: VersionQualifier::LetterSuffix(suffix.to_lowercase()) }
+            }
+        }
+    }
+
+    /// Render back to a canonical version string.
+    /// Strips trailing zero segments, lowercases suffixes/tags.
+    fn to_canonical(&self) -> String {
+        use VersionQualifier::{LetterSuffix, Plain, PreRelease};
+
+        // Strip trailing zeros
+        let mut segs = self.segments.clone();
+        while segs.len() > 1 && segs.last() == Some(&0) {
+            segs.pop();
+        }
+
+        let base: String = segs.iter().map(u64::to_string).collect::<Vec<_>>().join(".");
+        match &self.qualifier {
+            Plain => base,
+            LetterSuffix(s) => format!("{base}{s}"),
+            PreRelease { tag, num } => {
+                if *num == 0 {
+                    format!("{base}-{tag}")
+                } else {
+                    format!("{base}-{tag}{num}")
+                }
+            }
+        }
+    }
+}
+
+impl Ord for ParsedVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use VersionQualifier::{LetterSuffix, Plain, PreRelease};
+
+        // Compare numeric segments, treating missing trailing segments as 0
+        let max_len = self.segments.len().max(other.segments.len());
+        for i in 0..max_len {
+            let a = self.segments.get(i).copied().unwrap_or(0);
+            let b = other.segments.get(i).copied().unwrap_or(0);
+            match a.cmp(&b) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        // Segments equal — compare qualifier: PreRelease < Plain < LetterSuffix
+        match (&self.qualifier, &other.qualifier) {
+            (Plain, Plain) => std::cmp::Ordering::Equal,
+            (PreRelease { tag: t1, num: n1 }, PreRelease { tag: t2, num: n2 }) => t1.cmp(t2).then(n1.cmp(n2)),
+            (LetterSuffix(a), LetterSuffix(b)) => a.cmp(b),
+            (PreRelease { .. }, Plain | LetterSuffix(_)) | (Plain, LetterSuffix(_)) => std::cmp::Ordering::Less,
+            (Plain | LetterSuffix(_), PreRelease { .. }) | (LetterSuffix(_), Plain) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for ParsedVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Compare two version strings.
+///
+/// Rules:
+/// - Dot-separated numeric segments, compared numerically (1.9 < 1.10)
+/// - Trailing zeros ignored (1.0 == 1.0.0)
+/// - Pre-release (1.10-beta) < plain (1.10) < letter suffix (1.10a)
+/// - Pre-release tags: name lexicographic, then number numeric (alpha < beta2 < beta12 < rc1)
+/// - Letter suffixes: lexicographic (1.10a < 1.10b)
+/// - Case insensitive: -BETA == -beta, 1.0A == 1.0a
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    ParsedVersion::parse(a).cmp(&ParsedVersion::parse(b))
+}
+
+/// Canonicalize a version string: strip trailing `.0` segments, lowercase suffixes/tags.
+/// Examples: "1.0.0" -> "1", "2.0-BETA" -> "2-beta", "1.10A" -> "1.10a"
+pub fn canonicalize_version(v: &str) -> String {
+    ParsedVersion::parse(v).to_canonical()
+}
+
+// --- Server-only: repo scanning ---
 
 #[cfg(feature = "server")]
 pub use server_only::*;
 
 #[cfg(feature = "server")]
 mod server_only {
-    use super::{BTreeMap, IndexEntry, Manifest};
+    use super::{BTreeMap, IndexEntry, Manifest, version_cmp};
     use std::path::Path;
     use std::{fs, io};
 
@@ -108,68 +238,6 @@ mod server_only {
         }
     }
 
-    /// A parsed version segment: numeric prefix, optional text suffix, optional pre-release tag.
-    /// Examples: "10" -> (10, "", false), "10a" -> (10, "a", false), "10-beta" -> (10, "beta", true)
-    #[derive(Debug, Eq, PartialEq)]
-    struct VersionSegment {
-        num: u64,
-        suffix: String,
-        is_prerelease: bool,
-    }
-
-    impl VersionSegment {
-        fn parse(s: &str) -> Self {
-            // Split on '-' first to detect pre-release
-            let (main, prerelease) = if let Some((m, p)) = s.split_once('-') { (m, Some(p)) } else { (s, None) };
-
-            // Extract leading digits and trailing text from main part
-            let num_end = main.find(|c: char| !c.is_ascii_digit()).unwrap_or(main.len());
-            let num = main[..num_end].parse().unwrap_or(0);
-            let suffix = if let Some(pre) = prerelease { pre.to_string() } else { main[num_end..].to_string() };
-
-            Self { num, suffix, is_prerelease: prerelease.is_some() }
-        }
-    }
-
-    impl Ord for VersionSegment {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            // Compare numeric part first
-            self.num.cmp(&other.num).then_with(|| {
-                // No suffix > any suffix (1.10 > 1.10a > 1.10-beta)
-                // Pre-release < letter suffix (1.10-beta < 1.10a)
-                match (self.suffix.is_empty(), other.suffix.is_empty()) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => match (self.is_prerelease, other.is_prerelease) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => self.suffix.cmp(&other.suffix),
-                    },
-                }
-            })
-        }
-    }
-
-    impl PartialOrd for VersionSegment {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    /// Compare two version strings segment by segment.
-    ///
-    /// Rules:
-    /// - Split on '.' into segments
-    /// - Each segment: numeric prefix compared numerically, then suffix
-    /// - No suffix (1.10) > letter suffix (1.10a) > pre-release (1.10-beta)
-    /// - Fewer segments < more segments if prefix is equal (1.0 < 1.0.1)
-    fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-        let a_parts: Vec<VersionSegment> = a.split('.').map(VersionSegment::parse).collect();
-        let b_parts: Vec<VersionSegment> = b.split('.').map(VersionSegment::parse).collect();
-        a_parts.cmp(&b_parts)
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -239,38 +307,103 @@ mod server_only {
             assert_eq!(summary["testpkg"].latest, "2.0");
             assert_eq!(summary["other"].latest, "0.1");
         }
+    }
+}
 
-        #[test]
-        fn version_ordering_basic() {
-            assert_eq!(version_cmp("1.0", "2.0"), std::cmp::Ordering::Less);
-            assert_eq!(version_cmp("1.9", "1.10"), std::cmp::Ordering::Less);
-            assert_eq!(version_cmp("2.0", "2.0"), std::cmp::Ordering::Equal);
-            assert_eq!(version_cmp("1.0", "1.0.1"), std::cmp::Ordering::Less);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        #[test]
-        fn version_ordering_suffixes() {
-            // No suffix > letter suffix
-            assert_eq!(version_cmp("1.10", "1.10a"), std::cmp::Ordering::Greater);
-            assert_eq!(version_cmp("1.10a", "1.10b"), std::cmp::Ordering::Less);
-        }
+    #[test]
+    fn version_ordering_basic() {
+        assert_eq!(version_cmp("1.0", "2.0"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.9", "1.10"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("2.0", "2.0"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0", "1.0.1"), std::cmp::Ordering::Less);
+        // Trailing zeros are irrelevant
+        assert_eq!(version_cmp("1.0", "1.0.0"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1", "1.0.0.0"), std::cmp::Ordering::Equal);
+    }
 
-        #[test]
-        fn version_ordering_prerelease() {
-            // No suffix > pre-release
-            assert_eq!(version_cmp("1.10", "1.10-beta"), std::cmp::Ordering::Greater);
-            assert_eq!(version_cmp("1.10-alpha", "1.10-beta"), std::cmp::Ordering::Less);
-            assert_eq!(version_cmp("1.10-beta", "1.10"), std::cmp::Ordering::Less);
-            // Letter suffix > pre-release
-            assert_eq!(version_cmp("1.10a", "1.10-beta"), std::cmp::Ordering::Greater);
-        }
+    #[test]
+    fn version_ordering_suffixes() {
+        // Letter suffix > no suffix (1.10 < 1.10a, like OpenSSL)
+        assert_eq!(version_cmp("1.10", "1.10a"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10a", "1.10b"), std::cmp::Ordering::Less);
+        // Letter suffix < next dot-release
+        assert_eq!(version_cmp("1.10a", "1.10.1"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.0.1a", "1.0.1b"), std::cmp::Ordering::Less);
+    }
 
-        #[test]
-        fn version_ordering_mixed() {
-            // 1.9 < 1.10-beta < 1.10a < 1.10b < 1.10 < 1.10.1
-            let mut versions = vec!["1.10b", "1.10-beta", "1.9", "1.10.1", "1.10", "1.10a"];
-            versions.sort_by(|a, b| version_cmp(a, b));
-            assert_eq!(versions, vec!["1.9", "1.10-beta", "1.10a", "1.10b", "1.10", "1.10.1"]);
-        }
+    #[test]
+    fn version_ordering_prerelease() {
+        // Pre-release < no suffix
+        assert_eq!(version_cmp("1.10-beta", "1.10"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10", "1.10-beta"), std::cmp::Ordering::Greater);
+        // Pre-release tags ordered lexicographically
+        assert_eq!(version_cmp("1.10-alpha", "1.10-beta"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-beta", "1.10-rc"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-alpha", "1.10-rc"), std::cmp::Ordering::Less);
+        // Letter suffix > pre-release
+        assert_eq!(version_cmp("1.10a", "1.10-beta"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn version_ordering_prerelease_numbers() {
+        // Numeric suffixes on pre-release tags compared numerically
+        assert_eq!(version_cmp("1.10-beta", "1.10-beta2"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-beta2", "1.10-beta12"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-rc1", "1.10-rc2"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-alpha3", "1.10-beta"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("1.10-rc12", "1.10"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn version_ordering_case_insensitive() {
+        assert_eq!(version_cmp("1.0-BETA", "1.0-beta"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0A", "1.0a"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0-RC1", "1.0-rc1"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn version_ordering_mixed() {
+        // 1.9 < 1.10-beta < 1.10-beta2 < 1.10-beta12 < 1.10 < 1.10a < 1.10b < 1.10.1
+        let mut versions = vec!["1.10b", "1.10-beta", "1.9", "1.10.1", "1.10", "1.10a", "1.10-beta2", "1.10-beta12"];
+        versions.sort_by(|a, b| version_cmp(a, b));
+        assert_eq!(versions, vec!["1.9", "1.10-beta", "1.10-beta2", "1.10-beta12", "1.10", "1.10a", "1.10b", "1.10.1"]);
+    }
+
+    #[test]
+    fn canonicalize_strips_trailing_zeros() {
+        assert_eq!(canonicalize_version("1.0.0"), "1");
+        assert_eq!(canonicalize_version("1.0"), "1");
+        assert_eq!(canonicalize_version("2.1.0"), "2.1");
+        assert_eq!(canonicalize_version("1.0.1"), "1.0.1");
+        assert_eq!(canonicalize_version("0"), "0");
+    }
+
+    #[test]
+    fn canonicalize_lowercases() {
+        assert_eq!(canonicalize_version("1.0-BETA"), "1-beta");
+        assert_eq!(canonicalize_version("2.0-RC1"), "2-rc1");
+        assert_eq!(canonicalize_version("1.10A"), "1.10a");
+        assert_eq!(canonicalize_version("1.0.0-Beta2"), "1-beta2");
+    }
+
+    #[test]
+    fn canonicalize_qualifier_with_trailing_zeros() {
+        assert_eq!(canonicalize_version("1.0.0a"), "1a");
+        assert_eq!(canonicalize_version("2.0.0-beta3"), "2-beta3");
+        assert_eq!(canonicalize_version("1.0.0-rc"), "1-rc");
+        assert_eq!(canonicalize_version("3.0b"), "3b");
+    }
+
+    #[test]
+    fn canonical_and_non_canonical_compare_equal() {
+        assert_eq!(version_cmp("1.0.0", "1"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0.0a", "1a"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0.0-beta", "1-beta"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("2.0.0-RC1", "2-rc1"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("1.0.0-Beta2", "1-BETA2"), std::cmp::Ordering::Equal);
     }
 }

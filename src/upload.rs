@@ -4,8 +4,7 @@ use std::{fs, io};
 
 use crate::client::{HttpClient, validate_pkg_spec};
 use crate::install::{fetch_index, fetch_versions};
-use crate::repo::IndexEntry;
-use crate::repo::Manifest;
+use crate::repo::{IndexEntry, Manifest, canonicalize_version, version_cmp};
 
 /// Extract the non-glob base directory from a glob pattern.
 /// E.g. `C:\bin\git64\**` → `C:\bin\git64`, `C:\tools\*.exe` → `C:\tools`.
@@ -215,20 +214,24 @@ pub fn upload(
     lowercase: bool,
     http: &HttpClient,
 ) -> io::Result<()> {
+    let version = &canonicalize_version(version);
     validate_pkg_spec("package name", name)?;
     validate_pkg_spec("version", version)?;
     for dep in deps {
         validate_pkg_spec("dependency", dep)?;
     }
-    // Check if version already exists on server
-    if !force {
-        let versions = fetch_versions(http, name).unwrap_or_default();
-        if versions.contains(&version.to_string()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{name}@{version} already exists on server. Use --force to overwrite."),
-            ));
-        }
+    // Check if version already exists on server, warn if uploading an older version
+    let existing_versions = fetch_versions(http, name).unwrap_or_default();
+    if !force && existing_versions.contains(&version.clone()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{name}@{version} already exists on server. Use --force to overwrite."),
+        ));
+    }
+    if let Some(latest) = existing_versions.iter().max_by(|a, b| version_cmp(a, b))
+        && version_cmp(version, latest) == std::cmp::Ordering::Less
+    {
+        eprintln!("Warning: {name}@{version} is older than existing latest {name}@{latest}");
     }
 
     let (files, sources) = if mappings.is_empty() {
@@ -413,7 +416,7 @@ mod tests {
         .unwrap();
 
         let index = fetch_index(&http).unwrap();
-        assert_eq!(index["newtool"].latest, "1.0");
+        assert_eq!(index["newtool"].latest, "1");
 
         let mut db = Database::load_from(&db_path).unwrap();
         install("newtool", None, false, false, false, &http, &mut db).unwrap();
@@ -450,7 +453,7 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = crate::install::fetch_manifest(&http, "grouped", "1.0").unwrap();
+        let manifest = crate::install::fetch_manifest(&http, "grouped", "1").unwrap();
         assert_eq!(manifest.files["a.exe"], "bin");
         assert_eq!(manifest.files["b.dll"], "bin");
         assert_eq!(manifest.files["c.txt"], "doc");
@@ -472,7 +475,7 @@ mod tests {
         upload("lc-literal", "1.0", src_tmp.path(), &["MyTool.EXE:bin".to_string()], &[], &[], "", false, true, &http)
             .unwrap();
 
-        let manifest = crate::install::fetch_manifest(&http, "lc-literal", "1.0").unwrap();
+        let manifest = crate::install::fetch_manifest(&http, "lc-literal", "1").unwrap();
         assert!(
             manifest.files.contains_key("mytool.exe"),
             "expected lowercase: {:?}",
@@ -509,7 +512,7 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = crate::install::fetch_manifest(&http, "lc-glob", "1.0").unwrap();
+        let manifest = crate::install::fetch_manifest(&http, "lc-glob", "1").unwrap();
         assert!(
             manifest.files.contains_key("helper.dll"),
             "expected lowercase: {:?}",
@@ -550,7 +553,7 @@ mod tests {
         .unwrap();
 
         // Read the manifest back and verify forward slashes
-        let manifest = crate::install::fetch_manifest(&http, "slashtest", "1.0").unwrap();
+        let manifest = crate::install::fetch_manifest(&http, "slashtest", "1").unwrap();
         let dest = manifest.files.get("tool.exe").unwrap();
         assert!(!dest.contains('\\'), "manifest dest should use / not \\: {dest}");
         assert_eq!(dest, "sub/dir/");
@@ -571,8 +574,60 @@ mod tests {
         upload("fwdtest", "1.0", src_tmp.path(), &["*.dll:lib/native/".to_string()], &[], &[], "", false, false, &http)
             .unwrap();
 
-        let manifest = crate::install::fetch_manifest(&http, "fwdtest", "1.0").unwrap();
+        let manifest = crate::install::fetch_manifest(&http, "fwdtest", "1").unwrap();
         let dest = manifest.files.get("lib.dll").unwrap();
         assert_eq!(dest, "lib/native/");
+    }
+
+    #[test]
+    fn upload_older_version_succeeds_with_warning() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+
+        fs::write(src_tmp.path().join("tool.exe"), b"binary").unwrap();
+
+        // Upload v2 first
+        upload("oldtest", "2.0", src_tmp.path(), &["*.exe:bin".to_string()], &[], &[], "", false, false, &http)
+            .unwrap();
+
+        // Upload v1 — should succeed (just warns to stderr)
+        upload("oldtest", "1.0", src_tmp.path(), &["*.exe:bin".to_string()], &[], &[], "", false, false, &http)
+            .unwrap();
+
+        // Both versions exist
+        let versions = fetch_versions(&http, "oldtest").unwrap();
+        assert!(versions.contains(&"2".to_string()));
+        assert!(versions.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn upload_canonicalizes_version() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+
+        fs::write(src_tmp.path().join("tool.exe"), b"binary").unwrap();
+
+        // Upload with non-canonical version
+        upload("canon", "1.0.0", src_tmp.path(), &["*.exe:bin".to_string()], &[], &[], "", false, false, &http)
+            .unwrap();
+
+        // Server stores the canonical version
+        let index = fetch_index(&http).unwrap();
+        assert_eq!(index["canon"].latest, "1");
+
+        // Re-uploading the canonical form is a duplicate
+        let err = upload("canon", "1", src_tmp.path(), &["*.exe:bin".to_string()], &[], &[], "", false, false, &http)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 }

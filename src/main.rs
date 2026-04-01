@@ -232,25 +232,14 @@ fn grouped_help_template(cmd: &clap::Command) -> String {
     use std::fmt::Write;
 
     let groups: &[(&str, &[&str])] = &[
-        (
-            "Package Commands",
-            &["install", "remove", "update", "list", "search", "info", "status"],
-        ),
-        (
-            "Maintenance",
-            &["config", "manual", "purge", "cleanup", "clean-cache"],
-        ),
+        ("Package Commands", &["install", "remove", "update", "list", "search", "info", "status"]),
+        ("Maintenance", &["config", "manual", "purge", "cleanup", "clean-cache"]),
         ("Admin Commands", &["upload", "delete"]),
         ("Server", &["serve", "generate-keys"]),
     ];
 
     // Max command name length for column alignment
-    let max_len = cmd
-        .get_subcommands()
-        .filter(|s| !s.is_hide_set())
-        .map(|s| s.get_name().len())
-        .max()
-        .unwrap_or(0);
+    let max_len = cmd.get_subcommands().filter(|s| !s.is_hide_set()).map(|s| s.get_name().len()).max().unwrap_or(0);
 
     let mut seen = HashSet::new();
     let mut sections = String::new();
@@ -287,9 +276,7 @@ fn grouped_help_template(cmd: &clap::Command) -> String {
         let _ = write!(sections, "\nOther:\n{other}");
     }
 
-    format!(
-        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n{sections}\nOptions:\n{{options}}"
-    )
+    format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n{sections}\nOptions:\n{{options}}")
 }
 
 fn main() {
