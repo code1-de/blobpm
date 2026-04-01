@@ -31,7 +31,7 @@ struct Cli {
     yes: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -226,6 +226,72 @@ enum Commands {
     },
 }
 
+/// Build a help template with subcommands grouped into logical sections.
+fn grouped_help_template(cmd: &clap::Command) -> String {
+    use std::collections::HashSet;
+    use std::fmt::Write;
+
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "Package Commands",
+            &["install", "remove", "update", "list", "search", "info", "status"],
+        ),
+        (
+            "Maintenance",
+            &["config", "manual", "purge", "cleanup", "clean-cache"],
+        ),
+        ("Admin Commands", &["upload", "delete"]),
+        ("Server", &["serve", "generate-keys"]),
+    ];
+
+    // Max command name length for column alignment
+    let max_len = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(|s| s.get_name().len())
+        .max()
+        .unwrap_or(0);
+
+    let mut seen = HashSet::new();
+    let mut sections = String::new();
+
+    for (heading, names) in groups {
+        let mut group = String::new();
+        for name in *names {
+            if let Some(sub) = cmd.find_subcommand(name) {
+                seen.insert(*name);
+                let about = sub.get_about().map_or_else(String::new, ToString::to_string);
+                let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+                if aliases.is_empty() {
+                    let _ = writeln!(group, "  {name:<max_len$}  {about}");
+                } else {
+                    let _ = writeln!(group, "  {name:<max_len$}  {about} [aliases: {}]", aliases.join(", "));
+                }
+            }
+        }
+        if !group.is_empty() {
+            let _ = write!(sections, "\n{heading}:\n{group}");
+        }
+    }
+
+    // Catch ungrouped subcommands so new commands aren't silently hidden
+    let mut other = String::new();
+    for sub in cmd.get_subcommands() {
+        let name = sub.get_name();
+        if !seen.contains(name) && !sub.is_hide_set() && name != "help" {
+            let about = sub.get_about().map_or_else(String::new, ToString::to_string);
+            let _ = writeln!(other, "  {name:<max_len$}  {about}");
+        }
+    }
+    if !other.is_empty() {
+        let _ = write!(sections, "\nOther:\n{other}");
+    }
+
+    format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n{sections}\nOptions:\n{{options}}"
+    )
+}
+
 fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let install_limits = format!(
@@ -255,9 +321,16 @@ fn main() {
         );
         cmd.mut_subcommand("serve", |c| c.after_help(serve_limits))
     };
+    let template = grouped_help_template(&cmd);
+    let cmd = cmd.help_template(template);
     let cli = Cli::from_arg_matches(&cmd.get_matches()).expect("cli parse");
 
-    if let Err(e) = run_command(&cli.command, cli.yes) {
+    let Some(command) = cli.command else {
+        eprintln!("Usage: blob <COMMAND> [OPTIONS]\nTry 'blob --help' for more information.");
+        std::process::exit(2);
+    };
+
+    if let Err(e) = run_command(&command, cli.yes) {
         let msg = e.to_string();
         if let Some((first, rest)) = msg.split_once('\n') {
             eprintln!("{}\n{rest}", util::red(&format!("Error: {first}")));
