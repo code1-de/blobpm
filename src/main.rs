@@ -727,7 +727,7 @@ fn collect_files(
 
 fn run_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = client::Config::load().unwrap_or_else(|_| client::Config {
-        server_url: "https://lueders.io:53777".to_string(),
+        server_url: "https://localhost:53777".to_string(),
         base_dir: PathBuf::from("C:/"),
         username: String::new(),
         password: String::new(),

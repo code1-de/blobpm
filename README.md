@@ -1,6 +1,15 @@
 # Blob Package Manager
 
-A user-mode package manager for Windows. One Rust binary that acts as both server and client. Manages portable tools (executables, libraries, scripts) across multiple machines without requiring admin privileges. Packages are zip files with a JSON manifest, uploaded to and downloaded from a self-hosted HTTPS server.
+## Why Another Package Manager?
+
+The honest answer is: I wanted to have one, and I wanted to build it myself in Rust, using an AI coding agent (Claude Code). That said, it has several design principles that I think other package managers don't have:
+
+- **Single executable.** One binary contains all client and server code. You can carry around this one executable and connect to your repository of programs.
+- **Easy self-hosting.** All you need is a machine reachable via TCP/IP. No Apache, git, or nuget needed; batteries included.
+- **Flat installation.** Multiple packages can be installed into the same directory. This was important to me because I have one directory with assorted utility programs collected over the years. I didn't want hardlinks, symlinks, or shims — just the proper executables, directly there.
+- **Shims when needed.** For larger tools you can still use shims. For example, IrfanView can live in its own directory with all its files, while a small shim in the utility directory calls the actual `i_view64.exe`, thus allowing it to find its other files.
+- **Simple security like SSH.** On first connection you approve the server's certificate fingerprint and henceforth trust that connection. On the server side, you don't need anything but a self-signed certificate, which the server executable generates on first use.
+- **Simple uploads.** A single command-line call uploads a file, a set of files, or a whole directory tree to the server and creates the matching manifest automatically.
 
 ## Features
 
