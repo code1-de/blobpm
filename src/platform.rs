@@ -186,13 +186,10 @@ fn rename_with_blob_suffix(path: &Path) -> io::Result<std::path::PathBuf> {
 #[cfg(windows)]
 fn move_file_on_reboot(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
     use windows::core::PCWSTR;
 
-    let wide: Vec<u16> = path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     unsafe { MoveFileExW(PCWSTR(wide.as_ptr()), None, MOVEFILE_DELAY_UNTIL_REBOOT) }.is_ok()
 }
 
@@ -314,10 +311,7 @@ pub(crate) fn spawn_self_cleanup(blob_dir: &Path, old_exe: &Path) -> io::Result<
     // Re-open with FILE_EXECUTE + DELETE_ON_CLOSE — file auto-deletes when all handles close.
     // Handle intentionally leaked — closes when this process exits, triggering deletion
     // after the spawned cleanup process has also exited.
-    let wide_path: Vec<u16> = tmp_path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide_path: Vec<u16> = tmp_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let _delete_handle = unsafe {
         CreateFileW(
             PCWSTR(wide_path.as_ptr()),
@@ -344,7 +338,9 @@ pub(crate) fn spawn_self_cleanup(blob_dir: &Path, old_exe: &Path) -> io::Result<
 
     let mut si = STARTUPINFOW::default();
     #[allow(clippy::cast_possible_truncation)] // STARTUPINFOW size always fits in u32
-    { si.cb = std::mem::size_of_val(&si) as u32; }
+    {
+        si.cb = std::mem::size_of_val(&si) as u32;
+    }
     let mut pi = PROCESS_INFORMATION::default();
 
     unsafe {

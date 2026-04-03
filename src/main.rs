@@ -588,9 +588,10 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
 }
 
 /// Parse `name@version` into (name, Some(version)) or (name, None).
+/// Versions are canonicalized (trailing `.0` stripped, lowercased) to match server storage.
 fn parse_package_spec(spec: &str) -> (String, Option<String>) {
     if let Some((name, version)) = spec.split_once('@') {
-        (name.to_string(), Some(version.to_string()))
+        (name.to_string(), Some(repo::canonicalize_version(version)))
     } else {
         (spec.to_string(), None)
     }
@@ -643,16 +644,18 @@ fn run_status(
     show_missing: bool,
     max_depth: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     let dir = dunce::canonicalize(dir).map_err(|e| format!("Cannot access {}: {e}", dir.display()))?;
 
-    // Build reverse map: canonical file path -> "pkg version"
-    let mut owned: BTreeMap<PathBuf, String> = BTreeMap::new();
+    // Build reverse map: normalized file path -> (original path, "pkg version")
+    // Normalized keys ensure case-insensitive matching on Windows.
+    let mut owned: HashMap<String, (PathBuf, String)> = HashMap::new();
     for (pkg_name, pkg) in &db.packages {
         let label = format!("{pkg_name} {}", pkg.version);
         for dest_path in pkg.files.values() {
-            owned.insert(dest_path.clone(), label.clone());
+            let key = platform::normalize_for_compare(dest_path);
+            owned.insert(key, (dest_path.clone(), label.clone()));
         }
     }
 
@@ -669,10 +672,12 @@ fn run_status(
     let mut managed = 0u32;
     let mut unmanaged = 0u32;
     let mut missing_count = 0u32;
-    let entries_set: std::collections::HashSet<&PathBuf> = entries.iter().collect();
+    let entries_normalized: std::collections::HashSet<String> =
+        entries.iter().map(|p| platform::normalize_for_compare(p)).collect();
     for path in &entries {
         let display = path.strip_prefix(&dir).unwrap_or(path);
-        if let Some(label) = owned.get(path) {
+        let key = platform::normalize_for_compare(path);
+        if let Some((_, label)) = owned.get(&key) {
             println!("  {:<50} [{label}]", display.display());
             managed += 1;
         } else {
@@ -685,8 +690,9 @@ fn run_status(
 
     // Show files that should be under this dir but are missing from disk
     if show_missing {
-        for (path, label) in &owned {
-            if path.starts_with(&dir) && !entries_set.contains(path) {
+        let dir_key = platform::normalize_for_compare(&dir);
+        for (key, (path, label)) in &owned {
+            if key.starts_with(&dir_key) && !entries_normalized.contains(key) {
                 let display = path.strip_prefix(&dir).unwrap_or(path);
                 println!("! {:<50} [{label}]", display.display());
                 missing_count += 1;

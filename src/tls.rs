@@ -124,15 +124,15 @@ pub fn current_fingerprint() -> io::Result<String> {
 pub struct TofuVerifier {
     saved_fingerprint: String,
     config_path: PathBuf,
-    auto_accept: bool,
+    non_interactive: bool,
 }
 
 impl TofuVerifier {
     /// Create a new TOFU verifier with the saved fingerprint from config.
-    /// If `auto_accept` is true, new certificates are accepted without prompting.
+    /// If `non_interactive` is true, unknown certificates are rejected instead of prompting.
     #[must_use]
-    pub fn new(saved_fingerprint: String, config_path: PathBuf, auto_accept: bool) -> Self {
-        Self { saved_fingerprint, config_path, auto_accept }
+    pub fn new(saved_fingerprint: String, config_path: PathBuf, non_interactive: bool) -> Self {
+        Self { saved_fingerprint, config_path, non_interactive }
     }
 }
 impl ServerCertVerifier for TofuVerifier {
@@ -147,7 +147,7 @@ impl ServerCertVerifier for TofuVerifier {
         let fingerprint = cert_fingerprint(end_entity.as_ref());
 
         if self.saved_fingerprint.is_empty() {
-            if self.auto_accept {
+            if self.non_interactive {
                 return Err(rustls::Error::General(
                     "No server fingerprint configured. Run 'blob config' interactively first to trust the server certificate.".to_string(),
                 ));
@@ -233,7 +233,7 @@ impl ServerCertVerifier for TofuVerifier {
 ///
 /// # Errors
 /// Returns an error if the TLS config or client build fails.
-pub fn build_client(config: &super::client::Config, auto_accept: bool) -> io::Result<reqwest::blocking::Client> {
+pub fn build_client(config: &super::client::Config, non_interactive: bool) -> io::Result<reqwest::blocking::Client> {
     let config_path = super::client::config_path().unwrap_or_default();
 
     let tls_config = rustls::ClientConfig::builder()
@@ -241,7 +241,7 @@ pub fn build_client(config: &super::client::Config, auto_accept: bool) -> io::Re
         .with_custom_certificate_verifier(Arc::new(TofuVerifier::new(
             config.server_fingerprint.clone(),
             config_path,
-            auto_accept,
+            non_interactive,
         )))
         .with_no_client_auth();
 

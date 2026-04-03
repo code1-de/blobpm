@@ -654,8 +654,11 @@ async fn post_upload(
 
     state.log_entry(ip, "POST", &url_path, 201, Some(&format!("{bytes_written} bytes")));
 
-    if filename == "manifest.json"
-        && let Ok(new_index) = RepoIndex::scan(&state.repo_path)
+    // Rescan index after zip upload (package is complete) or after manifest upload
+    // for meta-packages (no zip expected). Rescanning on manifest-only upload for
+    // non-meta packages is harmless — the package appears in the index early, but
+    // clients will get a 404 on the zip until it arrives.
+    if let Ok(new_index) = RepoIndex::scan(&state.repo_path)
         && let Ok(mut index) = state.index.write()
     {
         *index = new_index;

@@ -559,7 +559,7 @@ pub fn update(
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index")))?
             .latest
             .clone();
-        if latest == db.packages[n].version {
+        if crate::repo::version_cmp(&latest, &db.packages[n].version) == std::cmp::Ordering::Equal {
             println!("{n} is already at latest version ({latest}).");
             return Ok(());
         }
@@ -568,7 +568,7 @@ pub fn update(
         let mut list = Vec::new();
         for (n, pkg) in &db.packages {
             if let Some(entry) = index.get(n)
-                && entry.latest != pkg.version
+                && crate::repo::version_cmp(&entry.latest, &pkg.version) != std::cmp::Ordering::Equal
             {
                 list.push((n.clone(), entry.latest.clone()));
             }

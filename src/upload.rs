@@ -60,7 +60,7 @@ pub fn search(
             println!("{name:<w0$}  {version:<w1$}  {desc}");
         }
         if show_long {
-            let lookup_ver = pin_version.unwrap_or_else(|| version.split(',').next().unwrap_or(version).trim());
+            let lookup_ver = pin_version.unwrap_or_else(|| version.split(',').next_back().unwrap_or(version).trim());
             if let Ok(manifest) = crate::install::fetch_manifest(http, name, lookup_ver) {
                 if !manifest.dependencies.is_empty() {
                     println!("  deps: {}", manifest.dependencies.join(", "));
@@ -129,7 +129,7 @@ fn resolve_mappings(
             // glob crate treats \ as escape on all platforms — normalize to / for reliable matching.
             // Also: "dir/**" only matches directories in the glob crate; append "/*" for files.
             let mut glob_pattern = full_pattern.replace('\\', "/");
-            if glob_pattern.ends_with("/**") || glob_pattern.ends_with("**") && !glob_pattern.ends_with("**/*") {
+            if glob_pattern.ends_with("/**") || (glob_pattern.ends_with("**") && !glob_pattern.ends_with("**/*")) {
                 glob_pattern.push_str("/*");
             }
             let matched = glob::glob(&glob_pattern)
@@ -353,15 +353,15 @@ pub fn upload_interactive(
         mappings.push(line.to_string());
     }
 
-    if mappings.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No mappings provided"));
-    }
-
     let description = prompt_line("Description", existing_desc)?;
 
     let deps_default = existing_deps.join(", ");
     let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
     let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+
+    if mappings.is_empty() && deps.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No file mappings or dependencies provided"));
+    }
 
     upload(name, version, from, &mappings, &deps, existing_links, &description, force, lowercase, http)
 }
