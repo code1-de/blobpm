@@ -155,7 +155,7 @@ pub(crate) const MAX_EXTRACT_SIZE: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of entries in a zip archive — prevents inode exhaustion from many tiny files.
-pub(crate) const MAX_ZIP_ENTRIES: usize = 50_000;
+pub(crate) const MAX_ZIP_ENTRIES: usize = 200_000;
 
 fn extract_zip(
     zip_path: &Path,
@@ -344,16 +344,19 @@ fn check_conflicts(
     to_install: &[(String, String, Manifest)],
     config: &crate::client::Config,
     db: &Database,
+    overwrite: bool,
 ) -> io::Result<()> {
-    // Build path → owner from already-installed packages (skip packages being reinstalled)
+    // Build normalized-path → (original path, owner) from already-installed packages
+    // (skip packages being reinstalled). Normalized keys ensure case-insensitive matching on Windows.
     let transaction_names: HashSet<&str> = to_install.iter().map(|(n, _, _)| n.as_str()).collect();
-    let mut owned: HashMap<PathBuf, &str> = HashMap::new();
+    let mut owned: HashMap<String, (PathBuf, &str)> = HashMap::new();
     for (pkg_name, pkg) in &db.packages {
         if transaction_names.contains(pkg_name.as_str()) {
             continue; // will be replaced by this transaction
         }
         for dest in pkg.files.values() {
-            owned.insert(dest.clone(), pkg_name.as_str());
+            let key = crate::platform::normalize_for_compare(dest);
+            owned.insert(key, (dest.clone(), pkg_name.as_str()));
         }
     }
 
@@ -363,25 +366,36 @@ fn check_conflicts(
         for (file, dest_dir) in &manifest.files {
             let native_file = crate::platform::to_native_path(file);
             let dest = config.resolve_dest(dest_dir).join(native_file);
-            if let Some(&other) = owned.get(&dest) {
+            let key = crate::platform::normalize_for_compare(&dest);
+            if let Some((_, other)) = owned.get(&key) {
                 conflicts.entry(other.to_string()).or_default().push((pkg_name.clone(), dest.clone()));
             } else {
                 // Register so later packages in the transaction can conflict with this one
-                owned.insert(dest, pkg_name.as_str());
+                owned.insert(key, (dest, pkg_name.as_str()));
             }
         }
         // Also check shim links
         for dest_key in manifest.links.keys() {
             let dest = config.resolve_dest(dest_key);
-            if let Some(&other) = owned.get(&dest) {
+            let key = crate::platform::normalize_for_compare(&dest);
+            if let Some((_, other)) = owned.get(&key) {
                 conflicts.entry(other.to_string()).or_default().push((pkg_name.clone(), dest.clone()));
             } else {
-                owned.insert(dest, pkg_name.as_str());
+                owned.insert(key, (dest, pkg_name.as_str()));
             }
         }
     }
 
     if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    if overwrite {
+        for (owner, files) in &conflicts {
+            for (wanting, path) in files {
+                eprintln!("Warning: {wanting} overwrites {} (owned by {owner})", path.display());
+            }
+        }
         return Ok(());
     }
 
@@ -417,14 +431,14 @@ pub fn install(
     }
     // If already installed, just ensure it's marked manual (unless --force)
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
-        if existing.reason == InstallReason::Auto {
-            if let Some(pkg) = db.packages.get_mut(name) {
-                pkg.reason = InstallReason::Manual;
-            }
+        let reason = existing.reason;
+        let version = existing.version.clone();
+        if reason == InstallReason::Auto {
+            db.packages.entry(name.to_string()).and_modify(|p| p.reason = InstallReason::Manual);
             db.save()?;
             println!("{name} marked as manually installed");
         } else {
-            println!("{name} is already installed ({}). Use --force to reinstall.", existing.version);
+            println!("{name} is already installed ({version}). Use --force to reinstall.");
         }
         return Ok(());
     }
@@ -448,9 +462,7 @@ pub fn install(
         return Ok(());
     }
 
-    if !overwrite {
-        check_conflicts(&to_install, &http.config, db)?;
-    }
+    check_conflicts(&to_install, &http.config, db, overwrite)?;
 
     download_and_install(&to_install, name, no_cache, http, db)?;
 
@@ -583,9 +595,7 @@ pub fn update(
 
         let resolved = resolve_dependencies(pkg_name, new_version, http, &index, db)?;
 
-        if !overwrite {
-            check_conflicts(&resolved, &http.config, db)?;
-        }
+        check_conflicts(&resolved, &http.config, db, overwrite)?;
 
         // Remove old files that are no longer in the new manifest
         if let Some(new_manifest) = resolved.iter().find(|(n, _, _)| n == pkg_name).map(|(_, _, m)| m)
@@ -1140,7 +1150,7 @@ mod tests {
         let to_install =
             vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("shared.dll", "util/")]))];
 
-        let result = check_conflicts(&to_install, &config, &db);
+        let result = check_conflicts(&to_install, &config, &db, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("existing"), "should name the owning package: {err}");
@@ -1160,11 +1170,59 @@ mod tests {
             ("pkgB".to_string(), "1.0".to_string(), make_manifest("pkgB", &[("shared.dll", "util/")])),
         ];
 
-        let result = check_conflicts(&to_install, &config, &db);
+        let result = check_conflicts(&to_install, &config, &db, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("pkgA"), "should name first package: {err}");
         assert!(err.contains("pkgB"), "should name second package: {err}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn conflict_case_insensitive_filename_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+        db.packages.insert(
+            "existing".to_string(),
+            InstalledPackage {
+                version: "1.0".to_string(),
+                reason: InstallReason::Manual,
+                files: BTreeMap::from([("Tool.exe".to_string(), PathBuf::from("C:\\base\\util\\Tool.exe"))]),
+                dependencies: vec![],
+            },
+        );
+
+        // Same file but different case — must still conflict on Windows
+        let to_install =
+            vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("tool.exe", "util/")]))];
+
+        let result = check_conflicts(&to_install, &config, &db, false);
+        assert!(result.is_err(), "case-only difference in filename must conflict on Windows");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn conflict_case_insensitive_dir_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = minimal_config(Path::new("C:\\base"));
+        let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
+        db.packages.insert(
+            "existing".to_string(),
+            InstalledPackage {
+                version: "1.0".to_string(),
+                reason: InstallReason::Manual,
+                files: BTreeMap::from([("tool.exe".to_string(), PathBuf::from("C:\\base\\Util\\tool.exe"))]),
+                dependencies: vec![],
+            },
+        );
+
+        // Same file but directory differs in case — must still conflict on Windows
+        let to_install =
+            vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("tool.exe", "util/")]))];
+
+        let result = check_conflicts(&to_install, &config, &db, false);
+        assert!(result.is_err(), "case-only difference in directory must conflict on Windows");
     }
 
     #[test]
@@ -1185,7 +1243,7 @@ mod tests {
         let to_install =
             vec![("newpkg".to_string(), "1.0".to_string(), make_manifest("newpkg", &[("tool.exe", "util/")]))];
 
-        assert!(check_conflicts(&to_install, &config, &db).is_ok());
+        assert!(check_conflicts(&to_install, &config, &db, false).is_ok());
     }
 
     #[test]
@@ -1208,7 +1266,7 @@ mod tests {
         let to_install =
             vec![("mypkg".to_string(), "2.0".to_string(), make_manifest("mypkg", &[("tool.exe", "util/")]))];
 
-        assert!(check_conflicts(&to_install, &config, &db).is_ok());
+        assert!(check_conflicts(&to_install, &config, &db, false).is_ok());
     }
 
     #[cfg(feature = "server")]

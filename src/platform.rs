@@ -219,12 +219,12 @@ fn minimal_roots(dirs: &std::collections::HashSet<std::path::PathBuf>) -> Vec<st
 
 /// Case-insensitive path comparison on Windows, case-sensitive elsewhere.
 #[cfg(windows)]
-fn normalize_for_compare(p: &Path) -> String {
+pub(crate) fn normalize_for_compare(p: &Path) -> String {
     p.to_string_lossy().to_lowercase()
 }
 
 #[cfg(not(windows))]
-fn normalize_for_compare(p: &Path) -> String {
+pub(crate) fn normalize_for_compare(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
@@ -337,6 +337,10 @@ pub(crate) fn spawn_self_cleanup(blob_dir: &Path, old_exe: &Path) -> io::Result<
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+
+    // Flush before spawning the cleanup process so output doesn't interleave
+    let _ = io::Write::flush(&mut io::stdout());
+    let _ = io::Write::flush(&mut io::stderr());
 
     let mut si = STARTUPINFOW::default();
     #[allow(clippy::cast_possible_truncation)] // STARTUPINFOW size always fits in u32
