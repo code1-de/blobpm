@@ -435,11 +435,10 @@ pub fn install(
     }
     // If already installed and not requesting a different version, just ensure it's marked manual
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
-        let installed_ver = &existing.reason;
-        let same_version = version.is_none()
-            || crate::repo::version_cmp(version.unwrap(), &existing.version) == std::cmp::Ordering::Equal;
+        let same_version =
+            version.is_none_or(|v| crate::repo::version_cmp(v, &existing.version) == std::cmp::Ordering::Equal);
         if same_version {
-            if *installed_ver == InstallReason::Auto {
+            if existing.reason == InstallReason::Auto {
                 db.packages.entry(name.to_string()).and_modify(|p| p.reason = InstallReason::Manual);
                 db.save()?;
                 println!("{name} marked as manually installed");

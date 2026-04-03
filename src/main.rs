@@ -41,7 +41,7 @@ enum Commands {
         /// Package names, or name@version for specific versions
         names: Vec<String>,
 
-        /// Reinstall even if already installed (e.g. to change version)
+        /// Reinstall even if already installed at the same version (e.g. to repair files)
         #[arg(long, short)]
         force: bool,
 

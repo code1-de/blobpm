@@ -346,17 +346,17 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 async fn get_index(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
     let value = {
         let Ok(index) = state.index.read() else {
             state.log_entry(addr.ip(), "GET", "/index", 500, Some("index lock failed"));
-            return Json(serde_json::Value::Object(serde_json::Map::default()));
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
         serde_json::to_value(index.index_summary()).unwrap_or_default()
     };
     let size = serde_json::to_string(&value).map_or(0, |s| s.len());
     state.log_entry(addr.ip(), "GET", "/index", 200, Some(&format!("{size} bytes")));
-    Json(value)
+    Ok(Json(value))
 }
 
 async fn get_versions(
