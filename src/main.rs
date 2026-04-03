@@ -347,6 +347,9 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             rt.block_on(server::run(server_config))?;
         }
         Commands::Install { names, force, no_cache, overwrite } => {
+            if names.is_empty() {
+                return Err("No packages specified. Usage: blob install <package>...".into());
+            }
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
@@ -363,7 +366,15 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             } else {
                 (pattern.clone(), None)
             };
-            upload::search(&search_pattern, *versions || *long, *description, *long, pin_version.as_deref(), &http)?;
+            upload::search(
+                &search_pattern,
+                *versions || *long,
+                *description,
+                *long,
+                pin_version.as_deref(),
+                pattern,
+                &http,
+            )?;
         }
         Commands::Info { package } => {
             let (pkg_name, version) = parse_package_spec(package);
@@ -372,12 +383,18 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             run_info(&pkg_name, version.as_deref(), &http)?;
         }
         Commands::Remove { names, force, transitive, keep } => {
+            if names.is_empty() {
+                return Err("No packages specified. Usage: blob remove <package>...".into());
+            }
             let mut db = client::Database::load()?;
             for name in names {
                 remove::remove(name, *force, *transitive, *keep, &mut db)?;
             }
         }
         Commands::Manual { names } => {
+            if names.is_empty() {
+                return Err("No packages specified. Usage: blob manual <package>...".into());
+            }
             let mut db = client::Database::load()?;
             let mut changed = false;
             for name in names {
@@ -602,6 +619,9 @@ fn parse_package_spec(spec: &str) -> (String, Option<String>) {
 
 fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Result<(), Box<dyn std::error::Error>> {
     client::validate_pkg_spec("package name", name)?;
+    if let Some(v) = version {
+        client::validate_pkg_spec("version", v)?;
+    }
 
     let version = if let Some(v) = version {
         v.to_string()

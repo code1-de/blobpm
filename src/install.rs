@@ -433,18 +433,22 @@ pub fn install(
     if let Some(v) = version {
         validate_pkg_spec("version", v)?;
     }
-    // If already installed, just ensure it's marked manual (unless --force)
+    // If already installed and not requesting a different version, just ensure it's marked manual
     if let Some(existing) = db.packages.get(name).filter(|_| !force) {
-        let reason = existing.reason;
-        let version = existing.version.clone();
-        if reason == InstallReason::Auto {
-            db.packages.entry(name.to_string()).and_modify(|p| p.reason = InstallReason::Manual);
-            db.save()?;
-            println!("{name} marked as manually installed");
-        } else {
-            println!("{name} is already installed ({version}). Use --force to reinstall.");
+        let installed_ver = &existing.reason;
+        let same_version = version.is_none()
+            || crate::repo::version_cmp(version.unwrap(), &existing.version) == std::cmp::Ordering::Equal;
+        if same_version {
+            if *installed_ver == InstallReason::Auto {
+                db.packages.entry(name.to_string()).and_modify(|p| p.reason = InstallReason::Manual);
+                db.save()?;
+                println!("{name} marked as manually installed");
+            } else {
+                println!("{name} is already installed ({}). Use --force to reinstall.", existing.version);
+            }
+            return Ok(());
         }
-        return Ok(());
+        // Different version requested — fall through to install it
     }
 
     let index = fetch_index(http)?;
@@ -468,12 +472,14 @@ pub fn install(
 
     check_conflicts(&to_install, &http.config, db, overwrite)?;
 
-    // Remove old files that are no longer in the new manifest (relevant for --force reinstall)
+    // Remove old files that are no longer in the new manifest (relevant for --force reinstall).
+    // Check both files and links — shims from links are tracked in db.files too.
     if let Some(new_manifest) = to_install.iter().find(|(n, _, _)| n == name).map(|(_, _, m)| m)
         && let Some(old_pkg) = db.packages.get(name)
     {
         for (old_file, old_path) in &old_pkg.files {
-            if !new_manifest.files.contains_key(old_file) && old_path.is_file() {
+            let still_needed = new_manifest.files.contains_key(old_file) || new_manifest.links.contains_key(old_file);
+            if !still_needed && old_path.is_file() {
                 fs::remove_file(old_path)?;
                 println!("  Removed old file {old_file}");
             }
@@ -620,12 +626,15 @@ pub fn update(
 
         check_conflicts(&resolved, &http.config, db, overwrite)?;
 
-        // Remove old files that are no longer in the new manifest
+        // Remove old files that are no longer in the new manifest.
+        // Check both files and links — shims from links are tracked in db.files too.
         if let Some(new_manifest) = resolved.iter().find(|(n, _, _)| n == pkg_name).map(|(_, _, m)| m)
             && let Some(old_pkg) = db.packages.get(pkg_name)
         {
             for (old_file, old_path) in &old_pkg.files {
-                if !new_manifest.files.contains_key(old_file) && old_path.is_file() {
+                let still_needed =
+                    new_manifest.files.contains_key(old_file) || new_manifest.links.contains_key(old_file);
+                if !still_needed && old_path.is_file() {
                     fs::remove_file(old_path)?;
                     println!("  Removed old file {old_file}");
                 }

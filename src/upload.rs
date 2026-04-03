@@ -22,6 +22,7 @@ pub fn search(
     search_desc: bool,
     show_long: bool,
     pin_version: Option<&str>,
+    display_pattern: &str,
     http: &HttpClient,
 ) -> io::Result<()> {
     if pattern.len() > 1024 {
@@ -44,7 +45,7 @@ pub fn search(
     }
 
     if rows.is_empty() {
-        println!("No packages matching '{pattern}'");
+        println!("No packages matching '{display_pattern}'");
         return Ok(());
     }
 
