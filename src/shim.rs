@@ -77,18 +77,29 @@ pub fn create_shims(
 }
 
 /// Check if a PE file has GUI subsystem.
+/// Reads only the necessary header bytes instead of the entire file.
 fn is_gui_exe(path: &Path) -> bool {
-    let Ok(data) = fs::read(path) else { return false };
-    if data.len() < 0x40 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut f) = fs::File::open(path) else { return false };
+
+    // Read PE header offset from DOS header at 0x3C
+    let mut dos_buf = [0u8; 0x40];
+    if f.read_exact(&mut dos_buf).is_err() {
         return false;
     }
-    let pe_offset = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
-    let subsystem_addr = pe_offset + PE_SUBSYSTEM_OFFSET;
-    if subsystem_addr + 2 > data.len() {
+    let pe_offset = u64::from(u32::from_le_bytes(dos_buf[0x3C..0x40].try_into().unwrap()));
+    let subsystem_addr = pe_offset + PE_SUBSYSTEM_OFFSET as u64;
+
+    // Seek to subsystem field and read 2 bytes
+    if f.seek(SeekFrom::Start(subsystem_addr)).is_err() {
         return false;
     }
-    let subsystem = u16::from_le_bytes(data[subsystem_addr..subsystem_addr + 2].try_into().unwrap());
-    subsystem == SUBSYSTEM_GUI
+    let mut sub_buf = [0u8; 2];
+    if f.read_exact(&mut sub_buf).is_err() {
+        return false;
+    }
+    u16::from_le_bytes(sub_buf) == SUBSYSTEM_GUI
 }
 
 /// Compute relative path from `base` to `target`. Returns None if on different drive roots.

@@ -3,7 +3,11 @@ use std::io;
 use crate::client::{Database, InstallReason};
 
 fn reverse_deps(name: &str, db: &Database) -> Vec<String> {
-    db.packages.iter().filter(|(_, pkg)| pkg.dependencies.contains(&name.to_string())).map(|(n, _)| n.clone()).collect()
+    db.packages
+        .iter()
+        .filter(|(n, pkg)| n.as_str() != name && pkg.dependencies.contains(&name.to_string()))
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 // TODO: build reverse-dep index for O(n) lookup instead of O(n²) per iteration
@@ -348,5 +352,51 @@ mod tests {
 
         remove("depA", false, true, false, &mut db).unwrap();
         assert!(db.packages.is_empty());
+    }
+
+    /// If a package somehow ends up with a self-dependency in the DB,
+    /// remove and remove --transitive must still work (not infinite-loop).
+    #[test]
+    fn remove_self_referencing_package() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install a normal package, then manually inject a self-dependency into its DB entry
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
+        db.packages.get_mut("toolA").unwrap().dependencies = vec!["toolA".to_string()];
+        db.save().unwrap();
+
+        // Plain remove should work (reverse_deps excludes self)
+        remove("toolA", false, false, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolA"));
+    }
+
+    #[test]
+    fn remove_transitive_self_referencing_package() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        // Install a normal package, then manually inject a self-dependency
+        install("toolA", None, false, false, false, &http, &mut db).unwrap();
+        db.packages.get_mut("toolA").unwrap().dependencies = vec!["toolA".to_string()];
+        db.save().unwrap();
+
+        // --transitive must not infinite-loop
+        remove("toolA", false, true, false, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolA"));
     }
 }

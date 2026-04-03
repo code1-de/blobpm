@@ -337,6 +337,12 @@ fn resolve_recursive(
     // This is intentional: `blob update pkg` means "update pkg to latest", not "update pkg
     // and transitively re-resolve its entire dependency tree".
     for dep in &manifest.dependencies {
+        if dep == name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Package {name} lists itself as a dependency"),
+            ));
+        }
         if !db.packages.contains_key(dep) {
             resolve_recursive(dep, None, http, index, db, result, visited, in_stack)?;
         }
@@ -956,6 +962,72 @@ mod tests {
             let db = Database::load_from(Path::new("")).unwrap();
             let result = resolve_dependencies("cycleA", "1.0", &http, &index, &db);
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn self_dependency_detected() {
+            let tmp = tempfile::tempdir().unwrap();
+
+            let pkg = tmp.path().join("packages").join("selfpkg").join("1.0");
+            fs::create_dir_all(&pkg).unwrap();
+            fs::write(
+                pkg.join("manifest.json"),
+                r#"{"name":"selfpkg","description":"","files":{"s.exe":"bin/"},"dependencies":["selfpkg"]}"#,
+            )
+            .unwrap();
+            create_zip(&pkg, &[("s.exe", b"binary")]);
+
+            let (_rt, port, fp) = start_tls_server(tmp.path());
+
+            let config = test_config(port, Path::new(""), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let index = fetch_index(&http).unwrap();
+            let db = Database::load_from(Path::new("")).unwrap();
+            let result = resolve_dependencies("selfpkg", "1.0", &http, &index, &db);
+            assert!(result.is_err(), "self-dependency should be rejected");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("itself"), "error should mention self-dep: {err}");
+        }
+
+        /// Verify self-dep is caught even when the package is already installed (update scenario)
+        #[test]
+        fn self_dependency_detected_when_already_installed() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+
+            // v1: normal, no self-dep
+            let v1 = repo_tmp.path().join("packages").join("selfpkg").join("1.0");
+            fs::create_dir_all(&v1).unwrap();
+            fs::write(
+                v1.join("manifest.json"),
+                r#"{"name":"selfpkg","description":"","files":{"s.exe":"bin/"},"dependencies":[]}"#,
+            )
+            .unwrap();
+            create_zip(&v1, &[("s.exe", b"v1")]);
+
+            // v2: self-dependency
+            let v2 = repo_tmp.path().join("packages").join("selfpkg").join("2.0");
+            fs::create_dir_all(&v2).unwrap();
+            fs::write(
+                v2.join("manifest.json"),
+                r#"{"name":"selfpkg","description":"","files":{"s.exe":"bin/"},"dependencies":["selfpkg"]}"#,
+            )
+            .unwrap();
+            create_zip(&v2, &[("s.exe", b"v2")]);
+
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install v1 (no self-dep) — succeeds
+            install("selfpkg", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert!(db.packages.contains_key("selfpkg"));
+
+            // Update to v2 (has self-dep) — must fail
+            let result = update(None, false, false, false, &http, &mut db);
+            assert!(result.is_err(), "update to self-referencing version should fail");
         }
 
         #[test]

@@ -506,6 +506,9 @@ async fn validate_uploaded_manifest(manifest_path: &std::path::Path, expected_na
         }
     }
     for dep in &manifest.dependencies {
+        if dep == expected_name {
+            return Err((400, format!("package cannot depend on itself: {dep}")));
+        }
         if crate::client::validate_pkg_spec("dependency", dep).is_err() {
             return Err((400, format!("invalid dependency name: {dep}")));
         }
@@ -1173,5 +1176,23 @@ mod tests {
         let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
         let json: serde_json::Value = resp.json().unwrap();
         assert!(!json["cleanpkg"].is_object(), "package should not appear in index after failed upload");
+    }
+
+    #[test]
+    fn test_upload_rejects_self_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Manifest where "selfpkg" depends on itself
+        let manifest = r#"{"name":"selfpkg","description":"","files":{"tool.exe":"bin/"},"dependencies":["selfpkg"]}"#;
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/selfpkg/1.0/manifest.json"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(manifest.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400, "server should reject self-dependency");
     }
 }
