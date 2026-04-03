@@ -19,8 +19,8 @@ pub(crate) fn validate_pkg_spec(label: &str, value: &str) -> io::Result<()> {
     if value.starts_with('.') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not start with '.'")));
     }
-    if value.ends_with('.') || value.ends_with(' ') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not end with '.' or space")));
+    if value.ends_with('.') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{label} must not end with '.'")));
     }
     for &b in value.as_bytes() {
         if !is_safe_spec_char(b) {
@@ -174,7 +174,17 @@ impl Config {
         let path = config_path()?;
         if path.is_file() {
             let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            let config: Self =
+                serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            for key in config.path_map.keys() {
+                if key.contains('/') || key.contains('\\') {
+                    eprintln!(
+                        "Warning: path_map key {key:?} contains a slash — only the first path segment is matched, \
+                         so this mapping will never apply"
+                    );
+                }
+            }
+            Ok(config)
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "No config found. Run 'blob config' first."))
         }

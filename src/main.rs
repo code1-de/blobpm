@@ -776,14 +776,19 @@ fn run_config() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  No mapping for '{}'", key.trim());
             }
         } else if let Some((key, path)) = line.split_once('=') {
+            let key = key.trim();
+            if key.contains('/') || key.contains('\\') {
+                println!("  Key must be a single path segment (no slashes): {key}");
+                continue;
+            }
             let path = PathBuf::from(path.trim());
             if !path.is_absolute() {
                 println!("  Path must be absolute: {}", path.display());
                 continue;
             }
             let path = dunce::canonicalize(&path).unwrap_or(path);
-            path_map.insert(key.trim().to_string(), path.clone());
-            println!("  {} -> {}", key.trim(), path.display());
+            path_map.insert(key.to_string(), path.clone());
+            println!("  {key} -> {}", path.display());
         } else {
             println!("  Format: segment=path or -segment");
         }

@@ -4,15 +4,7 @@ use std::io;
 use std::path::Path;
 
 /// Normalize a path string to manifest convention (always forward slashes).
-/// On Windows, converts `\` to `/`. On Linux, `\` is a valid filename character — left as-is.
-#[cfg(windows)]
-pub(crate) fn to_manifest_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-/// On Linux, also convert backslashes — manifests always use forward slashes,
-/// and backslash-as-filename-char is not a supported use case.
-#[cfg(not(windows))]
+/// Backslash-as-filename-char is not a supported use case, so we convert on all platforms.
 pub(crate) fn to_manifest_path(path: &str) -> String {
     path.replace('\\', "/")
 }
@@ -174,7 +166,7 @@ pub(crate) fn write_or_rename(dest: &Path, data: &[u8]) -> io::Result<Option<std
     Ok(None)
 }
 
-/// Rename a file by appending `.__blob_N` where N is the first free number.
+/// Rename a file by appending `.<N>.__blob__` where N is the first free number.
 #[cfg(windows)]
 fn rename_with_blob_suffix(path: &Path) -> io::Result<std::path::PathBuf> {
     let name = path.to_string_lossy();
@@ -194,15 +186,14 @@ fn rename_with_blob_suffix(path: &Path) -> io::Result<std::path::PathBuf> {
 #[cfg(windows)]
 fn move_file_on_reboot(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
-    const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 4;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    use windows::core::PCWSTR;
 
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-    }
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let ok = unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
-    ok != 0
+    let wide: Vec<u16> = path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe { MoveFileExW(PCWSTR(wide.as_ptr()), None, MOVEFILE_DELAY_UNTIL_REBOOT) }.is_ok()
 }
 
 /// Returns the path of the self-renamed exe, if any.
@@ -250,7 +241,7 @@ fn path_starts_with(child: &Path, parent: &Path) -> bool {
     child.starts_with(parent)
 }
 
-/// Recursively delete all `*.__blob_*` files under the given directories. Returns count of deleted files.
+/// Recursively delete all `*.__blob__` files under the given directories. Returns count of deleted files.
 pub(crate) fn cleanup_blob_renames(dirs: &std::collections::HashSet<std::path::PathBuf>) -> u32 {
     let roots = minimal_roots(dirs);
     let mut count = 0u32;
@@ -269,7 +260,7 @@ fn cleanup_recurse(dir: &Path, count: &mut u32) {
         } else {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.contains(BLOB_RENAME_MARKER) && std::fs::remove_file(&path).is_ok() {
+            if name_str.ends_with(BLOB_RENAME_MARKER) && std::fs::remove_file(&path).is_ok() {
                 println!("  Deleted {}", path.display());
                 *count += 1;
             }
@@ -300,45 +291,19 @@ pub(crate) fn cleanup_with_retry(dir: &Path) -> u32 {
 /// auto-deletes when the cleanup process exits.
 #[cfg(windows)]
 pub(crate) fn spawn_self_cleanup(blob_dir: &Path, old_exe: &Path) -> io::Result<()> {
-    unsafe extern "system" {
-        fn GetTempPathW(len: u32, buf: *mut u16) -> u32;
-        fn CreateFileW(
-            name: *const u16,
-            access: u32,
-            share: u32,
-            security: usize,
-            disp: u32,
-            flags: u32,
-            template: usize,
-        ) -> isize;
-        fn CloseHandle(handle: isize) -> i32;
-        fn CreateProcessW(
-            app: *const u16,
-            cmd: *mut u16,
-            pa: usize,
-            ta: usize,
-            inherit: i32,
-            flags: u32,
-            env: usize,
-            dir: usize,
-            si: *const u8,
-            pi: *mut u8,
-        ) -> i32;
-    }
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_EXECUTE, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
 
-    const FILE_EXECUTE: u32 = 0x20;
-    const FILE_SHARE_READ: u32 = 1;
-    const FILE_SHARE_DELETE: u32 = 4;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-
-    // Get temp dir
-    let mut tmp_buf = [0u16; 512];
-    #[allow(clippy::cast_possible_truncation)] // buffer is 512, fits in u32
-    let tmp_len = unsafe { GetTempPathW(tmp_buf.len() as u32, tmp_buf.as_mut_ptr()) } as usize;
-    let tmp_dir = String::from_utf16_lossy(&tmp_buf[..tmp_len]);
+    let tmp_dir = std::env::temp_dir();
     let pid = std::process::id();
-    let tmp_path = format!("{tmp_dir}blob_cleanup_{pid}.exe");
+    let tmp_path = tmp_dir.join(format!("blob_cleanup_{pid}.exe"));
 
     // Read the OLD (renamed) exe — it's the currently running process image.
     let exe_data = std::fs::read(old_exe)?;
@@ -349,45 +314,54 @@ pub(crate) fn spawn_self_cleanup(blob_dir: &Path, old_exe: &Path) -> io::Result<
     // Re-open with FILE_EXECUTE + DELETE_ON_CLOSE — file auto-deletes when all handles close.
     // Handle intentionally leaked — closes when this process exits, triggering deletion
     // after the spawned cleanup process has also exited.
-    let wide_path: Vec<u16> = tmp_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_path: Vec<u16> = tmp_path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let _delete_handle = unsafe {
         CreateFileW(
-            wide_path.as_ptr(),
-            FILE_EXECUTE,
+            PCWSTR(wide_path.as_ptr()),
+            FILE_EXECUTE.0,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
-            0,
+            None,
             OPEN_EXISTING,
             FILE_FLAG_DELETE_ON_CLOSE,
-            0,
+            None,
         )
     };
 
     // Spawn: blob_cleanup.exe cleanup --self-update <dir>
+    let tmp_path_str = tmp_path.to_string_lossy();
     let dir_str = blob_dir.to_string_lossy();
-    let mut cmdline: Vec<u16> = format!("\"{tmp_path}\" cleanup --self-update \"{dir_str}\"")
+    let mut cmdline: Vec<u16> = format!("\"{tmp_path_str}\" cleanup --self-update \"{dir_str}\"")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
 
-    let mut si = [0u8; 104]; // STARTUPINFOW is 104 bytes on 64-bit
-    si[0..4].copy_from_slice(&104u32.to_le_bytes()); // cb = sizeof(STARTUPINFOW)
-    let mut pi = [0u8; 24]; // PROCESS_INFORMATION
+    let mut si = STARTUPINFOW::default();
+    #[allow(clippy::cast_possible_truncation)] // STARTUPINFOW size always fits in u32
+    { si.cb = std::mem::size_of_val(&si) as u32; }
+    let mut pi = PROCESS_INFORMATION::default();
 
-    let ok = unsafe {
-        CreateProcessW(std::ptr::null(), cmdline.as_mut_ptr(), 0, 0, 0, 0, 0, 0, si.as_ptr(), pi.as_mut_ptr())
-    };
-
-    if ok == 0 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(err.kind(), format!("[self-update] CreateProcessW: {err}")));
-    }
-
-    // Close the process/thread handles from PROCESS_INFORMATION
-    let proc_handle = isize::from_le_bytes(pi[0..8].try_into().unwrap());
-    let thread_handle = isize::from_le_bytes(pi[8..16].try_into().unwrap());
     unsafe {
-        CloseHandle(proc_handle);
-        CloseHandle(thread_handle);
+        CreateProcessW(
+            None,
+            Some(PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS::default(),
+            None,
+            None,
+            &raw const si,
+            &raw mut pi,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("[self-update] CreateProcessW: {e}")))?;
+
+    unsafe {
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
     }
 
     Ok(())
@@ -400,27 +374,10 @@ mod tests {
     // --- Path convention tests ---
 
     #[test]
-    fn manifest_paths_use_forward_slashes() {
+    fn manifest_path_converts_backslashes() {
         assert_eq!(to_manifest_path("util/sub"), "util/sub");
-        assert_eq!(to_manifest_path("already/fine"), "already/fine");
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn manifest_path_converts_backslash_on_windows() {
         assert_eq!(to_manifest_path("util\\sub"), "util/sub");
         assert_eq!(to_manifest_path("a\\b\\c"), "a/b/c");
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn manifest_path_converts_backslash_on_linux() {
-        // Manifests always use forward slashes, even on Linux
-        assert_eq!(to_manifest_path("util\\sub"), "util/sub");
-    }
-
-    #[test]
-    fn manifest_path_preserves_no_separators() {
         assert_eq!(to_manifest_path("file.exe"), "file.exe");
         assert_eq!(to_manifest_path(""), "");
     }

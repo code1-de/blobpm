@@ -47,3 +47,4 @@ cargo run -- install <pkg>
 - **No automatic commits or pushes.** Only commit or push when the user explicitly asks.
 - **Before committing:** Review and update `PLAN.md` — check off completed items, add new items if needed.
 - **No `cd` or `git -C` when already in the working directory.** The working directory is already set correctly. Only use `git -C` when targeting a *different* repo.
+- **No hand-rolled FFI.** Never manually define Windows API constants, struct sizes, or function signatures when they're available from the `windows` crate. Add the required feature to Cargo.toml instead.
