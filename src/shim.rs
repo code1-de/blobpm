@@ -23,6 +23,7 @@ pub fn create_shims(
     let mut created = BTreeMap::new();
 
     for (dest, target) in links {
+        crate::client::validate_manifest_path(dest, target, "link")?;
         let dest_path = config.resolve_dest(dest);
         let target_path = config.resolve_dest(target);
 

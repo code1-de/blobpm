@@ -95,8 +95,8 @@ pub fn remove(name: &str, force: bool, transitive: bool, no_purge: bool, db: &mu
 
     if !no_purge {
         purge_orphans(db)?;
-        db.save()?;
     }
+    db.save()?;
     Ok(())
 }
 

@@ -510,6 +510,11 @@ async fn validate_uploaded_manifest(manifest_path: &std::path::Path, expected_na
             return Err((400, format!("invalid dependency name: {dep}")));
         }
     }
+    for (dest, target) in &manifest.links {
+        if crate::client::validate_manifest_path(dest, target, expected_name).is_err() {
+            return Err((400, format!("unsafe link path: {dest} -> {target}")));
+        }
+    }
     Ok(())
 }
 

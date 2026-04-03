@@ -323,6 +323,10 @@ fn resolve_recursive(
 
     let manifest = fetch_manifest(http, name, &version)?;
 
+    // Only resolve deps that aren't installed yet. Already-installed deps are left at their
+    // current version — `blob update` (without args) handles upgrading them individually.
+    // This is intentional: `blob update pkg` means "update pkg to latest", not "update pkg
+    // and transitively re-resolve its entire dependency tree".
     for dep in &manifest.dependencies {
         if !db.packages.contains_key(dep) {
             resolve_recursive(dep, None, http, index, db, result, visited, in_stack)?;
@@ -464,6 +468,18 @@ pub fn install(
 
     check_conflicts(&to_install, &http.config, db, overwrite)?;
 
+    // Remove old files that are no longer in the new manifest (relevant for --force reinstall)
+    if let Some(new_manifest) = to_install.iter().find(|(n, _, _)| n == name).map(|(_, _, m)| m)
+        && let Some(old_pkg) = db.packages.get(name)
+    {
+        for (old_file, old_path) in &old_pkg.files {
+            if !new_manifest.files.contains_key(old_file) && old_path.is_file() {
+                fs::remove_file(old_path)?;
+                println!("  Removed old file {old_file}");
+            }
+        }
+    }
+
     download_and_install(&to_install, name, no_cache, http, db)?;
 
     // Clean up orphaned auto-deps (e.g. after --force changed the dep tree)
@@ -559,16 +575,23 @@ pub fn update(
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{n} not found in index")))?
             .latest
             .clone();
-        if crate::repo::version_cmp(&latest, &db.packages[n].version) == std::cmp::Ordering::Equal {
-            println!("{n} is already at latest version ({latest}).");
-            return Ok(());
+        match crate::repo::version_cmp(&latest, &db.packages[n].version) {
+            std::cmp::Ordering::Greater => {}
+            std::cmp::Ordering::Equal => {
+                println!("{n} is already at latest version ({latest}).");
+                return Ok(());
+            }
+            std::cmp::Ordering::Less => {
+                println!("{n} is newer than server latest ({} > {latest}).", db.packages[n].version);
+                return Ok(());
+            }
         }
         vec![(n.to_string(), latest)]
     } else {
         let mut list = Vec::new();
         for (n, pkg) in &db.packages {
             if let Some(entry) = index.get(n)
-                && crate::repo::version_cmp(&entry.latest, &pkg.version) != std::cmp::Ordering::Equal
+                && crate::repo::version_cmp(&entry.latest, &pkg.version) == std::cmp::Ordering::Greater
             {
                 list.push((n.clone(), entry.latest.clone()));
             }

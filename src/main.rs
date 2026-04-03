@@ -515,7 +515,10 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
 
-            if *interactive && !yes {
+            if *interactive && yes {
+                return Err("--interactive cannot be used with --yes".into());
+            }
+            if *interactive {
                 upload::upload_interactive(
                     &pkg_name,
                     &version,
@@ -692,7 +695,11 @@ fn run_status(
     if show_missing {
         let dir_key = platform::normalize_for_compare(&dir);
         for (key, (path, label)) in &owned {
-            if key.starts_with(&dir_key) && !entries_normalized.contains(key) {
+            let is_under_dir = key.starts_with(&dir_key)
+                && (key.len() == dir_key.len()
+                    || key.as_bytes().get(dir_key.len()) == Some(&b'\\')
+                    || key.as_bytes().get(dir_key.len()) == Some(&b'/'));
+            if is_under_dir && !entries_normalized.contains(key) {
                 let display = path.strip_prefix(&dir).unwrap_or(path);
                 println!("! {:<50} [{label}]", display.display());
                 missing_count += 1;

@@ -222,7 +222,7 @@ pub fn upload(
     }
     // Check if version already exists on server, warn if uploading an older version
     let existing_versions = fetch_versions(http, name).unwrap_or_default();
-    if !force && existing_versions.contains(&version.clone()) {
+    if !force && existing_versions.iter().any(|v| v == version) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{name}@{version} already exists on server. Use --force to overwrite."),
