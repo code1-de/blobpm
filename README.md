@@ -1,5 +1,8 @@
 # Blob Package Manager
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+
 ## Why Another Package Manager?
 
 The honest answer is: I wanted to have one, and I wanted to build it myself in Rust, using an AI coding agent (Claude Code). That said, it has several design principles that I think other package managers don't have:
