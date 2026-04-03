@@ -652,7 +652,16 @@ async fn post_upload(
         let manifest_path = dir.join("manifest.json");
         if let Err(e) = validate_zip_against_manifest(&manifest_path, &final_path) {
             state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
+            // Clean up both zip and manifest to avoid leaving the package in a broken state
             let _ = tokio::fs::remove_file(&final_path).await;
+            let _ = tokio::fs::remove_file(&manifest_path).await;
+            cleanup_empty_package_dirs(&dir, &canonical_packages).await;
+            // Rescan index so the broken version is removed
+            if let Ok(new_index) = RepoIndex::scan(&state.repo_path)
+                && let Ok(mut index) = state.index.write()
+            {
+                *index = new_index;
+            }
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -1115,5 +1124,54 @@ mod tests {
         // Must not contain any filesystem path from the error message
         assert!(!sanitized.contains('\\'), "should not contain backslash paths: {sanitized}");
         assert!(!sanitized.contains('/'), "should not contain forward slash paths: {sanitized}");
+    }
+
+    #[test]
+    fn test_failed_zip_validation_cleans_up_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Upload a manifest that expects "tool.exe"
+        let manifest = r#"{"name":"cleanpkg","description":"","files":{"tool.exe":"bin/"},"dependencies":[]}"#;
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/cleanpkg/1.0/manifest.json"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(manifest.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Upload a zip with a DIFFERENT file — validation should fail
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut zip_buf);
+            zip.start_file("wrong.exe", zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, b"wrong").unwrap();
+            zip.finish().unwrap();
+        }
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/cleanpkg/1.0/files.zip"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(zip_buf.into_inner())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // Both manifest and zip should be cleaned up
+        assert!(
+            !tmp.path().join("packages/cleanpkg/1.0/manifest.json").exists(),
+            "manifest should be removed after failed zip validation"
+        );
+        assert!(
+            !tmp.path().join("packages/cleanpkg/1.0/files.zip").exists(),
+            "zip should be removed after failed zip validation"
+        );
+
+        // Package should not appear in the index
+        let resp = auth_get(&client, &format!("https://localhost:{port}/index"));
+        let json: serde_json::Value = resp.json().unwrap();
+        assert!(!json["cleanpkg"].is_object(), "package should not appear in index after failed upload");
     }
 }

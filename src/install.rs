@@ -16,6 +16,9 @@ use crate::util::{plural, pluralize};
 pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, IndexEntry>> {
     let url = format!("{}/index", http.config.server_url);
     let resp = http.get(&url)?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("Failed to fetch index: {}", resp.status())));
+    }
     resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -109,13 +112,15 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32, verbose: bool) {
         return;
     }
     let max_age = std::time::Duration::from_secs(u64::from(max_age_days) * 86400);
+    let delete_all = max_age_days == 0;
     let mut removed = 0u32;
     let Ok(packages) = fs::read_dir(cache_dir) else { return };
     for pkg_entry in packages.flatten() {
         let Ok(versions) = fs::read_dir(pkg_entry.path()) else { continue };
         for ver_entry in versions.flatten() {
             let Ok(meta) = ver_entry.path().join("files.zip").metadata() else { continue };
-            let stale = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
+            let stale =
+                delete_all || meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
             if stale {
                 let pkg_name = pkg_entry.file_name();
                 let ver_name = ver_entry.file_name();
@@ -339,6 +344,22 @@ fn resolve_recursive(
     Ok(())
 }
 
+/// Build a map of filename → resolved absolute path for all files and links in a manifest.
+/// Used to compare old vs. new destinations when cleaning up stale files.
+fn resolve_manifest_paths(manifest: &Manifest, config: &crate::client::Config) -> BTreeMap<String, PathBuf> {
+    let mut paths = BTreeMap::new();
+    for (file, dest_dir) in &manifest.files {
+        let native_file = crate::platform::to_native_path(file);
+        let dest = config.resolve_dest(dest_dir).join(native_file);
+        paths.insert(file.clone(), dest);
+    }
+    for dest_key in manifest.links.keys() {
+        let dest = config.resolve_dest(dest_key);
+        paths.insert(dest_key.clone(), dest);
+    }
+    paths
+}
+
 /// Check for file conflicts between packages to be installed and already-installed packages.
 ///
 /// Builds a path→owner map from the DB (O(existing files)), then checks each file in the
@@ -471,13 +492,16 @@ pub fn install(
 
     check_conflicts(&to_install, &http.config, db, overwrite)?;
 
-    // Remove old files that are no longer in the new manifest (relevant for --force reinstall).
-    // Check both files and links — shims from links are tracked in db.files too.
+    // Remove old files that are no longer at the same destination in the new manifest.
+    // Compares resolved paths, not just filename keys — catches files that moved between dirs.
     if let Some(new_manifest) = to_install.iter().find(|(n, _, _)| n == name).map(|(_, _, m)| m)
         && let Some(old_pkg) = db.packages.get(name)
     {
+        let new_paths = resolve_manifest_paths(new_manifest, &http.config);
         for (old_file, old_path) in &old_pkg.files {
-            let still_needed = new_manifest.files.contains_key(old_file) || new_manifest.links.contains_key(old_file);
+            let still_needed = new_paths.get(old_file).is_some_and(|new_path| {
+                crate::platform::normalize_for_compare(new_path) == crate::platform::normalize_for_compare(old_path)
+            });
             if !still_needed && old_path.is_file() {
                 fs::remove_file(old_path)?;
                 println!("  Removed old file {old_file}");
@@ -562,6 +586,7 @@ fn download_and_install(
 pub fn update(
     name: Option<&str>,
     dry_run: bool,
+    no_cache: bool,
     overwrite: bool,
     http: &HttpClient,
     db: &mut Database,
@@ -614,6 +639,18 @@ pub fn update(
             let old_version = &db.packages[pkg_name].version;
             println!("  {pkg_name} {old_version} -> {new_version}");
         }
+        // Show new dependencies that would be pulled in
+        let mut new_deps: Vec<String> = Vec::new();
+        for (pkg_name, new_version) in &packages {
+            if let Ok(resolved) = resolve_dependencies(pkg_name, new_version, http, &index, db) {
+                for (dep_name, dep_version, _) in &resolved {
+                    if dep_name != pkg_name && !db.packages.contains_key(dep_name) && !new_deps.contains(dep_name) {
+                        new_deps.push(dep_name.clone());
+                        println!("  + {dep_name} {dep_version} (new dependency)");
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -625,14 +662,16 @@ pub fn update(
 
         check_conflicts(&resolved, &http.config, db, overwrite)?;
 
-        // Remove old files that are no longer in the new manifest.
-        // Check both files and links — shims from links are tracked in db.files too.
+        // Remove old files that are no longer at the same destination in the new manifest.
+        // Compares resolved paths, not just filename keys — catches files that moved between dirs.
         if let Some(new_manifest) = resolved.iter().find(|(n, _, _)| n == pkg_name).map(|(_, _, m)| m)
             && let Some(old_pkg) = db.packages.get(pkg_name)
         {
+            let new_paths = resolve_manifest_paths(new_manifest, &http.config);
             for (old_file, old_path) in &old_pkg.files {
-                let still_needed =
-                    new_manifest.files.contains_key(old_file) || new_manifest.links.contains_key(old_file);
+                let still_needed = new_paths.get(old_file).is_some_and(|new_path| {
+                    crate::platform::normalize_for_compare(new_path) == crate::platform::normalize_for_compare(old_path)
+                });
                 if !still_needed && old_path.is_file() {
                     fs::remove_file(old_path)?;
                     println!("  Removed old file {old_file}");
@@ -647,7 +686,7 @@ pub fn update(
         // Use a sentinel — download_and_install marks main as Manual,
         // but for updates we preserve the original reason
         let original_reason = db.packages.get(pkg_name).map_or(InstallReason::Manual, |p| p.reason);
-        download_and_install(&to_install, pkg_name, false, http, db)?;
+        download_and_install(&to_install, pkg_name, no_cache, http, db)?;
         if let Some(pkg) = db.packages.get_mut(pkg_name) {
             pkg.reason = original_reason;
         }
@@ -880,7 +919,7 @@ mod tests {
             install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages.len(), 1);
 
-            update(None, false, false, &http, &mut db).unwrap();
+            update(None, false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages["toolE"].version, "2.0");
             assert!(db.packages.contains_key("depA"));
         }
@@ -982,6 +1021,78 @@ mod tests {
             assert!(result.is_err());
             assert!(db.packages.is_empty());
             assert!(!install_tmp.path().join("util").join("x.exe").exists());
+        }
+        /// Create a repo where mover@1.0 puts file in "bin/" and mover@2.0 puts it in "lib/"
+        fn create_mover_repo(base: &Path) {
+            let v1 = base.join("packages").join("mover").join("1.0");
+            fs::create_dir_all(&v1).unwrap();
+            fs::write(
+                v1.join("manifest.json"),
+                r#"{"name":"mover","description":"","files":{"tool.exe":"bin/"},"dependencies":[]}"#,
+            )
+            .unwrap();
+            create_zip(&v1, &[("tool.exe", b"v1-binary")]);
+
+            let v2 = base.join("packages").join("mover").join("2.0");
+            fs::create_dir_all(&v2).unwrap();
+            fs::write(
+                v2.join("manifest.json"),
+                r#"{"name":"mover","description":"","files":{"tool.exe":"lib/"},"dependencies":[]}"#,
+            )
+            .unwrap();
+            create_zip(&v2, &[("tool.exe", b"v2-binary")]);
+        }
+
+        #[test]
+        fn update_cleans_old_file_when_dest_dir_changes() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_mover_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install v1 — file goes to bin/
+            install("mover", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert!(install_tmp.path().join("bin").join("tool.exe").exists());
+
+            // Update to v2 — file moves to lib/
+            update(None, false, false, false, &http, &mut db).unwrap();
+            assert!(install_tmp.path().join("lib").join("tool.exe").exists());
+            // Old file at bin/ must be cleaned up
+            assert!(
+                !install_tmp.path().join("bin").join("tool.exe").exists(),
+                "old file at bin/tool.exe should have been removed after dest dir change"
+            );
+        }
+
+        #[test]
+        fn force_reinstall_cleans_old_file_when_dest_dir_changes() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_mover_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install v1 — file goes to bin/
+            install("mover", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert!(install_tmp.path().join("bin").join("tool.exe").exists());
+
+            // Force install v2 — file moves to lib/
+            install("mover", Some("2.0"), true, false, false, &http, &mut db).unwrap();
+            assert!(install_tmp.path().join("lib").join("tool.exe").exists());
+            // Old file at bin/ must be cleaned up
+            assert!(
+                !install_tmp.path().join("bin").join("tool.exe").exists(),
+                "old file at bin/tool.exe should have been removed after dest dir change"
+            );
         }
     } // mod integration
 

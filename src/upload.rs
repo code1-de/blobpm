@@ -221,6 +221,16 @@ pub fn upload(
     for dep in deps {
         validate_pkg_spec("dependency", dep)?;
     }
+    // Warn about dependencies that don't exist on the server yet
+    if !deps.is_empty()
+        && let Ok(index) = fetch_index(http)
+    {
+        for dep in deps {
+            if !index.contains_key(dep) {
+                eprintln!("Warning: dependency '{dep}' not found on server");
+            }
+        }
+    }
     // Check if version already exists on server, warn if uploading an older version
     let existing_versions = fetch_versions(http, name).unwrap_or_default();
     if !force && existing_versions.iter().any(|v| v == version) {
@@ -253,11 +263,11 @@ pub fn upload(
         println!("Dependencies: {}", deps.join(", "));
     }
 
-    // Parse --link args: "dest:target"
+    // Parse --link args: "dest:target" — rsplit_once for consistency with mapping parsing
     let mut link_map = BTreeMap::new();
     for l in links {
         let (dest, target) = l
-            .split_once(':')
+            .rsplit_once(':')
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid link (missing ':'): {l}")))?;
         link_map
             .insert(crate::platform::to_manifest_path(dest.trim()), crate::platform::to_manifest_path(target.trim()));
@@ -360,11 +370,32 @@ pub fn upload_interactive(
     let deps_str = prompt_line("Dependencies (comma-separated)", &deps_default)?;
     let deps: Vec<String> = deps_str.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
 
+    // Show existing links, allow adding more
+    let mut links: Vec<String> = existing_links.to_vec();
+    if !links.is_empty() {
+        println!("Current links:");
+        for l in &links {
+            println!("  {l}");
+        }
+    }
+    println!("Enter additional links (dest:target), empty line to finish:");
+    loop {
+        print!("  link> ");
+        io::Write::flush(&mut io::stdout())?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        links.push(line.to_string());
+    }
+
     if mappings.is_empty() && deps.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "No file mappings or dependencies provided"));
     }
 
-    upload(name, version, from, &mappings, &deps, existing_links, &description, force, lowercase, http)
+    upload(name, version, from, &mappings, &deps, &links, &description, force, lowercase, http)
 }
 
 #[cfg(all(test, feature = "server"))]
