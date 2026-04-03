@@ -41,7 +41,7 @@ The honest answer is: I wanted to have one, and I wanted to build it myself in R
 - **Trust On First Use (TOFU)** – like SSH, the client remembers the server's certificate fingerprint on first connection and warns if it changes
 - **Path safety** – all paths from manifests, uploads, and URLs are validated against traversal attacks (`..`), absolute paths, null bytes, and Windows reserved device names
 - **Confinement** – extracted files are canonicalized and verified to stay inside their allowed root directory
-- **Zip bomb protection** – per-file (1 GB), total (2 GB), and entry count (50k) limits on extraction
+- **Zip bomb protection** – per-file (1 GB), total (2 GB), and entry count (200k) limits on extraction
 - **Constant-time credential comparison** to prevent timing attacks
 - **Owner-only file permissions** on config and database files (Windows ACLs / Unix 0600)
 
@@ -359,7 +359,7 @@ Tests include both unit tests and integration tests. Integration tests spin up e
 |-------|-------|
 | Max file size (per file) | 1 GB |
 | Max total extraction size | 2 GB |
-| Max zip entries | 50,000 |
+| Max zip entries | 200,000 |
 
 ## License
 

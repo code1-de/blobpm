@@ -22,7 +22,7 @@ pub(crate) const MAX_UPLOAD_SIZE: usize = 512 * 1024 * 1024;
 #[derive(Parser)]
 #[command(
     name = "blob",
-    about = format!("blob package manager {} by Christoph Lüders — https://lueders.io", env!("CARGO_PKG_VERSION")),
+    about = format!("Blob Package Manager {} by Christoph Lüders — https://blob.pm", env!("CARGO_PKG_VERSION")),
     version,
 )]
 struct Cli {
