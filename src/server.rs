@@ -1195,4 +1195,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 400, "server should reject self-dependency");
     }
+
+    #[test]
+    fn test_upload_rejects_unsafe_link_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Manifest with a link that uses path traversal
+        let manifest = r#"{"name":"linkpkg","description":"","files":{},"dependencies":[],"links":{"bin/tool.exe":"../../../evil.exe"}}"#;
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/linkpkg/1.0/manifest.json"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(manifest.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400, "server should reject unsafe link path");
+    }
 }

@@ -399,4 +399,32 @@ mod tests {
         remove("toolA", false, true, false, &mut db).unwrap();
         assert!(!db.packages.contains_key("toolA"));
     }
+
+    /// Verify that --keep persists the removal to disk (db.save is not gated on purge).
+    #[test]
+    fn remove_keep_persists_to_db() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let install_tmp = tempfile::tempdir().unwrap();
+        let db_path = install_tmp.path().join("db.json");
+        create_test_repo(repo_tmp.path());
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+        let config = test_config(port, install_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+        let mut db = Database::load_from(&db_path).unwrap();
+
+        install("toolB", None, false, false, false, &http, &mut db).unwrap();
+        assert!(db.packages.contains_key("toolA"));
+        assert!(db.packages.contains_key("toolB"));
+
+        // Remove toolB with --keep: toolA (auto dep) should stay, but removal must be saved
+        remove("toolB", false, false, true, &mut db).unwrap();
+        assert!(!db.packages.contains_key("toolB"));
+        assert!(db.packages.contains_key("toolA"), "auto dep should be kept with --keep");
+
+        // Reload DB from disk — removal must have been persisted
+        let reloaded = Database::load_from(&db_path).unwrap();
+        assert!(!reloaded.packages.contains_key("toolB"), "removal must be persisted to disk");
+        assert!(reloaded.packages.contains_key("toolA"), "kept dep must be persisted");
+    }
 }

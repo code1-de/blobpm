@@ -464,6 +464,26 @@ mod tests {
     // --- Recursive cleanup tests ---
 
     #[test]
+    fn cleanup_does_not_delete_files_containing_blob_marker_in_middle() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Files that contain the marker but don't END with it — must NOT be deleted
+        std::fs::write(tmp.path().join("tool.__blob__.exe"), b"keep").unwrap();
+        std::fs::write(tmp.path().join(".__blob__notes.txt"), b"keep").unwrap();
+        // Real blob rename file — should be deleted
+        std::fs::write(tmp.path().join("tool.exe.0.__blob__"), b"old").unwrap();
+
+        let mut dirs = std::collections::HashSet::new();
+        dirs.insert(tmp.path().to_path_buf());
+
+        let count = cleanup_blob_renames(&dirs);
+        assert_eq!(count, 1);
+        assert!(tmp.path().join("tool.__blob__.exe").exists(), "non-suffix match must survive");
+        assert!(tmp.path().join(".__blob__notes.txt").exists(), "prefix match must survive");
+        assert!(!tmp.path().join("tool.exe.0.__blob__").exists(), "real blob file must be deleted");
+    }
+
+    #[test]
     fn cleanup_recursive_finds_nested_blob_files() {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("sub").join("deep");

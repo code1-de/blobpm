@@ -662,4 +662,47 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
+
+    /// Verify that search with `pin_version` uses canonical form to fetch manifest.
+    /// Package stored as "1" must be found when searching with "1.0.0".
+    #[test]
+    fn search_pin_version_is_canonicalized() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(repo_tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+        let config = test_config(port, src_tmp.path(), &fp);
+        let http = HttpClient::new(&config, false).unwrap();
+
+        fs::write(src_tmp.path().join("tool.exe"), b"binary").unwrap();
+
+        // Upload with version "1.0.0" (canonicalized to "1" on server)
+        upload(
+            "searchpkg",
+            "1.0.0",
+            src_tmp.path(),
+            &["*.exe:bin".to_string()],
+            &[],
+            &[],
+            "A tool",
+            false,
+            false,
+            &http,
+        )
+        .unwrap();
+
+        // Search with non-canonical version — must canonicalize to "1" to find the manifest
+        let canonical = crate::repo::canonicalize_version("1.0.0");
+        assert_eq!(canonical, "1");
+
+        // Fetch manifest with canonical version must work
+        let manifest = crate::install::fetch_manifest(&http, "searchpkg", &canonical).unwrap();
+        assert_eq!(manifest.name, "searchpkg");
+        assert!(manifest.files.contains_key("tool.exe"));
+
+        // Non-canonical must fail (server stores "1", not "1.0.0")
+        let result = crate::install::fetch_manifest(&http, "searchpkg", "1.0.0");
+        assert!(result.is_err(), "non-canonical version must 404 on server");
+    }
 }

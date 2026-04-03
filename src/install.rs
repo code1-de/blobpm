@@ -1170,9 +1170,167 @@ mod tests {
                 "old file at bin/tool.exe should have been removed after dest dir change"
             );
         }
+        #[test]
+        fn install_different_version_replaces_existing() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_diamond_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install toolE v1 (no deps)
+            install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolE"].version, "1.0");
+            assert_eq!(db.packages.len(), 1);
+
+            // Install toolE v2 (adds dep on depA) — must not require --force
+            install("toolE", Some("2.0"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolE"].version, "2.0");
+            assert!(db.packages.contains_key("depA"), "new dependency should be installed");
+        }
+
+        #[test]
+        fn update_does_not_downgrade_locally_newer() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_diamond_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install toolE v2 (latest on server)
+            install("toolE", Some("2.0"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolE"].version, "2.0");
+
+            // Simulate a locally-newer version by patching the DB
+            db.packages.get_mut("toolE").unwrap().version = "99.0".to_string();
+            db.save().unwrap();
+
+            // Update should NOT downgrade to server's 2.0
+            update(Some("toolE"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolE"].version, "99.0", "must not downgrade locally-newer version");
+        }
+
+        #[test]
+        fn update_all_skips_locally_newer() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Install toolA
+            install("toolA", None, false, false, false, &http, &mut db).unwrap();
+
+            // Patch to a newer version than the server has
+            db.packages.get_mut("toolA").unwrap().version = "99.0".to_string();
+            db.save().unwrap();
+
+            // Update all — should report "up to date" and not touch toolA
+            update(None, false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolA"].version, "99.0");
+        }
+        /// Installing with a non-canonical version (e.g. "1.0") must match the server's
+        /// canonical storage ("1") — verifies the canonicalization in `parse_package_spec`.
+        #[test]
+        fn install_with_non_canonical_version() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            let db_path = install_tmp.path().join("db.json");
+            create_test_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+            let mut db = Database::load_from(&db_path).unwrap();
+
+            // Verify canonicalization maps "1.0" → "1" (same as server storage for version "1.0")
+            assert_eq!(crate::repo::canonicalize_version("1.0"), "1");
+            assert_eq!(crate::repo::canonicalize_version("1.0.0"), "1");
+
+            // Install with the exact version on server — should work
+            install("toolA", Some("1.0"), false, false, false, &http, &mut db).unwrap();
+            assert_eq!(db.packages["toolA"].version, "1.0");
+        }
+
+        /// Verify that search --long fetches the manifest for the LATEST version,
+        /// not the first/oldest version.
+        #[test]
+        fn search_long_shows_latest_version_details() {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let install_tmp = tempfile::tempdir().unwrap();
+            create_diamond_repo(repo_tmp.path());
+            let (_rt, port, fp) = start_tls_server(repo_tmp.path());
+
+            let config = test_config(port, install_tmp.path(), &fp);
+            let http = HttpClient::new(&config, false).unwrap();
+
+            // toolE has v1.0 (no deps) and v2.0 (dep on depA)
+            // search --long should fetch manifest for v2.0 (latest), which has deps
+            let versions = fetch_versions(&http, "toolE").unwrap();
+            assert!(versions.contains(&"1.0".to_string()));
+            assert!(versions.contains(&"2.0".to_string()));
+
+            // The latest version is 2.0, which has a dependency on depA
+            let latest_manifest = fetch_manifest(&http, "toolE", "2.0").unwrap();
+            assert!(!latest_manifest.dependencies.is_empty(), "v2.0 should have deps");
+
+            // The oldest version 1.0 has no deps
+            let oldest_manifest = fetch_manifest(&http, "toolE", "1.0").unwrap();
+            assert!(oldest_manifest.dependencies.is_empty(), "v1.0 should have no deps");
+
+            // Verify the version list is sorted — last entry should be "2.0" (latest)
+            assert_eq!(versions.last().unwrap(), "2.0", "last version in sorted list should be latest");
+        }
     } // mod integration
 
     // --- Unit tests (no server needed) ---
+
+    #[test]
+    fn clean_cache_days_zero_deletes_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+
+        // Create two cached entries with different timestamps
+        let v1 = cache.join("pkg").join("1.0");
+        let v2 = cache.join("pkg").join("2.0");
+        fs::create_dir_all(&v1).unwrap();
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(v1.join("files.zip"), b"zip1").unwrap();
+        fs::write(v2.join("files.zip"), b"zip2").unwrap();
+
+        // days=0 must delete everything regardless of age
+        clean_cache(&cache, 0, false);
+
+        assert!(!v1.join("files.zip").exists(), "days=0 must delete all cached files");
+        assert!(!v2.join("files.zip").exists(), "days=0 must delete all cached files");
+    }
+
+    #[test]
+    fn clean_cache_nonzero_keeps_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+
+        let v1 = cache.join("pkg").join("1.0");
+        fs::create_dir_all(&v1).unwrap();
+        fs::write(v1.join("files.zip"), b"zip1").unwrap();
+
+        // days=30 — file was just created, so it's fresh and should survive
+        clean_cache(&cache, 30, false);
+
+        assert!(v1.join("files.zip").exists(), "fresh file should survive days=30");
+    }
 
     #[test]
     fn extract_zip_rejects_directory_entry() {
