@@ -366,7 +366,7 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
             let (search_pattern, pin_version) = if let Some((p, v)) = pattern.split_once('@') {
-                (p.to_string(), Some(v.to_string()))
+                (p.to_string(), Some(repo::canonicalize_version(v)))
             } else {
                 (pattern.clone(), None)
             };
@@ -493,8 +493,11 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
                     }
                     list
                 };
-                let show_details = *long || !names.is_empty();
-                if show_details {
+                if packages.is_empty() {
+                    if *manual {
+                        println!("No manually installed packages.");
+                    }
+                } else if *long || !names.is_empty() {
                     for n in &packages {
                         let pkg = &db.packages[*n];
                         let reason = match pkg.reason {

@@ -141,11 +141,15 @@ pub fn clean_cache(cache_dir: &Path, max_age_days: u32, verbose: bool) {
         }
     }
     if verbose && removed > 0 {
-        println!(
-            "Cleaned {removed} stale cache {} (older than {max_age_days} day{})",
-            pluralize(removed as usize, "entry", "entries"),
-            plural(max_age_days as usize)
-        );
+        if delete_all {
+            println!("Cleaned {removed} cached {}.", pluralize(removed as usize, "entry", "entries"));
+        } else {
+            println!(
+                "Cleaned {removed} stale cache {} (older than {max_age_days} day{}).",
+                pluralize(removed as usize, "entry", "entries"),
+                plural(max_age_days as usize)
+            );
+        }
     }
 }
 
