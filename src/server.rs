@@ -58,7 +58,26 @@ pub struct ServerConfig {
 }
 
 fn default_bind() -> String {
-    "127.0.0.1".to_string()
+    // Localhost on both stacks — safe default, reachable via IPv4 or IPv6 clients.
+    "127.0.0.1,::1".to_string()
+}
+
+/// Parse the `bind` config field into one or more IP addresses.
+///
+/// Accepts either a single address ("0.0.0.0", "::", "127.0.0.1") or a
+/// comma-separated list ("0.0.0.0,::") for dual-stack deployments.
+/// Note: on Linux, binding a single "::" listener also accepts IPv4
+/// connections (`IPV6_V6ONLY=0` by default), so "::" alone is usually enough.
+/// Windows binds are strict IPv6-only; use "0.0.0.0,::" there.
+fn parse_bind_addrs(bind: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+    let addrs: Result<Vec<_>, _> = bind.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::parse).collect();
+    let addrs = addrs.map_err(|e: std::net::AddrParseError| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address in {bind:?}: {e}"))
+    })?;
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bind must not be empty"));
+    }
+    Ok(addrs)
 }
 
 const fn default_port() -> u16 {
@@ -296,10 +315,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let index = RepoIndex::scan(&config.repo)?;
     let pkg_count = index.packages.len();
 
-    let bind_addr: std::net::IpAddr = config
-        .bind
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address: {e}")))?;
+    let bind_addrs = parse_bind_addrs(&config.bind)?;
 
     println!("Serving repo {} on https://{}:{}", config.repo.display(), config.bind, config.port);
 
@@ -332,15 +348,25 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let fingerprint = crate::tls::current_fingerprint()?;
     let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(std::io::Error::other)?;
 
-    let addr = SocketAddr::from((bind_addr, config.port));
     println!("{pkg_count} packages available");
     println!("Fingerprint: {fingerprint}");
     println!("Users: {admin_count} admin, {reader_count} reader");
 
-    axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .map_err(std::io::Error::other)
+    // Spawn one listener per bind address; fail fast if any listener errors out.
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let mut tasks = tokio::task::JoinSet::new();
+    for bind_addr in bind_addrs {
+        let addr = SocketAddr::from((bind_addr, config.port));
+        let tls_cfg = tls_config.clone();
+        let svc = make_service.clone();
+        tasks.spawn(async move {
+            axum_server::bind_rustls(addr, tls_cfg).serve(svc).await.map_err(std::io::Error::other)
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        res.map_err(std::io::Error::other)??;
+    }
+    Ok(())
 }
 
 async fn get_index(
@@ -737,7 +763,7 @@ async fn delete_version(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_io_error;
+    use super::{parse_bind_addrs, sanitize_io_error};
     use crate::server::{UserEntry, UserRole};
     use crate::testutil::helpers::create_zip;
     use crate::testutil::server_helpers::{
@@ -762,6 +788,40 @@ mod tests {
 
     fn auth_delete(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
         client.delete(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_single_ipv4() {
+        let a = parse_bind_addrs("0.0.0.0").unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(a[0].is_ipv4());
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_single_ipv6() {
+        let a = parse_bind_addrs("::").unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(a[0].is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_dual_stack_list() {
+        let a = parse_bind_addrs("0.0.0.0, ::").unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a[0].is_ipv4());
+        assert!(a[1].is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_rejects_empty() {
+        assert!(parse_bind_addrs("").is_err());
+        assert!(parse_bind_addrs(",").is_err());
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_rejects_garbage() {
+        assert!(parse_bind_addrs("not-an-ip").is_err());
+        assert!(parse_bind_addrs("0.0.0.0,nope").is_err());
     }
 
     #[test]

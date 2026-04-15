@@ -340,7 +340,7 @@ Tests include both unit tests and integration tests. Integration tests spin up e
 | Field | Default | Description |
 |-------|---------|-------------|
 | `repo` | (required) | Path to the package repository |
-| `bind` | `127.0.0.1` | Bind address |
+| `bind` | `127.0.0.1,::1` | Bind address(es). Comma-separated list, e.g. `"0.0.0.0,::"` for dual-stack public binding. |
 | `port` | `53777` | Listen port |
 | `log` | (none) | Optional log file path |
 | `users` | (required) | List of `{username, password, role}` entries |
