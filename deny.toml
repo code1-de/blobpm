@@ -151,8 +151,12 @@ registries = [
 # More documentation about the 'bans' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
-# Lint level for when multiple versions of the same crate are detected
-multiple-versions = "warn"
+# Lint level for when multiple versions of the same crate are detected.
+# `allow` because duplicates in our graph are almost all transitive — multiple
+# `windows-*`, `thiserror`, `getrandom`, etc. pulled in by deps we don't
+# control. Actionable duplicates at our direct deps would show up under
+# `bans.deny`/`skip` instead. Flip to `warn` when auditing for bloat.
+multiple-versions = "allow"
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
 # The graph highlighting used when creating dotgraphs for crates

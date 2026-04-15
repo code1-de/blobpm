@@ -1,0 +1,16 @@
+# cargo-audit configuration.
+#
+# Ignored advisories must carry a comment stating *why* they don't apply to
+# blob. This file is re-read on every run, so expired justifications surface
+# during review rather than silently.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0097 — `rand::rng()` panics on reentrancy when a custom
+    # global `log::Logger` installed at startup itself calls `rand::rng()`
+    # during its construction. blob does not install a custom global logger,
+    # and `rand` is not a direct dependency (pulled in via reqwest → quinn
+    # → quinn-proto for QUIC transport). Revisit if we ever wire in a
+    # custom logger or if `rand` ships a fix.
+    "RUSTSEC-2026-0097",
+]
