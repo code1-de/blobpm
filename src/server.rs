@@ -26,8 +26,16 @@ pub(crate) const MAX_LOCKOUT_SECS: u64 = 3600;
 pub(crate) const MAX_CONCURRENT: usize = 20;
 /// Maximum concurrent connections per IP.
 pub(crate) const MAX_CONNECTIONS_PER_IP: u32 = 10;
-/// Prune auth failure map when it exceeds this many entries.
-const AUTH_MAP_MAX: usize = 128;
+/// Hard cap on the auth failure map. Entries beyond this are evicted oldest-first
+/// to bound memory under IPv6 source-address spoofing.
+const AUTH_MAP_MAX: usize = 10_000;
+/// Maximum length of the request path stored in log lines. Longer paths are truncated.
+const MAX_LOG_PATH_LEN: usize = 200;
+/// Maximum nesting depth accepted in uploaded manifests (defense in depth —
+/// `serde_json` defaults to 128, but manifests are flat so a tight cap fails fast).
+const MAX_MANIFEST_JSON_DEPTH: usize = 32;
+/// Minimum password length accepted in server config.
+const MIN_PASSWORD_LEN: usize = 12;
 /// Server-side request timeout in seconds (covers entire request lifecycle).
 pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 600;
 
@@ -70,7 +78,8 @@ fn default_bind() -> String {
 /// connections (`IPV6_V6ONLY=0` by default), so "::" alone is usually enough.
 /// Windows binds are strict IPv6-only; use "0.0.0.0,::" there.
 fn parse_bind_addrs(bind: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
-    let addrs: Result<Vec<_>, _> = bind.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::parse).collect();
+    let addrs: Result<Vec<_>, _> =
+        bind.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::parse).collect();
     let addrs = addrs.map_err(|e: std::net::AddrParseError| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address in {bind:?}: {e}"))
     })?;
@@ -99,11 +108,29 @@ pub struct AppState {
     pub log_file: std::sync::Mutex<Option<BufWriter<std::fs::File>>>,
 }
 
+/// Sanitize a request path for safe logging: replace control characters with `?`
+/// and truncate to `MAX_LOG_PATH_LEN` to prevent log injection / unbounded log lines.
+fn sanitize_log_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len().min(MAX_LOG_PATH_LEN));
+    for c in path.chars().take(MAX_LOG_PATH_LEN) {
+        if c.is_control() {
+            out.push('?');
+        } else {
+            out.push(c);
+        }
+    }
+    if path.chars().count() > MAX_LOG_PATH_LEN {
+        out.push_str("...");
+    }
+    out
+}
+
 impl AppState {
     fn log_entry(&self, ip: IpAddr, method: &str, path: &str, status: u16, detail: Option<&str>) {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let safe_path = sanitize_log_path(path);
         let detail_str = detail.map_or_else(String::new, |d| format!("  {d}"));
-        let line = format!("{now}  {ip}  {method} {path}  {status}{detail_str}\n");
+        let line = format!("{now}  {ip}  {method} {safe_path}  {status}{detail_str}\n");
         print!("{line}");
         if let Ok(mut guard) = self.log_file.lock()
             && let Some(f) = guard.as_mut()
@@ -142,11 +169,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::max(crate::MAX_UPLOAD_SIZE)),
         )
         .route("/packages/{name}/{version}", axum::routing::delete(delete_version))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        // Layers execute outside-in for requests; last `.layer(...)` is outermost.
+        // Order (request flow, outermost-first): per-IP connection cap →
+        // auth → request timeout → global concurrency slot → security headers → handler.
+        // Putting the concurrency slot *inside* auth means unauthenticated slow
+        // requests cannot exhaust the global pool; per-IP cap still bounds them pre-auth.
         .layer(middleware::map_response(add_security_headers))
-        .layer(middleware::from_fn(request_timeout_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), per_ip_limit_middleware))
         .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT))
+        .layer(middleware::from_fn(request_timeout_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), per_ip_limit_middleware))
         .with_state(state)
 }
 
@@ -215,12 +247,21 @@ async fn auth_middleware(
         next.run(req).await
     } else {
         let count = if let Ok(mut failures) = state.auth_failures.lock() {
-            // Prune stale entries to bound HashMap size
-            if failures.len() > AUTH_MAP_MAX {
+            // Only prune when we're about to insert a *new* IP and the map is at cap.
+            // This prevents unbounded growth under source-address spoofing (e.g. a /64
+            // IPv6 range rotating source addresses on every request).
+            if !failures.contains_key(&ip) && failures.len() >= AUTH_MAP_MAX {
+                // First, drop entries whose lockout has fully expired.
                 failures.retain(|_, entry| {
                     let expiry = lockout_secs(entry.count).max(BASE_LOCKOUT_SECS);
                     entry.last_attempt.elapsed().as_secs() < expiry
                 });
+                // If still at cap, evict the oldest entry to make room.
+                if failures.len() >= AUTH_MAP_MAX
+                    && let Some(oldest) = failures.iter().min_by_key(|(_, e)| e.last_attempt).map(|(k, _)| *k)
+                {
+                    failures.remove(&oldest);
+                }
             }
             let entry = failures.entry(ip).or_insert(AuthFailure { count: 0, last_attempt: Instant::now() });
             // Full reset after long inactivity
@@ -310,6 +351,12 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                 format!("Username and password must not be empty (user: {:?}).", user.username),
             ));
         }
+        if user.password.chars().count() < MIN_PASSWORD_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Password for user {:?} must be at least {MIN_PASSWORD_LEN} characters.", user.username),
+            ));
+        }
     }
 
     let index = RepoIndex::scan(&config.repo)?;
@@ -359,9 +406,9 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         let addr = SocketAddr::from((bind_addr, config.port));
         let tls_cfg = tls_config.clone();
         let svc = make_service.clone();
-        tasks.spawn(async move {
-            axum_server::bind_rustls(addr, tls_cfg).serve(svc).await.map_err(std::io::Error::other)
-        });
+        tasks.spawn(
+            async move { axum_server::bind_rustls(addr, tls_cfg).serve(svc).await.map_err(std::io::Error::other) },
+        );
     }
     while let Some(res) = tasks.join_next().await {
         res.map_err(std::io::Error::other)??;
@@ -495,12 +542,56 @@ async fn get_file(
     }
 }
 
+/// Scan raw JSON bytes for maximum bracket nesting depth. Rejects input exceeding
+/// `MAX_MANIFEST_JSON_DEPTH` before handing it to `serde_json` — defense in depth
+/// against stack exhaustion (release builds use `panic = "abort"` so a deserializer
+/// panic would crash the server, not just the handler task).
+fn check_json_depth(data: &[u8]) -> Result<(), String> {
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for &b in data {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+                if max_depth > MAX_MANIFEST_JSON_DEPTH {
+                    return Err(format!("JSON nesting too deep (> {MAX_MANIFEST_JSON_DEPTH})"));
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Verify that a zip file contains all files listed in the manifest (and no extras).
 fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std::path::Path) -> Result<(), String> {
     let manifest_data = std::fs::read(manifest_path).map_err(|e| format!("read manifest: {e}"))?;
+    check_json_depth(&manifest_data)?;
     let manifest: Manifest = serde_json::from_slice(&manifest_data).map_err(|e| format!("parse manifest: {e}"))?;
     let zip_file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
     let archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("parse zip: {e}"))?;
+    if archive.len() > crate::install::MAX_ZIP_ENTRIES {
+        return Err(format!("zip has {} entries (max {})", archive.len(), crate::install::MAX_ZIP_ENTRIES));
+    }
 
     let zip_names: std::collections::HashSet<String> =
         (0..archive.len()).filter_map(|i| archive.name_for_index(i).map(String::from)).collect();
@@ -522,6 +613,9 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
 async fn validate_uploaded_manifest(manifest_path: &std::path::Path, expected_name: &str) -> Result<(), (u16, String)> {
     let data =
         tokio::fs::read(manifest_path).await.map_err(|e| (500, format!("read manifest: {}", sanitize_io_error(&e))))?;
+    if let Err(e) = check_json_depth(&data) {
+        return Err((400, e));
+    }
     let manifest: Manifest = serde_json::from_slice(&data).map_err(|e| (400, format!("invalid manifest JSON: {e}")))?;
     if manifest.name != expected_name {
         return Err((400, format!("manifest name mismatch: URL={expected_name}, manifest={}", manifest.name)));
@@ -676,10 +770,18 @@ async fn post_upload(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Cross-validate zip against manifest (zip is always uploaded after manifest)
+    // Cross-validate zip against manifest (zip is always uploaded after manifest).
+    // Runs on a blocking thread so the synchronous zip parse doesn't stall the async runtime.
     if filename == "files.zip" {
         let manifest_path = dir.join("manifest.json");
-        if let Err(e) = validate_zip_against_manifest(&manifest_path, &final_path) {
+        let zip_path = final_path.clone();
+        let mp = manifest_path.clone();
+        let validation = tokio::task::spawn_blocking(move || validate_zip_against_manifest(&mp, &zip_path)).await;
+        let result = match validation {
+            Ok(r) => r,
+            Err(e) => Err(format!("zip validation task failed: {e}")),
+        };
+        if let Err(e) = result {
             state.log_entry(ip, "POST", &url_path, 400, Some(&format!("zip/manifest mismatch: {e}")));
             // Clean up both zip and manifest to avoid leaving the package in a broken state
             let _ = tokio::fs::remove_file(&final_path).await;
@@ -763,7 +865,7 @@ async fn delete_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bind_addrs, sanitize_io_error};
+    use super::{check_json_depth, parse_bind_addrs, sanitize_io_error, sanitize_log_path};
     use crate::server::{UserEntry, UserRole};
     use crate::testutil::helpers::create_zip;
     use crate::testutil::server_helpers::{
@@ -788,6 +890,43 @@ mod tests {
 
     fn auth_delete(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
         client.delete(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
+    }
+
+    #[test]
+    fn test_sanitize_log_path_strips_control_chars() {
+        assert_eq!(sanitize_log_path("/a\r\nb"), "/a??b");
+        assert_eq!(sanitize_log_path("/a\x00\x1bb"), "/a??b");
+        assert_eq!(sanitize_log_path("/normal/path"), "/normal/path");
+    }
+
+    #[test]
+    fn test_sanitize_log_path_truncates() {
+        let long = "a".repeat(500);
+        let out = sanitize_log_path(&long);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= 203);
+    }
+
+    #[test]
+    fn test_check_json_depth_accepts_shallow() {
+        assert!(check_json_depth(br#"{"a":{"b":[1,2,{"c":3}]}}"#).is_ok());
+    }
+
+    #[test]
+    fn test_check_json_depth_rejects_deep() {
+        let deep = "[".repeat(100) + &"]".repeat(100);
+        assert!(check_json_depth(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_check_json_depth_ignores_brackets_in_strings() {
+        let s = br#"{"key":"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["}"#;
+        assert!(check_json_depth(s).is_ok());
+    }
+
+    #[test]
+    fn test_check_json_depth_handles_escaped_quotes() {
+        assert!(check_json_depth(br#"{"k":"\"[[[["}"#).is_ok());
     }
 
     #[test]
