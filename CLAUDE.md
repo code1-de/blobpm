@@ -45,6 +45,15 @@ cargo run -- install <pkg>
 - **Imports:** Prefer `use crate::module::Item;` at the top of the file over inline `crate::module::Item` paths in code
 - **No big refactors without asking first.** Discuss architectural changes before implementing them.
 - **No automatic commits or pushes.** Only commit or push when the user explicitly asks.
-- **Before committing:** Review and update `PLAN.md` — check off completed items, add new items if needed.
+- **Before committing:** if a `PLAN.md` exists (it lives in the maintainer's private overlay repo, see below), review and update it — check off completed items, add new items if needed.
 - **No `cd` or `git -C` when already in the working directory.** The working directory is already set correctly. Only use `git -C` when targeting a *different* repo.
 - **No hand-rolled FFI.** Never manually define Windows API constants, struct sizes, or function signatures when they're available from the `windows` crate. Add the required feature to Cargo.toml instead.
+
+## Private overlay repo (maintainer-only)
+
+This working directory hosts two git repos sharing one tree:
+
+- `.git/` — the public repo (this one). Tracks source, docs, and configs.
+- `.git-private/` — a private overlay with personal scripts, `PLAN.md`, `docker/`, `.claude/`, and local configs. Invoked via the `gip.bat` wrapper (`gip status`, `gip log`, etc.). Not present in public clones.
+
+Public clones do not see `.git-private/` or `gip.bat`. Contributors can ignore this section; it only matters on the maintainer's machine.
