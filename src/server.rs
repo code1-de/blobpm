@@ -72,14 +72,13 @@ fn default_bind() -> String {
 
 /// Parse the `bind` config field into one or more IP addresses.
 ///
-/// Accepts either a single address ("0.0.0.0", "::", "127.0.0.1") or a
-/// comma-separated list ("0.0.0.0,::") for dual-stack deployments.
-/// Note: on Linux, binding a single "::" listener also accepts IPv4
-/// connections (`IPV6_V6ONLY=0` by default), so "::" alone is usually enough.
-/// Windows binds are strict IPv6-only; use "0.0.0.0,::" there.
+/// Accepts either a single address (`"0.0.0.0"`, `"::"`, `"127.0.0.1"`) or a
+/// comma-separated list (`"0.0.0.0,::"`) for dual-stack deployments.
+/// Note: on Linux, binding a single `"::"` listener also accepts IPv4
+/// connections (`IPV6_V6ONLY=0` by default), so `"::"` alone is usually enough.
+/// Windows binds are strict IPv6-only; use `"0.0.0.0,::"` there.
 fn parse_bind_addrs(bind: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
-    let addrs: Result<Vec<_>, _> =
-        bind.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::parse).collect();
+    let addrs: Result<Vec<_>, _> = bind.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse).collect();
     let addrs = addrs.map_err(|e: std::net::AddrParseError| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid bind address in {bind:?}: {e}"))
     })?;

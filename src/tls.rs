@@ -249,7 +249,7 @@ pub fn build_client(config: &super::client::Config, non_interactive: bool) -> io
         .use_preconfigured_tls(tls_config)
         .redirect(reqwest::redirect::Policy::none())
         .tcp_keepalive(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(600))
+        .timeout(std::time::Duration::from_mins(10))
         .build()
         .map_err(|e| io::Error::other(format!("Failed to build HTTP client: {e}")))
 }
