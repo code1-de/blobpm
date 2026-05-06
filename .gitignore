@@ -1,6 +1,5 @@
 /target
 /target-wsl
-/Cargo.lock
 /.sem/
 /.claude/
 /repo
