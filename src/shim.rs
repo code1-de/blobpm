@@ -69,7 +69,7 @@ pub fn create_shims(
 
         fs::write(&dest_path, &shim_data)?;
         println!(
-            "  {dest} -> {} -> {} (shim{})",
+            "  {dest} -> {} [{}] (shim{})",
             dest_path.display(),
             target_path.display(),
             if gui { ", gui" } else { "" }
