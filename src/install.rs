@@ -555,7 +555,10 @@ fn download_and_install(
     }
 
     // Phase 2: extract all
-    for (pkg_name, version, manifest, zip_path) in &downloads {
+    for (i, (pkg_name, version, manifest, zip_path)) in downloads.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         let reason = if *pkg_name == manual_name { InstallReason::Manual } else { InstallReason::Auto };
 
         #[allow(unused_mut)]
@@ -593,9 +596,11 @@ fn download_and_install(
 ///
 /// # Errors
 /// Returns an error if fetching, downloading, or writing files fails.
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn update(
     name: Option<&str>,
     dry_run: bool,
+    force: bool,
     no_cache: bool,
     overwrite: bool,
     http: &HttpClient,
@@ -618,8 +623,10 @@ pub fn update(
         match crate::repo::version_cmp(&latest, &db.packages[n].version) {
             std::cmp::Ordering::Greater => {}
             std::cmp::Ordering::Equal => {
-                println!("{n} is already at latest version ({latest}).");
-                return Ok(());
+                if !force {
+                    println!("{n} is already at latest version ({latest}). Use --force to reinstall.");
+                    return Ok(());
+                }
             }
             std::cmp::Ordering::Less => {
                 println!("{n} is newer than server latest ({} > {latest}).", db.packages[n].version);
@@ -630,10 +637,11 @@ pub fn update(
     } else {
         let mut list = Vec::new();
         for (n, pkg) in &db.packages {
-            if let Some(entry) = index.get(n)
-                && crate::repo::version_cmp(&entry.latest, &pkg.version) == std::cmp::Ordering::Greater
-            {
-                list.push((n.clone(), entry.latest.clone()));
+            if let Some(entry) = index.get(n) {
+                let cmp = crate::repo::version_cmp(&entry.latest, &pkg.version);
+                if cmp == std::cmp::Ordering::Greater || (force && cmp == std::cmp::Ordering::Equal) {
+                    list.push((n.clone(), entry.latest.clone()));
+                }
             }
         }
         if list.is_empty() {
@@ -664,7 +672,10 @@ pub fn update(
         return Ok(());
     }
 
-    for (pkg_name, new_version) in &packages {
+    for (i, (pkg_name, new_version)) in packages.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         let old_version = db.packages[pkg_name].version.clone();
         println!("Updating {pkg_name} {old_version} -> {new_version}...");
 
@@ -929,7 +940,7 @@ mod tests {
             install("toolE", Some("1.0"), false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages.len(), 1);
 
-            update(None, false, false, false, &http, &mut db).unwrap();
+            update(None, false, false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages["toolE"].version, "2.0");
             assert!(db.packages.contains_key("depA"));
         }
@@ -1026,7 +1037,7 @@ mod tests {
             assert!(db.packages.contains_key("selfpkg"));
 
             // Update to v2 (has self-dep) — must fail
-            let result = update(None, false, false, false, &http, &mut db);
+            let result = update(None, false, false, false, false, &http, &mut db);
             assert!(result.is_err(), "update to self-referencing version should fail");
         }
 
@@ -1136,7 +1147,7 @@ mod tests {
             assert!(install_tmp.path().join("bin").join("tool.exe").exists());
 
             // Update to v2 — file moves to lib/
-            update(None, false, false, false, &http, &mut db).unwrap();
+            update(None, false, false, false, false, &http, &mut db).unwrap();
             assert!(install_tmp.path().join("lib").join("tool.exe").exists());
             // Old file at bin/ must be cleaned up
             assert!(
@@ -1214,7 +1225,7 @@ mod tests {
             db.save().unwrap();
 
             // Update should NOT downgrade to server's 2.0
-            update(Some("toolE"), false, false, false, &http, &mut db).unwrap();
+            update(Some("toolE"), false, false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages["toolE"].version, "99.0", "must not downgrade locally-newer version");
         }
 
@@ -1238,7 +1249,7 @@ mod tests {
             db.save().unwrap();
 
             // Update all — should report "up to date" and not touch toolA
-            update(None, false, false, false, &http, &mut db).unwrap();
+            update(None, false, false, false, false, &http, &mut db).unwrap();
             assert_eq!(db.packages["toolA"].version, "99.0");
         }
         /// Installing with a non-canonical version (e.g. "1.0") must match the server's

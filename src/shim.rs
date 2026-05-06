@@ -68,7 +68,12 @@ pub fn create_shims(
         shim_data.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
 
         fs::write(&dest_path, &shim_data)?;
-        println!("  {dest} -> {} (shim{})", dest_path.display(), if gui { ", gui" } else { "" });
+        println!(
+            "  {dest} -> {} -> {} (shim{})",
+            dest_path.display(),
+            target_path.display(),
+            if gui { ", gui" } else { "" }
+        );
 
         created.insert(dest.clone(), dest_path);
     }

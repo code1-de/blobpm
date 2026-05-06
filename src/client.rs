@@ -75,6 +75,33 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
     Ok(())
 }
 
+/// Compute the manifest-relative install path for a single file entry: `dest_dir/filename`.
+/// Empty or "." `dest_dir` means install at the package root.
+pub(crate) fn manifest_install_path(filename: &str, dest_dir: &str) -> String {
+    let dest = dest_dir.trim_end_matches('/');
+    if dest.is_empty() || dest == "." { filename.to_string() } else { format!("{dest}/{filename}") }
+}
+
+/// Validate that every link target points to a file installed by this manifest.
+/// Cross-package link targets (pointing into a dependency) are not allowed: a link
+/// must resolve to a file produced by *this* upload.
+pub(crate) fn validate_link_targets(
+    files: &BTreeMap<String, String>,
+    links: &BTreeMap<String, String>,
+) -> io::Result<()> {
+    let install_paths: std::collections::BTreeSet<String> =
+        files.iter().map(|(filename, dest_dir)| manifest_install_path(filename, dest_dir)).collect();
+    for (dest, target) in links {
+        if !install_paths.contains(target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Link target not found in this upload: {dest} -> {target}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
@@ -416,6 +443,37 @@ mod tests {
 
         let result = validate_manifest_path("console.exe", "util", "goodpkg");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn link_target_must_exist_in_files() {
+        let mut files = BTreeMap::new();
+        files.insert("tool.exe".to_string(), "app/bin".to_string());
+
+        let mut links = BTreeMap::new();
+        links.insert("bin/tool.exe".to_string(), "app/bin/tool.exe".to_string());
+        assert!(validate_link_targets(&files, &links).is_ok());
+
+        let mut bad = BTreeMap::new();
+        bad.insert("bin/missing.exe".to_string(), "app/bin/missing.exe".to_string());
+        assert!(validate_link_targets(&files, &bad).is_err());
+    }
+
+    #[test]
+    fn link_target_at_root_dest() {
+        let mut files = BTreeMap::new();
+        files.insert("tool.exe".to_string(), String::new());
+
+        let mut links = BTreeMap::new();
+        links.insert("bin/tool.exe".to_string(), "tool.exe".to_string());
+        assert!(validate_link_targets(&files, &links).is_ok());
+    }
+
+    #[test]
+    fn empty_links_always_valid() {
+        let files = BTreeMap::new();
+        let links = BTreeMap::new();
+        assert!(validate_link_targets(&files, &links).is_ok());
     }
 
     #[test]

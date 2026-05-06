@@ -79,6 +79,10 @@ enum Commands {
         #[arg(long, short = 'n')]
         dry_run: bool,
 
+        /// Reinstall even if already at the latest version (e.g. to repair files)
+        #[arg(long, short)]
+        force: bool,
+
         /// Ignore cached zip files, always download from server
         #[arg(long, short = 'C')]
         no_cache: bool,
@@ -459,15 +463,15 @@ fn run_command(command: &Commands, yes: bool) -> Result<(), Box<dyn std::error::
             println!("Cleaning cache (max age: {max_days} day{})...", util::plural(max_days as usize));
             install::clean_cache(&config.cache_dir()?, max_days, true);
         }
-        Commands::Update { names, dry_run, no_cache, overwrite } => {
+        Commands::Update { names, dry_run, force, no_cache, overwrite } => {
             let config = client::Config::load()?;
             let http = client::HttpClient::new(&config, yes)?;
             let mut db = client::Database::load()?;
             if names.is_empty() {
-                install::update(None, *dry_run, *no_cache, *overwrite, &http, &mut db)?;
+                install::update(None, *dry_run, *force, *no_cache, *overwrite, &http, &mut db)?;
             } else {
                 for name in names {
-                    install::update(Some(name.as_str()), *dry_run, *no_cache, *overwrite, &http, &mut db)?;
+                    install::update(Some(name.as_str()), *dry_run, *force, *no_cache, *overwrite, &http, &mut db)?;
                 }
             }
         }

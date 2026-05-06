@@ -637,6 +637,9 @@ async fn validate_uploaded_manifest(manifest_path: &std::path::Path, expected_na
             return Err((400, format!("unsafe link path: {dest} -> {target}")));
         }
     }
+    if let Err(e) = crate::client::validate_link_targets(&manifest.files, &manifest.links) {
+        return Err((400, e.to_string()));
+    }
     Ok(())
 }
 
@@ -1410,5 +1413,23 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(resp.status(), 400, "server should reject unsafe link path");
+    }
+
+    #[test]
+    fn test_upload_rejects_link_target_not_in_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("packages")).unwrap();
+        let (_rt, port, fp) = start_tls_server(tmp.path());
+        let client = tls_client_no_auth(&fp);
+
+        // Link target "app/bin/missing.exe" is not produced by any file in the manifest
+        let manifest = r#"{"name":"linkpkg","description":"","files":{"tool.exe":"app/bin"},"dependencies":[],"links":{"bin/missing.exe":"app/bin/missing.exe"}}"#;
+        let resp = client
+            .post(format!("https://localhost:{port}/upload/linkpkg/1.0/manifest.json"))
+            .basic_auth(TEST_USER, Some(TEST_PASS))
+            .body(manifest.to_string())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400, "server should reject link target absent from files");
     }
 }

@@ -279,6 +279,8 @@ pub fn upload(
         }
     }
 
+    crate::client::validate_link_targets(&files, &link_map)?;
+
     let manifest = Manifest {
         name: name.to_string(),
         description: description.to_string(),
