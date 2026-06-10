@@ -166,6 +166,12 @@ pub(crate) const MAX_TOTAL_EXTRACT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// Maximum number of entries in a zip archive — prevents inode exhaustion from many tiny files.
 pub(crate) const MAX_ZIP_ENTRIES: usize = 200_000;
 
+/// Upper bound on the per-file buffer pre-allocation hint. The zip's declared
+/// uncompressed size is attacker-controlled (a header field), so cap how much we
+/// pre-allocate up front — otherwise a tiny download declaring a huge size forces
+/// a large allocation. `io::copy` grows the buffer from here as real bytes arrive.
+const PREALLOC_HINT_CAP: u64 = 16 * 1024 * 1024;
+
 fn extract_zip(
     zip_path: &Path,
     manifest: &Manifest,
@@ -248,10 +254,12 @@ fn extract_zip(
             ));
         }
 
-        // Read entry with a size-limiting reader to prevent decompression bombs
+        // Read entry with a size-limiting reader to prevent decompression bombs.
+        // Pre-allocate only a capped amount: the declared size is attacker-controlled,
+        // so a tiny download must not be able to force a huge allocation.
         let declared_size = entry.size();
         let mut limited = entry.take(MAX_EXTRACT_SIZE + 1);
-        let mut buf = Vec::with_capacity(declared_size.min(MAX_EXTRACT_SIZE) as usize);
+        let mut buf = Vec::with_capacity(declared_size.min(PREALLOC_HINT_CAP) as usize);
         io::copy(&mut limited, &mut buf)?;
         if buf.len() as u64 > MAX_EXTRACT_SIZE {
             return Err(io::Error::new(
