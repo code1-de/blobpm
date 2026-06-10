@@ -1,4 +1,4 @@
-//! Blob shim — tiny no_std launcher that reads a relative target exe path appended
+//! Blob shim — tiny `no_std` launcher that reads a relative target exe path appended
 //! to itself, resolves it against its own directory, launches it with the original
 //! arguments, waits, and propagates the exit code.
 //!
@@ -10,6 +10,19 @@
 #![no_main]
 #![windows_subsystem = "console"]
 #![allow(unsafe_op_in_unsafe_fn)]
+// Hand-rolled no_std FFI launcher: these pedantic lints don't fit this context.
+// All int casts are between fixed-width types whose values are bounded by the
+// surrounding logic (buffers ≤ 32 KiB, path lengths validated before casting);
+// the large fixed-size buffers are deliberate (no_std has no heap); and the index
+// loops perform explicit bounds-checked copies that read clearer than iterator
+// adapters here.
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::large_stack_arrays)]
+#![allow(clippy::too_many_lines)]
 
 // --- Win32 FFI ---
 
@@ -93,7 +106,7 @@ unsafe extern "system" {
 unsafe fn die(msg: &[u8]) -> ! {
     let h = GetStdHandle(STD_ERROR_HANDLE);
     let mut w = 0u32;
-    WriteFile(h, msg.as_ptr(), msg.len() as u32, &mut w, 0);
+    WriteFile(h, msg.as_ptr(), msg.len() as u32, &raw mut w, 0);
     ExitProcess(127)
 }
 
@@ -143,7 +156,7 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
     SetFilePointer(file, -4, core::ptr::null_mut(), FILE_END);
     let mut len_buf = [0u8; 4];
     let mut read = 0u32;
-    ReadFile(file, len_buf.as_mut_ptr(), 4, &mut read, 0);
+    ReadFile(file, len_buf.as_mut_ptr(), 4, &raw mut read, 0);
     let path_len = u32::from_le_bytes(len_buf) as usize;
 
     if path_len == 0 || path_len > 32768 {
@@ -154,7 +167,7 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
     // 4. Read target path (UTF-8)
     let mut target_utf8 = [0u8; 32768];
     SetFilePointer(file, -(4 + path_len as i32), core::ptr::null_mut(), FILE_END);
-    ReadFile(file, target_utf8.as_mut_ptr(), path_len as u32, &mut read, 0);
+    ReadFile(file, target_utf8.as_mut_ptr(), path_len as u32, &raw mut read, 0);
     CloseHandle(file);
 
     // 5. Convert relative target path UTF-8 → UTF-16
@@ -252,8 +265,8 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
         0,
         0,
         0,
-        &si,
-        &mut pi,
+        &raw const si,
+        &raw mut pi,
     );
     if ok == 0 {
         die(b"blob-shim: cannot launch target\r\n");
@@ -262,7 +275,7 @@ unsafe extern "C" fn mainCRTStartup() -> ! {
     // 9. Wait and propagate exit code
     WaitForSingleObject(pi.process, INFINITE);
     let mut exit_code = 1u32;
-    GetExitCodeProcess(pi.process, &mut exit_code);
+    GetExitCodeProcess(pi.process, &raw mut exit_code);
     CloseHandle(pi.process);
     CloseHandle(pi.thread);
 
