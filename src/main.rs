@@ -644,12 +644,15 @@ fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Res
     let manifest = install::fetch_manifest(http, name, &version)?;
     let config = client::Config::load()?;
 
+    // name/version are CLI args already validated by validate_pkg_spec (no control
+    // chars possible). The remaining fields come from the server manifest, so sanitize
+    // control chars before printing to prevent terminal-escape injection.
     println!("{name} {version}");
     if !manifest.description.is_empty() {
-        println!("  {}", manifest.description);
+        println!("  {}", util::sanitize_display(&manifest.description));
     }
     if !manifest.dependencies.is_empty() {
-        println!("  Dependencies: {}", manifest.dependencies.join(", "));
+        println!("  Dependencies: {}", util::sanitize_display(&manifest.dependencies.join(", ")));
     }
     if manifest.files.is_empty() {
         println!("  (meta-package, no files)");
@@ -657,7 +660,7 @@ fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Res
         println!("  Files:");
         for (file, dest_dir) in &manifest.files {
             let dest = config.resolve_dest(dest_dir).join(platform::to_native_path(file));
-            println!("    {file} -> {}", dest.display());
+            println!("    {} -> {}", util::sanitize_display(file), util::sanitize_display(&dest.display().to_string()));
         }
     }
     if !manifest.links.is_empty() {
@@ -665,7 +668,11 @@ fn run_info(name: &str, version: Option<&str>, http: &client::HttpClient) -> Res
         for (dest, target) in &manifest.links {
             let dest_path = config.resolve_dest(dest);
             let target_path = config.resolve_dest(target);
-            println!("    {} -> {}", dest_path.display(), target_path.display());
+            println!(
+                "    {} -> {}",
+                util::sanitize_display(&dest_path.display().to_string()),
+                util::sanitize_display(&target_path.display().to_string())
+            );
         }
     }
     Ok(())

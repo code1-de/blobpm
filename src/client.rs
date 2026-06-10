@@ -59,10 +59,27 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
         if value.contains('\0') {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Null byte in {label} for {pkg_name}")));
         }
+        // Reject control characters: they would survive into terminal output (escape
+        // injection) and have no legitimate use in a path.
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Control character in {label} for {pkg_name}"),
+            ));
+        }
     }
     // Check both file and dest_dir segments against Windows reserved device names
     for (label, value) in [("file", file), ("dest_dir", dest_dir)] {
         for segment in value.split(['/', '\\']) {
+            // Reject trailing dot/space: Windows silently strips them, so "tool.exe."
+            // and "tool.exe" alias the same on-disk file, which would defeat the
+            // string-based conflict check. A bare "." (current dir) stays allowed.
+            if segment != "." && (segment.ends_with('.') || segment.ends_with(' ')) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Trailing dot or space in {label} segment for {pkg_name}: {segment}"),
+                ));
+            }
             let stem = segment.split('.').next().unwrap_or(segment);
             if WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem)) {
                 return Err(io::Error::new(
@@ -70,6 +87,35 @@ pub(crate) fn validate_manifest_path(file: &str, dest_dir: &str, pkg_name: &str)
                     format!("Reserved device name in {label} for {pkg_name}: {segment}"),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that `target` (a file to be written) stays within `root`, both lexically
+/// and — after creating its parent directory — by canonicalizing that parent and
+/// checking it is still under the canonical root. The canonicalize step catches
+/// symlink/junction escapes that a lexical check alone would miss.
+///
+/// Note: a local attacker with write access could swap the parent directory between
+/// this check and the subsequent write (TOCTOU). Accepted by design — such an attacker
+/// already has equivalent access to overwrite installed files directly.
+pub(crate) fn ensure_confined(target: &Path, root: &Path, label: &str) -> io::Result<()> {
+    if !target.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} escapes allowed root: {}", target.display()),
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+        let canonical_parent = dunce::canonicalize(parent)?;
+        let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} escapes allowed root: {}", canonical_parent.display()),
+            ));
         }
     }
     Ok(())
@@ -145,6 +191,19 @@ impl Config {
             }
         }
         self.base_dir.join(native)
+    }
+
+    /// Return the confinement root for a manifest `dest_dir`: the mapped `path_map`
+    /// target if the first path segment matches a key, otherwise `base_dir`. This is
+    /// the root that `resolve_dest`'s result must stay within.
+    pub(crate) fn resolve_root(&self, dest_dir: &str) -> PathBuf {
+        let native = crate::platform::to_native_path(dest_dir);
+        let first_seg =
+            std::path::Path::new(&native).components().next().map(|c| c.as_os_str().to_string_lossy().into_owned());
+        match first_seg.as_deref().and_then(|k| self.path_map.get(k)) {
+            Some(mapped) => mapped.clone(),
+            None => self.base_dir.clone(),
+        }
     }
 }
 
@@ -443,6 +502,43 @@ mod tests {
 
         let result = validate_manifest_path("console.exe", "util", "goodpkg");
         assert!(result.is_ok());
+
+        // "." (current dir) as dest_dir means install at root — must stay allowed
+        assert!(validate_manifest_path("tool.exe", ".", "goodpkg").is_ok());
+        // dest_dir with trailing slash produces an empty final segment — allowed
+        assert!(validate_manifest_path("tool.exe", "util/", "goodpkg").is_ok());
+        // Nested path still allowed
+        assert!(validate_manifest_path("git/bin/git.exe", "app", "goodpkg").is_ok());
+    }
+
+    #[test]
+    fn reject_trailing_dot_space_and_control_chars() {
+        // Trailing dot/space in the file or a dest_dir segment (Windows strips them,
+        // aliasing another file and defeating conflict detection)
+        assert!(validate_manifest_path("tool.exe.", "util", "pkg").is_err());
+        assert!(validate_manifest_path("tool.exe ", "util", "pkg").is_err());
+        assert!(validate_manifest_path("tool.exe", "util.", "pkg").is_err());
+        assert!(validate_manifest_path("tool.exe", "a /b", "pkg").is_err()); // segment "a " trailing space
+        // Control characters (would survive into terminal output)
+        assert!(validate_manifest_path("tool\x1b.exe", "util", "pkg").is_err());
+        assert!(validate_manifest_path("tool.exe", "ut\x07il", "pkg").is_err());
+        assert!(validate_manifest_path("tool\r.exe", "util", "pkg").is_err());
+        assert!(validate_manifest_path("tool.exe", "util\x7f", "pkg").is_err());
+    }
+
+    #[test]
+    fn ensure_confined_accepts_in_root_rejects_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("sub")).unwrap();
+
+        // In-root target (parent exists and canonicalizes under root)
+        let good = root.join("sub").join("file.txt");
+        assert!(ensure_confined(&good, &root, "test").is_ok());
+
+        // Lexical escape — sibling directory outside the root
+        let bad = tmp.path().join("outside").join("file.txt");
+        assert!(ensure_confined(&bad, &root, "test").is_err());
     }
 
     #[test]

@@ -224,11 +224,18 @@ async fn auth_middleware(
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|creds| {
             creds.split_once(':').and_then(|(u, p)| {
-                state.users.iter().find_map(|entry| {
+                // Scan every user without early-exit so response timing does not reveal
+                // which user index matched. (constant_time_eq still length-checks each
+                // field — an accepted minor leak, gated behind the per-IP lockout.)
+                let mut matched: Option<UserRole> = None;
+                for entry in &state.users {
                     let u_ok = constant_time_eq::constant_time_eq(u.as_bytes(), entry.username.as_bytes());
                     let p_ok = constant_time_eq::constant_time_eq(p.as_bytes(), entry.password.as_bytes());
-                    if u_ok & p_ok { Some(entry.role) } else { None }
-                })
+                    if u_ok & p_ok {
+                        matched = Some(entry.role);
+                    }
+                }
+                matched
             })
         });
 
@@ -514,12 +521,14 @@ async fn get_file(
         state.log_entry(addr.ip(), "GET", &url_path, 404, Some("file not found"));
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(repo_base) = tokio::fs::canonicalize(state.repo_path.join("packages").join(&name).join(&version)).await
-    else {
-        state.log_entry(addr.ip(), "GET", &url_path, 404, Some("version dir not found"));
-        return Err(StatusCode::NOT_FOUND);
+    // Confine against the canonicalized packages root, not the per-version directory:
+    // if <name>/<version> is itself a symlink/junction, basing the check on the resolved
+    // version dir would let it escape the repo. delete_version confines the same way.
+    let Ok(packages_root) = tokio::fs::canonicalize(state.repo_path.join("packages")).await else {
+        state.log_entry(addr.ip(), "GET", &url_path, 500, Some("canonicalize packages failed"));
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
-    if !canonical.starts_with(&repo_base) {
+    if !canonical.starts_with(&packages_root) {
         state.log_entry(addr.ip(), "GET", &url_path, 400, Some("path traversal attempt"));
         return Err(StatusCode::BAD_REQUEST);
     }

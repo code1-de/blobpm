@@ -32,11 +32,17 @@ pub fn create_shims(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Link points to itself: {dest}")));
         }
 
+        // Confine the shim write to the allowed root (mapped path or base_dir),
+        // canonicalizing the parent to catch symlink/junction escapes — the same
+        // defense-in-depth check `extract_zip` applies to extracted files. This also
+        // creates the parent directory.
+        let root = config.resolve_root(dest);
+        crate::client::ensure_confined(&dest_path, &root, &format!("shim dest for {dest}"))?;
+
         // Compute relative path from shim directory to target
         let shim_dir = dest_path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid link dest: {dest}")))?;
-        fs::create_dir_all(shim_dir)?;
 
         let rel_path = pathdiff(shim_dir, &target_path).ok_or_else(|| {
             io::Error::new(

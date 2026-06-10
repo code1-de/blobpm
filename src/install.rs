@@ -9,6 +9,26 @@ use crate::remove::purge_orphans;
 use crate::repo::{IndexEntry, Manifest};
 use crate::util::{plural, pluralize};
 
+/// Maximum size of a JSON metadata response (index, versions, manifest): 16 MB.
+/// A malicious server could otherwise force unbounded client memory via `resp.json()`,
+/// which buffers the whole body. The zip download path is separately bounded at extraction.
+const MAX_JSON_RESPONSE: u64 = 16 * 1024 * 1024;
+
+/// Read a JSON response body with a hard size cap, then deserialize it.
+fn read_json_capped<T: serde::de::DeserializeOwned>(resp: reqwest::blocking::Response) -> io::Result<T> {
+    let mut buf = Vec::new();
+    resp.take(MAX_JSON_RESPONSE + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if buf.len() as u64 > MAX_JSON_RESPONSE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Server JSON response exceeds {MAX_JSON_RESPONSE}-byte limit"),
+        ));
+    }
+    serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Fetch the package index from the server.
 ///
 /// # Errors
@@ -19,7 +39,7 @@ pub fn fetch_index(http: &HttpClient) -> io::Result<BTreeMap<String, IndexEntry>
     if !resp.status().is_success() {
         return Err(io::Error::other(format!("Failed to fetch index: {}", resp.status())));
     }
-    resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    read_json_capped(resp)
 }
 
 /// Fetch available versions for a package from the server.
@@ -32,7 +52,7 @@ pub fn fetch_versions(http: &HttpClient, name: &str) -> io::Result<Vec<String>> 
     if !resp.status().is_success() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} not found")));
     }
-    let value: serde_json::Value = resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let value: serde_json::Value = read_json_capped(resp)?;
     let versions = value["versions"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -50,7 +70,7 @@ pub fn fetch_manifest(http: &HttpClient, name: &str, version: &str) -> io::Resul
     if !resp.status().is_success() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("Package {name} {version} not found")));
     }
-    let manifest: Manifest = resp.json().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest: Manifest = read_json_capped(resp)?;
     if manifest.name != name {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -199,42 +219,11 @@ fn extract_zip(
         let native_file = crate::platform::to_native_path(file);
         let dest = resolved_dir.join(&native_file);
 
-        // Confinement check: the resolved root is either a mapped path or base_dir.
-        // Ensure the final destination stays inside that root.
-        let native_dest_dir = crate::platform::to_native_path(dest_dir);
-        let root = {
-            let first_seg = std::path::Path::new(&native_dest_dir)
-                .components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned());
-            match first_seg.as_deref().and_then(|k| config.path_map.get(k)) {
-                Some(mapped) => mapped.clone(),
-                None => config.base_dir.clone(),
-            }
-        };
-        if !dest.starts_with(&root) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Install target escapes allowed root for {name}: {}", dest.display()),
-            ));
-        }
-
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-            // Defense in depth: verify canonical path is still inside the allowed root after mkdir
-            // (catches symlink escapes).
-            // Known TOCTOU race: a local attacker with write access could swap the directory
-            // between this check and File::create below. Accepted by design — such an attacker
-            // already has equivalent access to overwrite installed files directly.
-            let canonical_parent = dunce::canonicalize(parent)?;
-            let canonical_root = dunce::canonicalize(&root).unwrap_or(root.clone());
-            if !canonical_parent.starts_with(&canonical_root) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Install target escapes allowed root for {name}: {}", canonical_parent.display()),
-                ));
-            }
-        }
+        // Confine the destination to the allowed root (mapped path or base_dir), both
+        // lexically and after canonicalizing the parent dir (catches symlink/junction
+        // escapes). The same check guards shim writes in `create_shims`.
+        let root = config.resolve_root(dest_dir);
+        crate::client::ensure_confined(&dest, &root, &format!("install target for {name}"))?;
 
         let entry = archive
             .by_name(file)
