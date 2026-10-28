@@ -601,8 +601,10 @@ fn validate_zip_against_manifest(manifest_path: &std::path::Path, zip_path: &std
         return Err(format!("zip has {} entries (max {})", archive.len(), crate::install::MAX_ZIP_ENTRIES));
     }
 
-    let zip_names: std::collections::HashSet<String> =
-        (0..archive.len()).filter_map(|i| archive.name_for_index(i).map(String::from)).collect();
+    let zip_names: std::collections::HashSet<String> = (0..archive.len())
+        .filter_map(|i| archive.name_for_index(i))
+        .map(|name| name.map(String::from).map_err(|e| format!("zip entry name: {e}")))
+        .collect::<Result<_, _>>()?;
     let manifest_names: std::collections::HashSet<&String> = manifest.files.keys().collect();
 
     let missing: Vec<_> = manifest_names.iter().filter(|f| !zip_names.contains(**f)).collect();

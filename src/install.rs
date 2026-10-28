@@ -720,6 +720,10 @@ pub fn update(
 }
 
 /// If our own exe was renamed during install (self-update), spawn a cleanup process and exit.
+#[cfg_attr(
+    not(windows),
+    allow(clippy::unnecessary_wraps, reason = "fallible only on Windows, where spawning the cleanup can fail")
+)]
 fn check_self_update() -> io::Result<()> {
     let Some(old_exe) = crate::platform::take_self_renamed_exe() else {
         return Ok(());
@@ -1422,16 +1426,18 @@ mod tests {
 
     #[test]
     fn resolve_dest_uses_path_map() {
-        let mut config = minimal_config(Path::new("C:\\base"));
-        config.path_map.insert("bin".to_string(), PathBuf::from("D:\\tools\\bin"));
+        let base = Path::new("C:\\base");
+        let mapped = PathBuf::from("D:\\tools\\bin");
+        let mut config = minimal_config(base);
+        config.path_map.insert("bin".to_string(), mapped.clone());
 
         // Mapped segment
-        assert_eq!(config.resolve_dest("bin"), PathBuf::from("D:\\tools\\bin"));
-        assert_eq!(config.resolve_dest("bin/sub"), PathBuf::from("D:\\tools\\bin\\sub"));
+        assert_eq!(config.resolve_dest("bin"), mapped);
+        assert_eq!(config.resolve_dest("bin/sub"), mapped.join("sub"));
 
         // Unmapped segment falls back to base_dir
-        assert_eq!(config.resolve_dest("util"), PathBuf::from("C:\\base\\util"));
-        assert_eq!(config.resolve_dest("util/sub"), PathBuf::from("C:\\base\\util\\sub"));
+        assert_eq!(config.resolve_dest("util"), base.join("util"));
+        assert_eq!(config.resolve_dest("util/sub"), base.join("util").join("sub"));
     }
 
     #[test]
@@ -1519,14 +1525,15 @@ mod tests {
     #[test]
     fn conflict_with_installed_package() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = minimal_config(Path::new("C:\\base"));
+        let base = Path::new("C:\\base");
+        let config = minimal_config(base);
         let mut db = Database::load_from(&tmp.path().join("db.json")).unwrap();
         db.packages.insert(
             "existing".to_string(),
             InstalledPackage {
                 version: "1.0".to_string(),
                 reason: InstallReason::Manual,
-                files: BTreeMap::from([("shared.dll".to_string(), PathBuf::from("C:\\base\\util\\shared.dll"))]),
+                files: BTreeMap::from([("shared.dll".to_string(), base.join("util").join("shared.dll"))]),
                 dependencies: vec![],
             },
         );
