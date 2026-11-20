@@ -124,9 +124,13 @@ fn sanitize_log_path(path: &str) -> String {
     out
 }
 
+fn log_timestamp() -> String {
+    jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 impl AppState {
     fn log_entry(&self, ip: IpAddr, method: &str, path: &str, status: u16, detail: Option<&str>) {
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let now = log_timestamp();
         let safe_path = sanitize_log_path(path);
         let detail_str = detail.map_or_else(String::new, |d| format!("  {d}"));
         let line = format!("{now}  {ip}  {method} {safe_path}  {status}{detail_str}\n");
@@ -878,7 +882,7 @@ async fn delete_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_json_depth, parse_bind_addrs, sanitize_io_error, sanitize_log_path};
+    use super::{check_json_depth, log_timestamp, parse_bind_addrs, sanitize_io_error, sanitize_log_path};
     use crate::server::{UserEntry, UserRole};
     use crate::testutil::helpers::create_zip;
     use crate::testutil::server_helpers::{
@@ -903,6 +907,15 @@ mod tests {
 
     fn auth_delete(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking::Response {
         client.delete(url).basic_auth(TEST_USER, Some(TEST_PASS)).send().unwrap()
+    }
+
+    #[test]
+    fn test_log_timestamp() {
+        let ts = log_timestamp();
+        assert_eq!(ts.len(), "2026-06-11T10:00:00Z".len(), "{ts}");
+        let parsed: jiff::Timestamp = ts.parse().unwrap_or_else(|e| panic!("{ts}: {e}"));
+        let off = (jiff::Timestamp::now().as_second() - parsed.as_second()).abs();
+        assert!(off < 60, "{ts} is {off}s off now");
     }
 
     #[test]

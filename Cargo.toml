@@ -1,19 +1,18 @@
 [package]
 name = "blob"
-version = "1.8.6"
+version = "1.8.7"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [features]
 default = ["server"]
-server = ["dep:axum", "dep:axum-server", "dep:tokio", "dep:tower", "dep:futures-util", "dep:chrono"]
+server = ["dep:axum", "dep:axum-server", "dep:tokio", "dep:tower", "dep:futures-util", "dep:jiff"]
 
 [dependencies]
 axum = { version = "0.8.8", features = ["tokio"], optional = true }
 axum-server = { version = "0.8.0", features = ["tls-rustls"], optional = true }
 base64 = "0.22.1"
-chrono = { version = "0.4", features = ["clock"], optional = true }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 constant_time_eq = "0.4.2"
 dirs = "6.0.0"
@@ -21,6 +20,7 @@ dunce = "1.0.5"
 futures-util = { version = "0.3", optional = true }
 glob = "0.3.3"
 indicatif = "0.18"
+jiff = { version = "1.0", optional = true }
 pem = "3.0.6"
 rcgen = "0.14.7"
 regex = "1.12.3"
